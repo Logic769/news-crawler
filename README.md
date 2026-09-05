@@ -1,170 +1,149 @@
-# GNE (GeneralNewsExtractor)
+# 新闻抓取工具（基于 GNE）
 
-[**中文文档**](README_CN.md)
+这是在 GNE 新闻正文抽取器基础上扩展的一套抓取工具，用来从不同网站上抓取新闻标题和正文，并按时间范围筛选。
 
-![](https://github.com/GeneralNewsExtractor/GeneralNewsExtractor/raw/master/screenshots/logo.png)
+## 文件说明
 
-## Star History
+- `news_crawler.py`：多站点批量抓取主程序，负责列表解析、3 天时间过滤、正文抽取、SQLite 入库和去重。
+- `url_extract.py`：单条网址抽取工具，输入一篇文章网址，输出 JSON。
+- `sources.json`：站点配置，按站点填写列表页 XPath 等信息。
+- `sources.example.json`：配置示例，包含一个可直接运行的 NSFC 站点。
+- `news.db`：SQLite 数据库（首次运行 `init` 后自动创建）。
 
-[![Star History Chart](https://api.star-history.com/svg?repos=GeneralNewsExtractor/GeneralNewsExtractor&type=Date)](https://star-history.com/#GeneralNewsExtractor/GeneralNewsExtractor&Date)
+## 环境准备
 
-## Introduction
-
-GNE is a general-purpose news content extractor built in Python. It is based on the algorithm described in the paper ["Web Content Extraction Based on Text and Symbol Density"](https://kns.cnki.net/KCMS/detail/detail.aspx?dbcode=CJFQ&dbname=CJFDLAST2019&filename=GWDZ201908029&v=MDY4MTRxVHJXTTFGckNVUkxPZmJ1Wm5GQ2poVXJyQklqclBkTEc0SDlqTXA0OUhiWVI4ZVgxTHV4WVM3RGgxVDM=).
-
-The algorithm is clean, logical, and effective. Since the paper only describes the algorithm without a concrete implementation, this project implements it in Python. It has been tested on major Chinese news sites (Toutiao, NetEase News, Sina News, iFeng, Tencent News, ReadHub, etc.) with nearly 100% accuracy.
-
-## Current Status
-
-Beyond the body text extraction described in the paper, GNE also supports automatic detection and extraction of **title**, **publish time**, and **author**.
-
-This project is named "Extractor" rather than "Crawler" by design — the input is HTML, and the output is a dictionary. You are responsible for obtaining the HTML of target pages using your own methods.
-
-**This project does not and will not provide any functionality to actively request HTML from websites.**
-
-## Usage
-
-### Online Demo
-
-You can try GNE online at [http://gne.kingname.info/](http://gne.kingname.info/). Simply paste the rendered HTML into the text area and click the extract button. For more precise extraction, additional parameters can be provided. See the [API documentation](https://generalnewsextractor.readthedocs.io/zh_CN/latest/#api) for details.
-
-### Installation
-
-```bash
-# Install via pip
-pip install --upgrade gne
-
-# Or install via pipenv
-pipenv install gne
+```powershell
+cd 你的项目目录
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[browser]"
 ```
 
-### Basic Usage
+工具默认使用本机 Chrome 作为浏览器回退，若机器上没有 Chrome：
 
-#### Extract Article Content
-
-```python
-from gne import GeneralNewsExtractor
-
-html = '''Your rendered HTML code'''
-
-extractor = GeneralNewsExtractor()
-result = extractor.extract(html, noise_node_list=['//div[@class="comment-list"]'])
-print(result)
-
-# Output:
-# {"title": "xxxx", "publish_time": "2019-09-10 11:12:13", "author": "yyy", "content": "zzzz", "images": ["/xxx.jpg", "/yyy.png"]}
+```powershell
+.\.venv\Scripts\python.exe -m playwright install chromium
 ```
 
-For more details, see the [GNE documentation](https://generalnewsextractor.readthedocs.io/).
+## 单条网址抓取
 
-#### Extract List Pages (Beta)
-
-```python
-from gne import ListPageExtractor
-
-html = '''Your rendered HTML code'''
-list_extractor = ListPageExtractor()
-result = list_extractor.extract(html, feature='XPath of any element in the list')
-print(result)
+```powershell
+.\.venv\Scripts\python.exe -X utf8 url_extract.py
 ```
 
-### Advanced Usage
+按提示粘贴文章网址，也可以直接传参：
 
-#### Custom Title XPath
-
-If automatic title extraction fails, you can specify a custom XPath:
-
-```python
-from gne import GeneralNewsExtractor
-
-extractor = GeneralNewsExtractor()
-html = 'Your target page HTML'
-result = extractor.extract(html, title_xpath='//h5/text()')
-print(result)
+```powershell
+.\.venv\Scripts\python.exe -X utf8 url_extract.py "https://example.com/article.html"
 ```
 
-#### Noise Removal
+输出为 JSON，包含 `title`、`publish_time`、`author`、`content`、`images`。
 
-Some news pages contain comments that may look more like body text than the actual article. Use the `noise_node_list` parameter to remove interfering elements before extraction:
+## 多站点批量抓取
 
-```python
-result = extractor.extract(html, noise_node_list=['//div[@class="comment-list"]'])
+### 1. 填写站点配置
+
+打开 `sources.json`，在 `sources` 数组中添加站点。参考格式：
+
+```json
+{
+  "name": "站点标识",
+  "list_url": "https://example.com/news.html",
+  "item_xpath": "//ul[contains(@class,'list')]//li",
+  "title_xpath": ".//a",
+  "url_xpath": ".//a/@href",
+  "date_xpath": ".//*[contains(@class,'time')]",
+  "date_format": "%Y-%m-%d",
+  "timezone": "Asia/Shanghai"
+}
 ```
 
-`noise_node_list` accepts a list of XPath expressions, each targeting an element to be removed during preprocessing.
+字段说明：
 
-### Development Setup
+- `name`：站点唯一标识。
+- `list_url`：新闻列表页地址；如果列表分页，也可以用 `list_urls` 直接写多个页面地址。
+- `item_xpath`：定位每条新闻节点的 XPath，必填。
+- `title_xpath`：节点内标题 XPath，不填默认取第一个 `a` 标签。
+- `url_xpath`：节点内详情页链接 XPath，不填默认取第一个 `a` 标签的 `href`。
+- `date_xpath`：节点内发布日期 XPath，不填则从整条节点文本中自动识别日期。
+- `date_format`：日期格式，例如 `%Y-%m-%d`、`%Y-%m-%d %H:%M`，不填也会自动尝试常见格式。
+- `timezone`：站点所在时区，默认 `Asia/Shanghai`。
+- `render`：设为 `true` 时列表页直接用 Chrome 渲染，适合 JS 动态列表。
+- `delay`：每个请求之间的等待秒数，默认 0.5。
 
-```bash
-git clone https://github.com/kingname/GeneralNewsExtractor.git
-cd GeneralNewsExtractor
-pipenv install
-pipenv shell
-python3 example.py
+### 2. 测试列表解析
+
+推荐先只测试一个站点，确认能解析出标题、链接和日期：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 news_crawler.py test --config sources.json --name 站点标识
 ```
 
-### Notes
+如果解析为空或日期不对，需要调整该站点的 XPath。
 
-- The `example.py` file provides basic usage examples.
-- Test code is located in the `tests` directory.
-- The input HTML must be **JavaScript-rendered HTML**, not raw page source. This means GNE works with both server-side rendered and Ajax-loaded content.
-- To manually test a new page, open it in Chrome, go to Developer Tools, locate the `<html>` tag in the Elements tab, right-click and select `Copy` > `Copy OuterHTML`.
+### 3. 初始化数据库
 
-![](https://github.com/kingname/GeneralNewsExtractor/blob/master/screenshots/2019-09-08-22-20-33.png)
+```powershell
+.\.venv\Scripts\python.exe -X utf8 news_crawler.py init
+```
 
-![](https://github.com/kingname/GeneralNewsExtractor/blob/master/screenshots/2019-09-08-22-21-49.png)
+### 4. 运行抓取
 
-- You can also use Puppeteer/Pyppeteer, Selenium, or any other method to obtain the JavaScript-rendered source code.
-- **List page extraction is an experimental feature and should not be used in production.** You can use Chrome DevTools' `Copy XPath` to copy the XPath of any item in the list. GNE will automatically find other items in the same list.
+```powershell
+.\.venv\Scripts\python.exe -X utf8 news_crawler.py run --config sources.json --days 3
+```
 
-![](https://github.com/kingname/GeneralNewsExtractor/blob/master/screenshots/2020-08-02-17-07-19.png)
+常用参数：
 
-## Screenshots
+- `--days 3`：抓取最近 3 天。
+- `--since 2026-09-01`：从指定日期开始。
+- `--workers 5`：同时处理几个站点，默认 3。
+- `--limit-per-source 20`：调试时限制每个站点最多处理多少条。
+- `--force`：忽略数据库中的已抓记录，强制重新抓取。
 
-### NetEase News
+## 查看结果
 
-![](https://github.com/kingname/GeneralNewsExtractor/blob/master/screenshots/WX20191125-231230.png)
+抓取结果存放在 `news.db`，可用任意 SQLite 工具查询：
 
-### Toutiao
+```sql
+SELECT source, title, publish_time, url
+FROM articles
+WHERE status = 'ok'
+ORDER BY publish_time DESC;
+```
 
-![](https://github.com/kingname/GeneralNewsExtractor/blob/master/screenshots/WX20191125-225851.png)
+只显示最近 3 天：
 
-### Sina News
+```sql
+SELECT source, title, publish_time, url
+FROM articles
+WHERE status = 'ok'
+  AND datetime(publish_time) >= datetime('now', '-3 days', 'localtime')
+ORDER BY publish_time DESC;
+```
 
-![](https://github.com/kingname/GeneralNewsExtractor/blob/master/screenshots/WX20191125-231506.png)
+## 工作原理
 
-### iFeng
+1. 读取 `sources.json` 中每个站点的配置。
+2. 抓取列表页 HTML，用 XPath 解析出标题、链接、发布时间。
+3. 按日期过滤，只保留最近 N 天内的文章。
+4. 逐条抓取文章详情页。
+5. 先用 GNE 抽取标题和正文；若正文为空或页面需要 JS 渲染，自动改用无头 Chrome。
+6. 结果写入 SQLite，以 `(source, url)` 去重，已抓过的文章下次自动跳过。
 
-![](https://github.com/kingname/GeneralNewsExtractor/blob/master/screenshots/WX20191126-004218.png)
+数据库状态字段：
 
-### NetEase News List Page
+- `ok`：成功抓取且发布时间在时间范围内。
+- `old`：已识别为超出时间范围，不再重复抓取。
+- `skip`：本次运行中数据库里已有记录。
+- `no_content`：正文提取失败。
+- `unknown_date`：无法解析发布日期。
+- `error`：抓取过程出错。
+- `list_empty`：列表页没有解析到任何条目。
 
-![](https://github.com/kingname/GeneralNewsExtractor/blob/master/screenshots/WX20200802-170137@2x.png)
+## 注意事项
 
-## Documentation
-
-[GNE FAQ & Q&A](https://github.com/kingname/GeneralNewsExtractor/wiki/GeneralNewsExtractor-Q&A)
-
-## Known Issues
-
-1. GNE is designed for news article pages. It may not work well on non-news pages or photo gallery articles.
-2. The author field may be empty if the article does not specify an author or if the author pattern is not covered by the existing regular expressions.
-
-## Todo
-
-* ~~Use a configuration file for constants instead of hard-coding them.~~
-* ~~Allow custom patterns for time and author extraction.~~
-* ~~News article list page extraction.~~
-* Support multi-page articles by accepting a list of HTMLs and concatenating the extracted content.
-* ~~Optimize extraction speed.~~
-* ~~Test on more news websites.~~
-* ...
-
-## Community
-
-- WeChat: Add the author `mekingname` and mention "GNE" to join the group.
-- Telegram: [https://t.me/joinchat/Bc5swww_XnVR7pEtDUl1vw](https://t.me/joinchat/Bc5swww_XnVR7pEtDUl1vw)
-
-## Acknowledgements
-
-@bigbrother666sh
+- 正文抽取器本身不会主动请求网页，请求逻辑在本项目脚本中实现。
+- 抓取公开网页时请注意目标网站的 `robots.txt`、访问频率和内容使用条款。
+- `sources.json` 里的站点越多、越复杂，主要工作越集中在逐个调试 XPath 上。
+- 如果某站点列表页不显示日期，工具会先抓详情页再用 GNE 识别出的发布时间过滤，请求量会明显增加。
+- 原项目说明见仓库自带 `README.md` / `README_CN.md`。

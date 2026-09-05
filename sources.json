@@ -1,0 +1,16 @@
+{
+  "workers": 3,
+  "days": 3,
+  "timezone": "Asia/Shanghai",
+  "delay": 0.5,
+  "sources": [
+    {
+      "name": "nchu_xwzx",
+      "list_url": "https://www.nchu.edu.cn/xwzx/jcdt1",
+      "item_xpath": "//ul[contains(@class,\"newsList\")]/li",
+      "title_xpath": ".//a",
+      "url_xpath": ".//a/@href",
+      "timezone": "Asia/Shanghai"
+    }
+  ]
+}
