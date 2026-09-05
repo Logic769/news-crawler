@@ -6,16 +6,29 @@
 
 - `news_crawler.py`：多站点批量抓取主程序，负责列表解析、3 天时间过滤、正文抽取、SQLite 入库和去重。
 - `url_extract.py`：单条网址抽取工具，输入一篇文章网址，输出 JSON。
-- `sources.json`：站点配置，按站点填写列表页 XPath 等信息。
-- `sources.example.json`：配置示例，包含一个可直接运行的 NSFC 站点。
+- `sources.json`：仓库自带的空站点配置模板；若直接修改并提交，站点配置会公开。
+- `sources.local.json`：本地私人站点配置，已被 `.gitignore` 忽略，不会提交；存在时程序会自动优先使用。
 - `news.db`：SQLite 数据库（首次运行 `init` 后自动创建）。
 
-## 环境准备
+## 全新部署
+
+Windows PowerShell：
 
 ```powershell
-cd 你的项目目录
+git clone https://github.com/Logic769/news-crawler.git
+cd news-crawler
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[browser]"
+```
+
+Linux / macOS：
+
+```bash
+git clone https://github.com/Logic769/news-crawler.git
+cd news-crawler
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[browser]"
 ```
 
 工具默认使用本机 Chrome 作为浏览器回退，若机器上没有 Chrome：
@@ -40,9 +53,15 @@ python -m venv .venv
 
 ## 多站点批量抓取
 
-### 1. 填写站点配置
+### 1. 添加你的站点配置
 
-打开 `sources.json`，在 `sources` 数组中添加站点。参考格式：
+仓库自带的 `sources.json` 是空模板。推荐把个人站点列表写到 `sources.local.json`（该文件已被 Git 忽略），这样提交代码时不会泄露你的站点配置：
+
+```powershell
+Copy-Item sources.json sources.local.json
+```
+
+在 `sources.local.json`（或 `sources.json`）的 `sources` 数组中添加站点。参考格式：
 
 ```json
 {
@@ -75,7 +94,7 @@ python -m venv .venv
 推荐先只测试一个站点，确认能解析出标题、链接和日期：
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 news_crawler.py test --config sources.json --name 站点标识
+.\.venv\Scripts\python.exe -X utf8 news_crawler.py test --config sources.local.json --name 站点标识
 ```
 
 如果解析为空或日期不对，需要调整该站点的 XPath。
@@ -89,7 +108,7 @@ python -m venv .venv
 ### 4. 运行抓取
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 news_crawler.py run --config sources.json --days 3
+.\.venv\Scripts\python.exe -X utf8 news_crawler.py run --config sources.local.json --days 3
 ```
 
 常用参数：
@@ -123,7 +142,7 @@ ORDER BY publish_time DESC;
 
 ## 工作原理
 
-1. 读取 `sources.json` 中每个站点的配置。
+1. 读取配置文件中每个站点的配置（默认 `sources.json`；存在 `sources.local.json` 时自动使用它）。
 2. 抓取列表页 HTML，用 XPath 解析出标题、链接、发布时间。
 3. 按日期过滤，只保留最近 N 天内的文章。
 4. 逐条抓取文章详情页。
@@ -144,6 +163,6 @@ ORDER BY publish_time DESC;
 
 - 正文抽取器本身不会主动请求网页，请求逻辑在本项目脚本中实现。
 - 抓取公开网页时请注意目标网站的 `robots.txt`、访问频率和内容使用条款。
-- `sources.json` 里的站点越多、越复杂，主要工作越集中在逐个调试 XPath 上。
+- 站点越多、越复杂，主要工作越集中在逐个调试 XPath 上。
 - 如果某站点列表页不显示日期，工具会先抓详情页再用 GNE 识别出的发布时间过滤，请求量会明显增加。
-- 原项目说明见仓库自带 `README.md` / `README_CN.md`。
+- 本项目基于 [GeneralNewsExtractor](https://github.com/kingname/GeneralNewsExtractor) 扩展。

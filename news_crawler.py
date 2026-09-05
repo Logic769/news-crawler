@@ -180,10 +180,17 @@ def init_db(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def resolve_config_path(path: str) -> str:
+    """Prefer a private local config when present; the repo default is public."""
+    if path == DEFAULT_SOURCES_FILE and Path("sources.local.json").exists():
+        return "sources.local.json"
+    return path
+
+
 def load_config(path: str) -> dict:
     if not Path(path).exists():
         raise FileNotFoundError(
-            f"找不到配置文件 {path}。可先复制 sources.example.json 为 sources.json。"
+            f"找不到配置文件 {path}。请参考 README 创建并填写配置文件。"
         )
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
@@ -545,12 +552,13 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> None:
-    config = load_config(args.config)
+    config_path = resolve_config_path(args.config)
+    config = load_config(config_path)
     sources = config["sources"]
     if not sources:
         print(
-            "sources.json 里还没有配置任何站点。"
-            "请参考 sources.example.json 填写后重试。"
+            f"{config_path} 里还没有配置任何站点。"
+            "请参考 README 中的配置说明添加站点。"
         )
         return
 
@@ -602,7 +610,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_test(args: argparse.Namespace) -> None:
-    config = load_config(args.config)
+    config = load_config(resolve_config_path(args.config))
     sources = config["sources"]
     if args.name:
         sources = [s for s in sources if s.get("name") == args.name]
