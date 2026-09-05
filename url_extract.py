@@ -18,6 +18,15 @@ HEADERS = {
 }
 
 
+def content_needs_render(content: str) -> bool:
+    """Return True when body looks empty or is only a JS-loading placeholder."""
+    text = (content or "").strip()
+    if not text:
+        return True
+    placeholders = ("正在加载", "加载中", "内容加载中", "请稍候")
+    return len(text) < 500 and any(p in text for p in placeholders)
+
+
 def fetch_html_with_browser(url: str) -> str | None:
     """Render a page with headless Chrome (Playwright) as a fallback."""
     try:
@@ -100,7 +109,7 @@ def extract_article(url: str, extractor: GeneralNewsExtractor) -> dict | None:
     except NoContentException:
         result = None
 
-    if result is None or not (result.get("content") or "").strip():
+    if result is None or content_needs_render(result.get("content")):
         print("直接抓取未提取到正文，正在用本机 Chrome 无头模式渲染...")
         html = fetch_html_with_browser(url)
         if html is None:
@@ -110,7 +119,7 @@ def extract_article(url: str, extractor: GeneralNewsExtractor) -> dict | None:
             result = extractor.extract(html)
         except NoContentException:
             result = None
-        if result is None or not (result.get("content") or "").strip():
+        if result is None or content_needs_render(result.get("content")):
             print("浏览器渲染后仍无法提取正文。可能是列表页，或不是新闻文章页。")
             return None
     return result

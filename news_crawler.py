@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 import lxml.html
 from gne import GeneralNewsExtractor, NoContentException
 
-from url_extract import fetch_html, fetch_html_with_browser
+from url_extract import content_needs_render, fetch_html, fetch_html_with_browser
 
 LOG = logging.getLogger("news_crawler")
 
@@ -256,12 +256,17 @@ def parse_list_items(html: str, source: dict, base_url: str) -> list[dict]:
             continue
         seen.add(url)
         date_text = xpath_text(node, source.get("date_xpath") or ".")
+        parsed = parse_datetime(date_text, date_format, tz_name)
+        if parsed is None:
+            # Some sites put the publish date in the article URL instead,
+            # for example https://.../2026/09/05/article.shtml
+            parsed = parse_datetime(url, None, tz_name)
         items.append(
             {
                 "title": title,
                 "url": url,
                 "date_text": date_text,
-                "parsed": parse_datetime(date_text, date_format, tz_name),
+                "parsed": parsed,
             }
         )
     return items
@@ -309,7 +314,7 @@ def extract_article(html: str, url: str) -> dict | None:
         result = extractor.extract(html)
     except NoContentException:
         result = None
-    if result is None or not (result.get("content") or "").strip():
+    if result is None or content_needs_render(result.get("content")):
         LOG.info("正文为空，尝试 Chrome 渲染 %s", url)
         rendered = fetch_html_with_browser(url)
         if rendered:
@@ -317,7 +322,7 @@ def extract_article(html: str, url: str) -> dict | None:
                 result = extractor.extract(rendered)
             except NoContentException:
                 result = None
-    if result is None or not (result.get("content") or "").strip():
+    if result is None or content_needs_render(result.get("content")):
         return None
     return result
 
