@@ -12,6 +12,8 @@
 
 ## 全新部署
 
+要求 Python 3.10 或更高版本。
+
 Windows PowerShell：
 
 ```powershell

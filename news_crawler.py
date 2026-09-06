@@ -116,6 +116,26 @@ def parse_datetime(
         except ValueError:
             pass
 
+    # Day-first format used by some university sites: 04 2026.09
+    day_first = re.search(
+        r"(?<!\d)(\d{1,2})\s+(20\d{2})\.(\d{1,2})"
+        r"(?:\s+(\d{1,2}):(\d{2}))?",
+        text,
+    )
+    if day_first:
+        try:
+            parsed = dt.datetime(
+                int(day_first.group(2)),
+                int(day_first.group(3)),
+                int(day_first.group(1)),
+                int(day_first.group(4) or 0),
+                int(day_first.group(5) or 0),
+                tzinfo=tz,
+            )
+        except ValueError:
+            return None
+        return parsed
+
     # Full year: 2026-08-26 / 2026年8月26日 / 2026-08-26 10:30:00
     full = re.search(
         r"(20\d{2}|\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})"
