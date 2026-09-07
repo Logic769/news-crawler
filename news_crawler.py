@@ -133,8 +133,9 @@ def parse_datetime(
                 tzinfo=tz,
             )
         except ValueError:
-            return None
-        return parsed
+            pass
+        else:
+            return parsed
 
     # Full year: 2026-08-26 / 2026年8月26日 / 2026-08-26 10:30:00
     full = re.search(
@@ -543,7 +544,27 @@ def run_source(
             for entry in entries:
                 if limit_per_source and processed >= limit_per_source:
                     break
-                status = process_entry(conn, source, entry, cutoff, force)
+                try:
+                    status = process_entry(conn, source, entry, cutoff, force)
+                except Exception as exc:
+                    LOG.exception(
+                        "[%s] 文章处理失败 %s: %s",
+                        source_name,
+                        entry.get("url"),
+                        exc,
+                    )
+                    try:
+                        save_article(
+                            conn,
+                            source_name,
+                            entry.get("url", ""),
+                            list_title=entry.get("title", ""),
+                            status="error",
+                            error=str(exc)[:500],
+                        )
+                    except Exception:
+                        LOG.exception("[%s] 保存错误记录失败", source_name)
+                    status = "error"
                 counts[status] = counts.get(status, 0) + 1
                 processed += 1
             LOG.info(

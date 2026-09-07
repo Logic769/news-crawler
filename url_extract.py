@@ -97,12 +97,16 @@ def extract_article(url: str, extractor: GeneralNewsExtractor) -> dict | None:
         html = fetch_html(url)
     except urllib.error.HTTPError as exc:
         if exc.code not in (401, 403, 406, 429):
-            raise
+            print(f"抓取失败（HTTP {exc.code}）。")
+            return None
         print(f"直接抓取被拒绝(HTTP {exc.code})，正在用本机 Chrome 无头模式渲染...")
         html = fetch_html_with_browser(url)
         if html is None:
             print("浏览器回退失败。")
             return None
+    except (urllib.error.URLError, ValueError, TimeoutError, ConnectionError) as exc:
+        print(f"抓取失败（网络错误或网址无效）：{exc}")
+        return None
 
     try:
         result = extractor.extract(html)
