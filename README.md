@@ -14,6 +14,33 @@
 
 要求 Python 3.10 或更高版本。
 
+### 一键部署
+
+Windows：
+
+```powershell
+git clone https://github.com/Logic769/news-crawler.git
+cd news-crawler
+.\deploy.bat
+```
+
+Linux / macOS：
+
+```bash
+git clone https://github.com/Logic769/news-crawler.git
+cd news-crawler
+chmod +x deploy.sh
+./deploy.sh
+```
+
+部署脚本会创建 `.venv`、安装依赖、在缺少 Chrome/Chromium 时安装 Playwright
+Chromium、初始化 `news.db`，最后运行 `smoke_test.py` 做功能自检。
+如果本机已有 Chrome，脚本会自动跳过浏览器内核下载；也可以使用
+`SKIP_BROWSER=1 ./deploy.sh`（Linux/macOS）或
+`powershell -File deploy.ps1 -SkipBrowser`（Windows）跳过。
+
+### 手动部署（可选）
+
 Windows PowerShell：
 
 ```powershell
