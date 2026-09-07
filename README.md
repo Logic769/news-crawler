@@ -1,22 +1,116 @@
-# 新闻抓取工具（基于 GNE）
+# 新闻爬虫（News Crawler）
 
-这是在 GNE 新闻正文抽取器基础上扩展的一套抓取工具，用来从不同网站上抓取新闻标题和正文，并按时间范围筛选。
+一个基于 [GNE（GeneralNewsExtractor）](https://github.com/kingname/GeneralNewsExtractor) 的多站点新闻抓取工具。
 
-## 文件说明
+它可以把网页新闻的**标题、发布时间、作者、正文、图片**自动提取出来，并按时间范围筛选，适合需要定时收集多个网站新闻、通知或公告的场景。
 
-- `news_crawler.py`：多站点批量抓取主程序，负责列表解析、3 天时间过滤、正文抽取、SQLite 入库和去重。
-- `url_extract.py`：单条网址抽取工具，输入一篇文章网址，输出 JSON。
-- `sources.json`：仓库自带的空站点配置模板；若直接修改并提交，站点配置会公开。
-- `sources.local.json`：本地私人站点配置，已被 `.gitignore` 忽略，不会提交；存在时程序会自动优先使用。
-- `news.db`：SQLite 数据库（首次运行 `init` 后自动创建）。
+---
 
-## 全新部署
+## 它能做什么
 
-要求 Python 3.10 或更高版本。
+- 输入一篇新闻文章网址，直接输出标题、发布时间、作者、正文、图片；
+- 配置多个网站列表页，自动抓取“最近 N 天”的新闻；
+- 自动识别大多数常见日期格式；
+- 页面正文由 JavaScript 加载时，自动使用 Chrome/Chromium 渲染后再提取；
+- 抓取结果自动存入 SQLite，避免重复抓取；
+- 提供 Windows、Linux/macOS 一键部署脚本和冒烟测试。
 
-### 一键部署
+> 注意：GNE 本身是“正文抽取器”，不是通用爬虫框架。本工具负责请求网页，GNE 负责从 HTML 中提取新闻正文。
 
-Windows：
+---
+
+## 项目结构
+
+| 文件 / 目录 | 作用 |
+| --- | --- |
+| `news_crawler.py` | 多站点批量抓取主程序 |
+| `url_extract.py` | 单条文章网址抽取工具 |
+| `sources.json` | 仓库自带的空站点配置模板 |
+| `sources.local.json` | 本地私人站点配置（被 Git 忽略，不会提交） |
+| `deploy.bat` / `deploy.ps1` | Windows 一键部署脚本 |
+| `deploy.sh` | Linux/macOS 一键部署脚本 |
+| `smoke_test.py` | 部署后的离线自检脚本 |
+| `gne/` | GNE 新闻抽取核心库 |
+| `tests/` | 上游自带测试 HTML 样本 |
+
+---
+
+## 环境要求
+
+- Python 3.10 或更高版本
+- Git
+- 能访问 GitHub / PyPI 的网络
+- 可选：Chrome 或 Chromium（用于 JS 渲染；没有时部署脚本会自动安装 Playwright Chromium）
+
+---
+
+## 国内网络加速（可选）
+
+如果直接访问 GitHub 或 PyPI 速度很慢，可以先按下面的方式加速。网络正常时不需要这些步骤。
+
+### GitHub 克隆加速
+
+GitHub 克隆/下载慢时，可以使用第三方代理镜像（仅用于网络加速）：
+
+```bash
+git clone https://ghfast.top/https://github.com/Logic769/news-crawler.git
+```
+
+如果某个镜像失效，可以尝试：
+
+```bash
+git clone https://gh-proxy.com/https://github.com/Logic769/news-crawler.git
+git clone https://ghproxy.net/https://github.com/Logic769/news-crawler.git
+```
+
+> 注意：第三方代理会经手仓库代码。对安全性要求较高时，请优先使用官方 GitHub 地址，
+> 或在克隆后核对仓库提交与 Release 信息。
+
+### Python 依赖加速
+
+使用清华大学 PyPI 镜像：
+
+Windows PowerShell（在运行 `deploy.bat` 之前设置）：
+
+```powershell
+$env:PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+.\deploy.bat
+```
+
+Linux / macOS：
+
+```bash
+export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+./deploy.sh
+```
+
+### Playwright Chromium 下载加速
+
+没有 Chrome/Chromium 时，部署脚本会自动下载 Playwright Chromium。国内下载慢时使用 npmmirror：
+
+Windows PowerShell：
+
+```powershell
+$env:PLAYWRIGHT_DOWNLOAD_HOST = "https://npmmirror.com/mirrors/playwright"
+.\deploy.bat
+```
+
+Linux / macOS：
+
+```bash
+export PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
+./deploy.sh
+```
+
+也可以同时设置两个变量，一次性加速依赖安装和浏览器下载。
+
+---
+
+## 快速开始
+
+### Windows
+
+打开 PowerShell，依次执行：
 
 ```powershell
 git clone https://github.com/Logic769/news-crawler.git
@@ -24,7 +118,14 @@ cd news-crawler
 .\deploy.bat
 ```
 
-Linux / macOS：
+看到以下输出表示部署成功：
+
+```text
+SMOKE TEST PASSED
+部署完成。
+```
+
+### Linux / macOS
 
 ```bash
 git clone https://github.com/Logic769/news-crawler.git
@@ -33,70 +134,46 @@ chmod +x deploy.sh
 ./deploy.sh
 ```
 
-部署脚本会创建 `.venv`、安装依赖、在缺少 Chrome/Chromium 时安装 Playwright
-Chromium、初始化 `news.db`，最后运行 `smoke_test.py` 做功能自检。
-如果本机已有 Chrome，脚本会自动跳过浏览器内核下载；也可以使用
-`SKIP_BROWSER=1 ./deploy.sh`（Linux/macOS）或
-`powershell -File deploy.ps1 -SkipBrowser`（Windows）跳过。
+部署脚本会自动完成：
 
-### 手动部署（可选）
+1. 检查 Python 版本；
+2. 创建 `.venv` 虚拟环境；
+3. 安装项目依赖；
+4. 检测 Chrome/Chromium，没有则安装 Playwright Chromium；
+5. 初始化 `news.db`；
+6. 运行冒烟测试。
 
-Windows PowerShell：
+---
+
+## 快速体验：抓取单篇文章
 
 ```powershell
-git clone https://github.com/Logic769/news-crawler.git
 cd news-crawler
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[browser]"
-```
-
-Linux / macOS：
-
-```bash
-git clone https://github.com/Logic769/news-crawler.git
-cd news-crawler
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e ".[browser]"
-```
-
-工具默认使用本机 Chrome 作为浏览器回退，若机器上没有 Chrome：
-
-Windows：
-
-```powershell
-.\.venv\Scripts\python.exe -m playwright install chromium
-```
-
-Linux / macOS（已激活虚拟环境）：
-
-```bash
-python -m playwright install chromium
-```
-
-> 提示：下文命令示例使用 Windows 写法。Linux/macOS 激活虚拟环境后，
-> 请把 `.venv\Scripts\python.exe` 换成 `python`（或 `.venv/bin/python`），
-> 把 `Copy-Item` 换成 `cp`。
-
-## 单条网址抓取
-
-```powershell
-.\.venv\Scripts\python.exe -X utf8 url_extract.py
-```
-
-按提示粘贴文章网址，也可以直接传参：
-
-```powershell
 .\.venv\Scripts\python.exe -X utf8 url_extract.py "https://example.com/article.html"
 ```
 
-输出为 JSON，包含 `title`、`publish_time`、`author`、`content`、`images`。
+把网址替换成真实新闻文章页。成功后会在终端输出 JSON：
+
+```json
+{
+  "url": "https://example.com/article.html",
+  "title": "新闻标题",
+  "publish_time": "2026-09-07 18:00:00",
+  "author": "作者",
+  "content": "新闻正文……",
+  "images": []
+}
+```
+
+> Linux/macOS 用户把 `.venv\Scripts\python.exe` 换成 `.venv/bin/python` 即可。
+
+---
 
 ## 多站点批量抓取
 
-### 1. 添加你的站点配置
+### 第 1 步：创建本地站点配置
 
-仓库自带的 `sources.json` 是空模板。推荐把个人站点列表写到 `sources.local.json`（该文件已被 Git 忽略），这样提交代码时不会泄露你的站点配置：
+推荐使用 `sources.local.json` 保存自己的站点配置，这样即使以后提交代码，也不会把站点列表公开：
 
 Windows：
 
@@ -110,51 +187,60 @@ Linux / macOS：
 cp sources.json sources.local.json
 ```
 
-在 `sources.local.json`（或 `sources.json`）的 `sources` 数组中添加站点。参考格式：
+### 第 2 步：填写站点配置
+
+用任意文本编辑器打开 `sources.local.json`，在 `sources` 数组中添加站点：
 
 ```json
 {
-  "name": "站点标识",
-  "list_url": "https://example.com/news.html",
-  "item_xpath": "//ul[contains(@class,'list')]//li",
-  "title_xpath": ".//a",
-  "url_xpath": ".//a/@href",
-  "date_xpath": ".//*[contains(@class,'time')]",
-  "date_format": "%Y-%m-%d",
-  "timezone": "Asia/Shanghai"
+  "workers": 3,
+  "days": 3,
+  "timezone": "Asia/Shanghai",
+  "delay": 0.5,
+  "sources": [
+    {
+      "name": "example",
+      "list_url": "https://example.com/news.html",
+      "item_xpath": "//ul[contains(@class,'news-list')]/li",
+      "title_xpath": ".//a",
+      "url_xpath": ".//a/@href",
+      "date_xpath": ".//*[contains(@class,'time')]",
+      "date_format": "%Y-%m-%d",
+      "timezone": "Asia/Shanghai"
+    }
+  ]
 }
 ```
 
-字段说明：
+### 配置字段说明
 
-- `name`：站点唯一标识。
-- `list_url`：新闻列表页地址；如果列表分页，也可以用 `list_urls` 直接写多个页面地址。
-- `item_xpath`：定位每条新闻节点的 XPath，必填。
-- `title_xpath`：节点内标题 XPath，不填默认取第一个 `a` 标签。
-- `url_xpath`：节点内详情页链接 XPath，不填默认取第一个 `a` 标签的 `href`。
-- `date_xpath`：节点内发布日期 XPath，不填则从整条节点文本中自动识别日期。
-- `date_format`：日期格式，例如 `%Y-%m-%d`、`%Y-%m-%d %H:%M`，不填也会自动尝试常见格式。
-- `timezone`：站点所在时区，默认 `Asia/Shanghai`。
-- `render`：设为 `true` 时列表页直接用 Chrome 渲染，适合 JS 动态列表。
-- `delay`：每个请求之间的等待秒数，默认 0.5。
+| 字段 | 是否必填 | 说明 |
+| --- | --- | --- |
+| `name` | 必填 | 站点唯一标识，例如 `ncu_news` |
+| `list_url` | 二选一 | 新闻列表页地址 |
+| `list_urls` | 二选一 | 多个列表页地址组成的数组，用于分页等情况 |
+| `item_xpath` | 必填 | 定位每条新闻节点的 XPath |
+| `title_xpath` | 可选 | 标题 XPath，不填默认取第一个 `a` 标签 |
+| `url_xpath` | 可选 | 详情页链接 XPath，不填默认取第一个 `a` 标签的 `href` |
+| `date_xpath` | 可选 | 发布日期 XPath，不填则从整条节点文本中自动识别 |
+| `date_format` | 可选 | 日期格式，例如 `%Y-%m-%d`、`%Y-%m-%d %H:%M` |
+| `timezone` | 可选 | 站点时区，默认 `Asia/Shanghai` |
+| `render` | 可选 | 设为 `true` 表示列表页需要用 Chrome 渲染后再解析 |
+| `delay` | 可选 | 每个请求之间的等待秒数，默认 0.5 |
 
-### 2. 测试列表解析
+> 顶层还可以配置 `workers`（同时处理几个站点）和 `days`（默认抓取天数）。
 
-推荐先只测试一个站点，确认能解析出标题、链接和日期：
+### 第 3 步：测试列表解析
 
-```powershell
-.\.venv\Scripts\python.exe -X utf8 news_crawler.py test --config sources.local.json --name 站点标识
-```
-
-如果解析为空或日期不对，需要调整该站点的 XPath。
-
-### 3. 初始化数据库
+先只测试一个站点，确认标题、链接、日期能正确解析：
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 news_crawler.py init
+.\.venv\Scripts\python.exe -X utf8 news_crawler.py test --config sources.local.json --name 你的站点标识
 ```
 
-### 4. 运行抓取
+如果输出为空、标题重复或日期不对，需要调整该站点的 XPath。
+
+### 第 4 步：运行批量抓取
 
 ```powershell
 .\.venv\Scripts\python.exe -X utf8 news_crawler.py run --config sources.local.json --days 3
@@ -162,15 +248,21 @@ cp sources.json sources.local.json
 
 常用参数：
 
-- `--days 3`：抓取最近 3 天。
-- `--since 2026-09-01`：从指定日期开始。
-- `--workers 5`：同时处理几个站点，默认 3。
-- `--limit-per-source 20`：调试时限制每个站点最多处理多少条。
-- `--force`：忽略数据库中的已抓记录，强制重新抓取。
+| 参数 | 作用 |
+| --- | --- |
+| `--days 3` | 抓取最近 3 天 |
+| `--since 2026-09-01` | 从指定日期开始抓取 |
+| `--workers 5` | 同时处理 5 个站点 |
+| `--limit-per-source 20` | 每个站点最多处理 20 条 |
+| `--force` | 忽略数据库已有记录，强制重新抓取 |
 
-## 查看结果
+---
 
-抓取结果存放在 `news.db`，可用任意 SQLite 工具查询：
+## 查看抓取结果
+
+结果默认保存在项目目录的 `news.db` 中。
+
+查看最近抓取的文章：
 
 ```sql
 SELECT source, title, publish_time, url
@@ -179,7 +271,7 @@ WHERE status = 'ok'
 ORDER BY publish_time DESC;
 ```
 
-只显示最近 3 天：
+只查看最近 3 天：
 
 ```sql
 SELECT source, title, publish_time, url
@@ -189,34 +281,75 @@ WHERE status = 'ok'
 ORDER BY publish_time DESC;
 ```
 
-> 注意：如果数据库是用旧版本抓取的，库里可能仍存在中文日期（例如
-> `2026年09月07日 18:07:40`），上面的 `datetime()` 过滤不会生效。
-> 请删除 `news.db` 后重新抓取，或对站点使用 `--force` 强制重抓，
-> 入库时间会统一保存为 `YYYY-MM-DD HH:MM:SS`。
+也可以用图形工具 [DB Browser for SQLite](https://sqlitebrowser.org/) 打开 `news.db`。
+
+### 数据状态说明
+
+| 状态 | 含义 |
+| --- | --- |
+| `ok` | 成功抓取且发布时间在时间范围内 |
+| `old` | 已确认超出时间范围，不会重复抓取 |
+| `skip` | 数据库已有记录，本次跳过 |
+| `no_content` | 正文提取失败 |
+| `unknown_date` | 无法解析发布日期 |
+| `error` | 抓取过程出错 |
+| `list_empty` | 列表页没有解析到条目 |
+
+---
 
 ## 工作原理
 
-1. 读取配置文件中每个站点的配置（默认 `sources.json`；存在 `sources.local.json` 时自动使用它）。
-2. 抓取列表页 HTML，用 XPath 解析出标题、链接、发布时间。
-3. 按日期过滤，只保留最近 N 天内的文章。
-4. 逐条抓取文章详情页。
-5. 先用 GNE 抽取标题和正文；若正文为空或页面需要 JS 渲染，自动改用无头 Chrome。
-6. 结果写入 SQLite，以 `(source, url)` 去重，已抓过的文章下次自动跳过。
+1. 读取配置文件中的站点列表；
+2. 抓取新闻列表页 HTML；
+3. 按 XPath 解析出标题、链接、发布日期；
+4. 过滤出最近 N 天的文章；
+5. 逐篇抓取详情页；
+6. 用 GNE 提取标题和正文；必要时使用 Chrome 渲染；
+7. 结果写入 SQLite，按 `(source, url)` 去重。
 
-数据库状态字段：
+---
 
-- `ok`：成功抓取且发布时间在时间范围内。
-- `old`：已识别为超出时间范围，不再重复抓取。
-- `skip`：本次运行中数据库里已有记录。
-- `no_content`：正文提取失败。
-- `unknown_date`：无法解析发布日期。
-- `error`：抓取过程出错。
-- `list_empty`：列表页没有解析到任何条目。
+## 常见问题
 
-## 注意事项
+### 1. 提示找不到 python
 
-- 正文抽取器本身不会主动请求网页，请求逻辑在本项目脚本中实现。
-- 抓取公开网页时请注意目标网站的 `robots.txt`、访问频率和内容使用条款。
-- 站点越多、越复杂，主要工作越集中在逐个调试 XPath 上。
-- 如果某站点列表页不显示日期，工具会先抓详情页再用 GNE 识别出的发布时间过滤，请求量会明显增加。
-- 本项目基于 [GeneralNewsExtractor](https://github.com/kingname/GeneralNewsExtractor) 扩展。
+Windows 上安装 Python 时勾选 “Add Python to PATH”，安装后重新打开 PowerShell。
+
+### 2. 提示无法执行脚本 / 执行策略受限
+
+直接运行 `deploy.bat`，脚本内部已经使用 `-ExecutionPolicy Bypass`，一般不会受 PowerShell 执行策略限制。
+
+### 3. 抓取后正文为空，或者只有“正在加载”
+
+说明目标页面正文由 JavaScript 动态加载。工具会尝试自动回退到 Chrome 渲染；如果仍然失败，请确认本机安装了 Chrome，或者已经运行过 Playwright Chromium 安装。
+
+### 4. 站点配置里的真实网址会被上传吗
+
+不会。只要把站点配置放在 `sources.local.json`，该文件已被 `.gitignore` 忽略。
+
+### 5. 一个站点抓取出错会影响其他站点吗
+
+不会。单个文章异常会被记录为 `error`，其他文章和站点会继续抓取。
+
+### 6. 如何更新项目
+
+```powershell
+git pull
+.\deploy.bat
+```
+
+---
+
+## 安全与合规建议
+
+- 不要提交任何网站后台地址、API Token、数据库密码或账号信息；
+- 抓取公开网站前，请阅读目标网站的 `robots.txt`、服务条款和访问频率要求；
+- 请合理设置 `delay`，避免对目标网站造成压力；
+- 本站点配置、数据库和虚拟环境都属于本地数据，不要误提交到 Git。
+
+---
+
+## 相关链接
+
+- [本项目仓库](https://github.com/Logic769/news-crawler)
+- [原项目 GeneralNewsExtractor](https://github.com/kingname/GeneralNewsExtractor)
