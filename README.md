@@ -35,9 +35,21 @@ python -m pip install -e ".[browser]"
 
 工具默认使用本机 Chrome 作为浏览器回退，若机器上没有 Chrome：
 
+Windows：
+
 ```powershell
 .\.venv\Scripts\python.exe -m playwright install chromium
 ```
+
+Linux / macOS（已激活虚拟环境）：
+
+```bash
+python -m playwright install chromium
+```
+
+> 提示：下文命令示例使用 Windows 写法。Linux/macOS 激活虚拟环境后，
+> 请把 `.venv\Scripts\python.exe` 换成 `python`（或 `.venv/bin/python`），
+> 把 `Copy-Item` 换成 `cp`。
 
 ## 单条网址抓取
 
@@ -59,8 +71,16 @@ python -m pip install -e ".[browser]"
 
 仓库自带的 `sources.json` 是空模板。推荐把个人站点列表写到 `sources.local.json`（该文件已被 Git 忽略），这样提交代码时不会泄露你的站点配置：
 
+Windows：
+
 ```powershell
 Copy-Item sources.json sources.local.json
+```
+
+Linux / macOS：
+
+```bash
+cp sources.json sources.local.json
 ```
 
 在 `sources.local.json`（或 `sources.json`）的 `sources` 数组中添加站点。参考格式：
@@ -141,6 +161,11 @@ WHERE status = 'ok'
   AND datetime(publish_time) >= datetime('now', '-3 days', 'localtime')
 ORDER BY publish_time DESC;
 ```
+
+> 注意：如果数据库是用旧版本抓取的，库里可能仍存在中文日期（例如
+> `2026年09月07日 18:07:40`），上面的 `datetime()` 过滤不会生效。
+> 请删除 `news.db` 后重新抓取，或对站点使用 `--force` 强制重抓，
+> 入库时间会统一保存为 `YYYY-MM-DD HH:MM:SS`。
 
 ## 工作原理
 

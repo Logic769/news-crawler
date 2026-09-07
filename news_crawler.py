@@ -465,8 +465,8 @@ def process_entry(
     )
     if publish_dt is None:
         publish_dt = list_date
-        if list_date:
-            publish_text = list_date.strftime("%Y-%m-%d %H:%M:%S")
+    if publish_dt is not None:
+        publish_text = publish_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     if publish_dt and publish_dt < cutoff:
         save_article(
