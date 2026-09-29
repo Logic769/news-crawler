@@ -30,6 +30,7 @@
 | `deploy.bat` / `deploy.ps1` | Windows 一键部署脚本 |
 | `deploy.sh` | Linux/macOS 一键部署脚本 |
 | `smoke_test.py` | 部署后的离线自检脚本 |
+| `AGENTS.md` | 多 Agent 协作与开发说明（架构、规范、发布流程） |
 | `gne/` | GNE 新闻抽取核心库 |
 | `tests/` | 上游自带测试 HTML 样本 |
 
