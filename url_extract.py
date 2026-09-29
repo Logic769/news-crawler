@@ -18,10 +18,20 @@ HEADERS = {
 }
 
 
+MIN_CONTENT_LENGTH = 100
+
+
+def content_is_too_short(content: str) -> bool:
+    """Return True when the body is shorter than the useful minimum."""
+    return len((content or "").strip()) < MIN_CONTENT_LENGTH
+
+
 def content_needs_render(content: str) -> bool:
-    """Return True when body looks empty or is only a JS-loading placeholder."""
+    """Return True when body is empty, too short, or a JS-loading placeholder."""
     text = (content or "").strip()
     if not text:
+        return True
+    if content_is_too_short(text):
         return True
     placeholders = ("正在加载", "加载中", "内容加载中", "请稍候")
     return len(text) < 500 and any(p in text for p in placeholders)
@@ -123,9 +133,14 @@ def extract_article(url: str, extractor: GeneralNewsExtractor) -> dict | None:
             result = extractor.extract(html)
         except NoContentException:
             result = None
-        if result is None or content_needs_render(result.get("content")):
+        if result is None:
             print("浏览器渲染后仍无法提取正文。可能是列表页，或不是新闻文章页。")
             return None
+        if content_needs_render(result.get("content")):
+            if not content_is_too_short(result.get("content")):
+                print("浏览器渲染后仍无法提取正文。可能是列表页，或不是新闻文章页。")
+                return None
+            print(f"警告：渲染回退后正文仍不足 {MIN_CONTENT_LENGTH} 字，仍按原文返回。")
     return result
 
 

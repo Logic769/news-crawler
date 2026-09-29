@@ -28,7 +28,13 @@ from zoneinfo import ZoneInfo
 import lxml.html
 from gne import GeneralNewsExtractor, NoContentException
 
-from url_extract import content_needs_render, fetch_html, fetch_html_with_browser
+from url_extract import (
+    MIN_CONTENT_LENGTH,
+    content_is_too_short,
+    content_needs_render,
+    fetch_html,
+    fetch_html_with_browser,
+)
 
 LOG = logging.getLogger("news_crawler")
 
@@ -342,16 +348,27 @@ def extract_article(html: str, url: str) -> dict | None:
         result = extractor.extract(html)
     except NoContentException:
         result = None
+    from_render = False
     if result is None or content_needs_render(result.get("content")):
-        LOG.info("正文为空，尝试 Chrome 渲染 %s", url)
+        LOG.info("正文为空或过短，尝试 Chrome 渲染 %s", url)
         rendered = fetch_html_with_browser(url)
         if rendered:
+            from_render = True
             try:
                 result = extractor.extract(rendered)
             except NoContentException:
                 result = None
-    if result is None or content_needs_render(result.get("content")):
+    if result is None:
         return None
+    if content_needs_render(result.get("content")):
+        if not from_render or not content_is_too_short(result.get("content")):
+            return None
+        LOG.warning(
+            "渲染回退后正文仍不足 %d 字（实际 %d 字），仍入库 %s",
+            MIN_CONTENT_LENGTH,
+            len(clean_text(result.get("content"))),
+            url,
+        )
     return result
 
 
