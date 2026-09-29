@@ -1,5 +1,18 @@
 # General News Extractor Changelog
 
+## 1.0.2 (2026-09-30)
+
+### Bug fix
+
+1. 修复正文碎片被当作成功结果入库的问题：`content_needs_render()` 原先只判断空正文与“加载中”类占位词，导致 `正在阅读：<标题>` 这类导航碎片（央视文章页约 47 字）以 `ok` 状态入库，而 `ok` 会被后续运行永久跳过。新增 `MIN_CONTENT_LENGTH = 100` 与 `content_is_too_short()`，正文不足 100 字即触发浏览器渲染回退
+2. 渲染回退后正文仍不足 100 字时记 WARNING 并照常入库；渲染回退本身失败时维持 `no_content`（下次重试），避免一次环境故障就把碎片永久写成 `ok`
+3. 单 URL 抓取流程 `url_extract.extract_article()` 同步同一规则
+
+### Docs
+
+1. 新增 AGENTS.md 多 Agent 协作开发说明，并在 README 项目结构表中引用
+2. 同步 AGENTS.md §11.1 技术债与 §12.4 共享接口约定
+
 ## 0.4.1 (2026-03-02)
 
 ### Bug fix
