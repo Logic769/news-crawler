@@ -42,6 +42,37 @@ def main() -> None:
     if url_extract.is_video_page(ordinary_url, ordinary_html):
         raise AssertionError("embedded video ordinary article misclassified as video page")
 
+
+    # 普通文章的 JSON-LD @graph 内嵌 VideoObject 时不得误判为视频页
+    article_jsonld_html = (
+        '<html><head><meta property="og:type" content="article">'
+        '<script type="application/ld+json">'
+        '{"@graph":[{"@type":"NewsArticle","headline":"x"},{"@type":"VideoObject","name":"v"}]}'
+        "</script></head><body><article>正文</article></body></html>"
+    )
+    if url_extract.is_video_page("https://example.com/news/2026/10/30/abc.html", article_jsonld_html):
+        raise AssertionError("article JSON-LD @graph video misclassified as video page")
+
+    # 主实体的 @type 为数组 [VideoObject, NewsArticle] 时仍应识别为视频页
+    array_video_html = (
+        '<html><head><script type="application/ld+json">'
+        '{"@type":["VideoObject","NewsArticle"]}'
+        "</script></head><body></body></html>"
+    )
+    if not url_extract.is_video_page("https://example.com/news/2026/10/30/abc.html", array_video_html):
+        raise AssertionError("JSON-LD @type array video page not detected")
+
+    # 非 ISO 日期不得被按字符 T 截断
+    rfc_date_html = (
+        '<html><head><meta property="og:type" content="video.other">'
+        '<meta property="og:title" content="视频标题">'
+        '<meta property="article:published_time" content="Tue, 30 Oct 2026 10:00:00 GMT">'
+        "</head><body></body></html>"
+    )
+    rfc_meta = url_extract.extract_video_meta(rfc_date_html, "https://example.com/video/1")
+    if rfc_meta is None or rfc_meta["publish_time"] != "Tue, 30 Oct 2026 10:00:00 GMT":
+        raise AssertionError(f"RFC date wrongly truncated: {rfc_meta}")
+
     video_html = (
         '<html><head><meta property="og:type" content="video.other">'
         '<meta property="og:title" content="COVID-19疫苗获批-中新网视频">'

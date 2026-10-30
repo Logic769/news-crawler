@@ -45,7 +45,7 @@ RUN if [ "${INSTALL_BROWSER}" = "1" ]; then \
       rm -rf /var/lib/apt/lists/* ; \
     fi
 
-# 默认镜像必须真的带浏览器：构建期启动一次 Chromium，确保运行时可用（含 root 的 --no-sandbox）
+# 构建期尝试启动一次 Chromium；失败仅告警，由 CI 的 docker-build-full 兜底验证
 RUN if [ "${INSTALL_BROWSER}" = "1" ]; then \
       python -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage']); b.close(); p.stop(); print('chromium launch OK')" || echo 'WARNING: chromium self-check failed (CI will verify)' ; \
     fi

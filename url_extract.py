@@ -42,6 +42,58 @@ def content_needs_render(content: str) -> bool:
 _VIDEO_PATH_RE = re.compile(r"/(?:shipin|video|vod|videos)/", re.IGNORECASE)
 
 
+def _json_ld_type_sets(html_text: str) -> tuple[set[str], set[str]]:
+    """Return (main entity types, all types) from JSON-LD blocks.
+
+    Main entity = top-level object, first element of a top-level array, or first
+    typed item inside @graph. This avoids treating an article page as video
+    just because its @graph embeds a related VideoObject.
+    """
+    main_types: set[str] = set()
+    all_types: set[str] = set()
+
+    def add_types(value, target: set[str]) -> None:
+        if isinstance(value, str):
+            target.add(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    target.add(item)
+
+    def walk(value) -> None:
+        if isinstance(value, dict):
+            add_types(value.get("@type"), all_types)
+            for key, child in value.items():
+                if key != "@type" and isinstance(child, (dict, list)):
+                    walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    for match in re.finditer(
+        r'(?is)<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        (html_text or "")[:60000],
+    ):
+        try:
+            data = json.loads(match.group(1).strip())
+        except Exception:
+            continue
+        walk(data)
+
+        main = data
+        if isinstance(data, list):
+            main = next((item for item in data if isinstance(item, dict)), None)
+        elif isinstance(data, dict) and isinstance(data.get("@graph"), list):
+            main = next(
+                (item for item in data["@graph"] if isinstance(item, dict) and item.get("@type")),
+                None,
+            )
+        if isinstance(main, dict):
+            add_types(main.get("@type"), main_types)
+
+    return main_types, all_types
+
+
 def is_video_page(url: str, html_text: str) -> bool:
     """明确的视频页信号才返回 True，避免把内嵌播放器的普通文章误判为视频页。"""
     from urllib.parse import urlparse
@@ -57,8 +109,11 @@ def is_video_page(url: str, html_text: str) -> bool:
             r'(?is)content\s*=\s*["\']video', tag
         ):
             return True
-    # 只有 JSON-LD 明确声明 VideoObject 才算；普通文章内嵌 <video> 不算
-    if re.search(r'(?is)"@type"\s*:\s*"(?:VideoObject|Video)"', head):
+    main_types, all_types = _json_ld_type_sets(html_text)
+    if {"VideoObject", "Video"} & main_types:
+        return True
+    # 普通文章的 @graph 可能内嵌相关视频；有 Article 类型时不以视频页处理
+    if ({"VideoObject", "Video"} & all_types) and not ({"Article", "NewsArticle"} & all_types):
         return True
     return False
 
@@ -109,7 +164,7 @@ def extract_video_meta(html_text: str, url: str) -> dict | None:
     if title:
         # 仅剥离形如“-中新网视频”的站点后缀，不切分 COVID-19 这类普通连字符
         title = re.sub(
-            r"\s*[-–|_]\s*[^-–|_]{1,20}(?:网|视频|新闻|频道|首页|网站|客户端|报)$",
+            r"\s*[-–—－|_]\s*[^-–—－|_]{1,20}(?:网|视频|新闻|频道|首页|网站|客户端)$",
             "",
             title,
         ).strip()
@@ -126,7 +181,7 @@ def extract_video_meta(html_text: str, url: str) -> dict | None:
         or metas.get("date")
         or ""
     )
-    if "T" in publish:
+    if re.match(r"^\d{4}-\d{2}-\d{2}T", publish):
         publish = publish[:10]
     author = metas.get("author") or ""
     image = metas.get("og:image") or ""
