@@ -47,6 +47,7 @@ services:
       NEWS_ALLOW_PRIVATE_URLS: ${NEWS_ALLOW_PRIVATE_URLS:-}
       NEWS_EXTRACT_ALLOW_BROWSER: ${NEWS_EXTRACT_ALLOW_BROWSER:-}
       NEWS_MAX_PENDING_JOBS: ${NEWS_MAX_PENDING_JOBS:-50}
+      NEWS_REQUIRE_AUTH: ${NEWS_REQUIRE_AUTH:-}
     volumes:
       - ./sources.local.json:/app/sources.local.json:ro
       - ./data:/app/data

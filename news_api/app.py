@@ -46,8 +46,15 @@ LOG = logging.getLogger("news_api")
 
 
 def require_api_key(request: Request) -> None:
-    expected = request.app.state.settings.api_key
+    settings: Settings = request.app.state.settings
+    expected = settings.api_key
     if not expected:
+        if settings.require_auth:
+            raise HTTPException(
+                status_code=401,
+                detail="服务未设置 NEWS_API_KEY，已按 NEWS_REQUIRE_AUTH 拒绝未鉴权访问",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         return
     provided = request.headers.get("x-api-key", "").strip()
     if not provided:
@@ -90,9 +97,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.settings = settings
         app.state.jobs = manager
         if not settings.api_key:
-            LOG.warning(
-                "NEWS_API_KEY 未设置：/v1 接口无鉴权，仅在可信网络中暴露"
-            )
+            if settings.require_auth:
+                LOG.warning(
+                    "NEWS_API_KEY 未设置且 NEWS_REQUIRE_AUTH=1：业务接口将返回 401"
+                )
+            else:
+                LOG.warning(
+                    "NEWS_API_KEY 未设置：/v1 接口无鉴权，仅在可信网络中暴露"
+                )
         timezones = load_timezones(settings.config_path, settings.timezone)
         foreign = sorted({tz for tz in timezones.values() if tz != settings.timezone})
         if foreign:
@@ -146,6 +158,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             content={
                 "error": {
                     "code": "validation_error",
+                    "status": 422,
                     "message": "请求参数不合法",
                     "details": jsonable_encoder(exc.errors()),
                 }
@@ -189,6 +202,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 content={
                     "error": {
                         "code": "database_unavailable",
+                        "status": 503,
                         "message": "数据库不可用",
                     }
                 },

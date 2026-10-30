@@ -219,7 +219,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 
 列表参数：`status`、`source`、`published_from`、`published_to`、`q`、`page`、`page_size`、`order`、`include_content`。文章列表与作业列表返回 `{"data": [...], "meta": {...}}`；文章详情、统计、健康检查返回对应对象；`/v1/sources` 返回 `{"data": [...]}`。
 
-设置 `NEWS_API_KEY` 后，除 `/v1/health` 与文档外都需 `X-API-Key` 或 `Authorization: Bearer <key>`。作业状态为 `queued`/`running`/`succeeded`/`failed`，单进程执行，避免 SQLite 并发写冲突。排队 + 运行中的作业上限为 `NEWS_MAX_PENDING_JOBS`（默认 50），超出返回 `429`；相同类型与参数的未完成作业复用同一 ID。`extract` 默认拒绝回环、内网与保留地址（`NEWS_ALLOW_PRIVATE_URLS=1` 可放开）；`fetch_html` 通过自定义 `HTTPRedirectHandler` 对每个重定向目标复用同一校验，默认还以 `allow_browser=False` 禁用浏览器回退（`NEWS_EXTRACT_ALLOW_BROWSER=1` 可放开），避免页面 JS 绕过地址限制。上述限制仍不能替代 API Key。已完成作业保留 30 天后自动清理。
+设置 `NEWS_API_KEY` 后，除 `/v1/health` 与文档外都需 `X-API-Key` 或 `Authorization: Bearer <key>`。作业状态为 `queued`/`running`/`succeeded`/`failed`，单进程执行，避免 SQLite 并发写冲突。排队 + 运行中的作业上限为 `NEWS_MAX_PENDING_JOBS`（默认 50），超出返回 `429`；相同类型与参数的未完成作业复用同一 ID。`extract` 默认拒绝回环、内网与保留地址（`NEWS_ALLOW_PRIVATE_URLS=1` 可放开）；`fetch_html` 通过自定义 `HTTPRedirectHandler` 对每个重定向目标复用同一校验，默认还以 `allow_browser=False` 禁用浏览器回退（`NEWS_EXTRACT_ALLOW_BROWSER=1` 可放开），避免页面 JS 绕过地址限制。上述限制仍不能替代 API Key。已完成作业保留 30 天后自动清理。未设置 `NEWS_API_KEY` 时默认开放（仅提示 warning）；设置 `NEWS_REQUIRE_AUTH=1` 后行为是"未配置 key 则业务请求一律 401，已配置 key 时按 key 校验"（401 带 `WWW-Authenticate`，`/v1/health`、`/docs`、openapi 与根路径始终开放）。错误响应统一为 `{"error": {"code", "status": <HTTP 码>, "message", "details"?}}`，参数校验错误为 422 且带 `details`。`docker compose` 通过白名单透传 API 变量，需在 `.env` 或 shell 中设置后生效。
 
 ---
 
@@ -298,9 +298,10 @@ CREATE TABLE IF NOT EXISTS articles (
     list_title    TEXT,            -- 列表页标题
     title         TEXT,            -- GNE 抽取标题
     publish_time  TEXT,            -- 统一为 YYYY-MM-DD HH:MM:SS
+    timezone      TEXT,            -- 写入时的站点时区，历史行可能为空
     author        TEXT,
     content       TEXT,            -- 正文纯文本
-    images        TEXT,            -- JSON 数组字符串
+    images        TEXT,            -- JSON 数组字符串；空串表示本次未取到，不覆盖库中原值
     status        TEXT NOT NULL,   -- ok/old/no_content/unknown_date/error
     error         TEXT,
     first_seen_at TEXT,
@@ -323,7 +324,7 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 
 索引：`source`、`status`、`publish_time`、`article_id`（唯一）；`crawl_jobs` 的 `status`、`created_at`、`(type, payload, status)` 去重索引。
 
-旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、回填、建唯一索引与去重索引，完成后置 `user_version = 1`，后续启动直接跳过。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
+旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 2`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id` 与 `timezone`，按 2000 行分批回填 `article_id` 并建唯一索引与去重索引，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
 
 ### 7.2 status 语义
 
@@ -341,8 +342,10 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 - 用旧版本抓取过的数据可能仍是中文日期格式，需要 `--force` 重抓或重建数据库；
 - `content` 入库前会被 `clean_text()` 压缩空白，段落换行会丢失；
 - 同一 `(source, url)` 使用 upsert，不会产生重复记录；
+- `save_article()` 是**部分更新**：空字符串/空图片表示“这次没拿到”，不会覆盖库中已有值，因此抓取失败或重新分类时只更新 `status`/`error`，已成功入库的正文不会被清空；
+- `timezone` 随文章落库，读取时优先使用该列，旧行（NULL）才回落到当前配置推断；`published_from`/`published_to` 仍按站点本地墙钟字符串比较，混合时区时会有偏差；
 - `article_id` 由 `sha256(source + \x1f + url)` 派生，不随数据库重建变化，可安全作为下游引用；
-- SQLite 启用 WAL 与 `busy_timeout=5000`，API 作业默认单 worker 写入。
+- SQLite 启用 WAL 与 `busy_timeout=5000`，API 作业默认单 worker 写入；只读查询使用 `file:...?mode=ro` URI（路径会转义），WAL 库仍要求目录可写（需要 -shm/-wal）。
 
 ---
 

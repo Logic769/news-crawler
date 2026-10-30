@@ -117,6 +117,7 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             url_validator=validator,
         )
         if result is None:
+            # 只标记错误：save_article 是部分更新，已有正文不会被清空。
             news_crawler.save_article(
                 conn,
                 source,
@@ -138,6 +139,7 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             url,
             title=news_crawler.clean_text(result.get("title")),
             publish_time=publish_text,
+            timezone=settings.timezone,
             author=news_crawler.clean_text(result.get("author")),
             content=news_crawler.clean_text(result.get("content")),
             images=result.get("images") or [],

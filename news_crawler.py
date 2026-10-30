@@ -43,7 +43,7 @@ LOG = logging.getLogger("news_crawler")
 
 DEFAULT_SOURCES_FILE = "sources.json"
 DEFAULT_DB_FILE = "news.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS articles (
@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS articles (
     list_title   TEXT,
     title        TEXT,
     publish_time TEXT,
+    timezone     TEXT,
     author       TEXT,
     content      TEXT,
     images       TEXT,
@@ -232,20 +233,29 @@ def parse_datetime(
 def _migrate_schema(conn: sqlite3.Connection) -> None:
     """Add columns/indexes introduced after the first schema version."""
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-    if version >= SCHEMA_VERSION:
-        return
     columns = {row[1] for row in conn.execute("PRAGMA table_info(articles)")}
+    # 只有“版本号到位且列确实齐全”才跳过迁移：手工改库、降级或中途异常都可能
+    # 让 user_version 已置位而列缺失，此时早退会让后续 INSERT/SELECT 直接报错。
+    if version >= SCHEMA_VERSION and {"article_id", "timezone"} <= columns:
+        return
     if "article_id" not in columns:
         conn.execute("ALTER TABLE articles ADD COLUMN article_id TEXT")
+    if "timezone" not in columns:
+        conn.execute("ALTER TABLE articles ADD COLUMN timezone TEXT")
 
-    rows = conn.execute(
+    # 分批回填，避免大库一次性 fetchall 占满内存；仍在同一事务内，保证
+    # article_id 全部回填后才会置位 user_version。
+    cursor = conn.execute(
         "SELECT source, url FROM articles "
         "WHERE article_id IS NULL OR article_id = ''"
-    ).fetchall()
-    if rows:
+    )
+    while True:
+        batch = cursor.fetchmany(2000)
+        if not batch:
+            break
         conn.executemany(
             "UPDATE articles SET article_id = ? WHERE source = ? AND url = ?",
-            [(article_id_for(source, url), source, url) for source, url in rows],
+            [(article_id_for(source, url), source, url) for source, url in batch],
         )
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_article_id "
@@ -258,10 +268,43 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
+def _ensure_wal(conn: sqlite3.Connection) -> None:
+    """Switch to WAL once, tolerating concurrent first-start connections.
+
+    PRAGMA journal_mode 不受 busy_timeout 保护：多个进程同时首次初始化时，
+    另一个连接持锁会让该语句直接抛 "database is locked"。已是 WAL 时跳过，
+    否则短重试后放行（后续 BEGIN IMMEDIATE 仍负责串行化迁移）。
+    """
+    try:
+        current = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    except sqlite3.OperationalError:
+        current = ""
+    if str(current).lower() == "wal":
+        return
+    for attempt in range(3):
+        try:
+            row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        except sqlite3.OperationalError as exc:
+            if attempt == 2:
+                LOG.warning("切换到 WAL 失败，继续使用当前日志模式：%s", exc)
+                return
+            time.sleep(0.2)
+            continue
+        # 不支持的库（如 :memory: 或网络文件系统）不抛异常，只返回原模式，
+        # 因此必须校验返回值，否则会静默跑在 delete 模式。
+        mode = str(row[0]).lower() if row else ""
+        if mode == "wal":
+            return
+        if attempt == 2:
+            LOG.warning("无法切换到 WAL，继续使用日志模式：%s", mode or "unknown")
+            return
+        time.sleep(0.2)
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=30)
     conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA journal_mode=WAL")
+    _ensure_wal(conn)
     conn.executescript(SCHEMA_SQL)
     # 迁移必须串行执行：API 可能同时运行多个 extract 作业，
     # 并发 ALTER TABLE / 回填会互相冲突。BEGIN IMMEDIATE 让其他
@@ -454,27 +497,37 @@ def save_article(
     list_title: str = "",
     title: str = "",
     publish_time: str = "",
+    timezone: str = "",
     author: str = "",
     content: str = "",
     images: list[str] | None = None,
     status: str,
     error: str = "",
 ) -> str:
+    """Insert or update one article with partial-update semantics.
+
+    空值表示"这次没有拿到该字段"，不会覆盖库中已有内容：重新抓取失败、
+    文章被判过期或正文抽取失败时只更新 status/error，已经成功抓到的
+    正文、标题、发布时间不会被清空。状态始终按本次结果覆盖。
+    """
     article_id = article_id_for(source, url)
+    images_json = json.dumps(images, ensure_ascii=False) if images else ""
+    stamp = now_iso()
     conn.execute(
         """
         INSERT INTO articles (
-            article_id, source, url, list_title, title, publish_time, author,
-            content, images, status, error, first_seen_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            article_id, source, url, list_title, title, publish_time, timezone,
+            author, content, images, status, error, first_seen_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source, url) DO UPDATE SET
             article_id = excluded.article_id,
-            list_title = excluded.list_title,
-            title = excluded.title,
-            publish_time = excluded.publish_time,
-            author = excluded.author,
-            content = excluded.content,
-            images = excluded.images,
+            list_title = COALESCE(NULLIF(excluded.list_title, ''), articles.list_title),
+            title = COALESCE(NULLIF(excluded.title, ''), articles.title),
+            publish_time = COALESCE(NULLIF(excluded.publish_time, ''), articles.publish_time),
+            timezone = COALESCE(NULLIF(excluded.timezone, ''), articles.timezone),
+            author = COALESCE(NULLIF(excluded.author, ''), articles.author),
+            content = COALESCE(NULLIF(excluded.content, ''), articles.content),
+            images = COALESCE(NULLIF(excluded.images, ''), articles.images),
             status = excluded.status,
             error = excluded.error,
             updated_at = excluded.updated_at
@@ -486,13 +539,14 @@ def save_article(
             list_title,
             title,
             publish_time,
+            timezone,
             author,
             content,
-            json.dumps(images or [], ensure_ascii=False),
+            images_json,
             status,
             error,
-            now_iso(),
-            now_iso(),
+            stamp,
+            stamp,
         ),
     )
     conn.commit()
@@ -525,6 +579,7 @@ def process_entry(
             url,
             list_title=entry.get("title", ""),
             publish_time=list_date.strftime("%Y-%m-%d %H:%M:%S"),
+            timezone=source.get("timezone", "Asia/Shanghai"),
             status="old",
         )
         return "old"
@@ -572,6 +627,7 @@ def process_entry(
             list_title=entry.get("title", ""),
             title=clean_text(result.get("title")),
             publish_time=publish_text,
+            timezone=source.get("timezone", "Asia/Shanghai"),
             author=clean_text(result.get("author")),
             status="old",
         )
@@ -598,6 +654,7 @@ def process_entry(
         list_title=entry.get("title", ""),
         title=clean_text(result.get("title")),
         publish_time=publish_text,
+        timezone=source.get("timezone", "Asia/Shanghai"),
         author=clean_text(result.get("author")),
         content=clean_text(result.get("content")),
         images=result.get("images") or [],

@@ -183,8 +183,13 @@ curl http://localhost:8000/v1/health
 | `NEWS_ALLOW_PRIVATE_URLS` | 空（关闭） | 允许 `extract` 抓取回环/内网地址；仅可信环境开启 |
 | `NEWS_EXTRACT_ALLOW_BROWSER` | 空（关闭） | 允许 `extract` 在直接抓取失败时回退无头浏览器；仅在可信环境开启 |
 | `NEWS_MAX_PENDING_JOBS` | `50` | 排队 + 运行中的作业上限，超出返回 `429`；相同类型与参数的未完成作业会复用 |
+| `NEWS_REQUIRE_AUTH` | 空（关闭） | 设为 `1` 时要求必须配置 `NEWS_API_KEY`，否则业务接口一律返回 `401` |
 
 > 安全提示：未设置 `NEWS_API_KEY` 时接口完全开放。compose 默认只监听 `127.0.0.1`；如需局域网访问，请同时设置强随机 `NEWS_API_KEY` 再改 `NEWS_API_BIND=0.0.0.0`。`extract` 默认拒绝回环、内网与保留地址，并在每次 HTTP 重定向时重新校验目标；默认还禁用浏览器回退，避免通过页面 JS 绕过地址限制。确需抓取内网新闻时设置 `NEWS_ALLOW_PRIVATE_URLS=1`；确需浏览器渲染时再加 `NEWS_EXTRACT_ALLOW_BROWSER=1`。
+>
+> 开启 `NEWS_EXTRACT_ALLOW_BROWSER=1` 等于放弃上述地址限制：Chromium 会自行解析 DNS 并跟随跳转，`extract` 只对初始 URL 与 HTTP 层的每一跳做校验。另外 DNS 解析与真正建连是两次独立查询，仍存在 DNS rebinding 的理论窗口。因此公网部署请始终设置 `NEWS_API_KEY`（或 `NEWS_REQUIRE_AUTH=1`），并保持浏览器回退关闭。
+
+> 用 `docker compose` 部署时，API 的变量通过 compose 的白名单透传，需要在项目根目录的 `.env` 或当前 shell 中设置后才生效（例如 `NEWS_API_KEY=... docker compose up -d api`）。
 
 设置 API Key 的示例（bash）：
 
@@ -207,7 +212,7 @@ curl -H "X-API-Key: change-me" http://localhost:8000/v1/articles
 | GET | `/v1/jobs` | 任务列表 |
 | GET | `/v1/jobs/{id}` | 任务状态与结果 |
 
-`/v1/health` 在数据库异常时返回 `503` 和 `{"error":{"code":"database_unavailable","message":"数据库不可用"}}`，可直接作为容器健康检查探针。其余错误统一为 `{"error":{"code":"http_error","status":<HTTP 状态码>,"message":"..."}}`，参数校验失败时额外带 `details`。
+`/v1/health` 在数据库异常时返回 `503` 和 `{"error":{"code":"database_unavailable","status":503,"message":"数据库不可用"}}`，可直接作为容器健康检查探针。其余错误统一为 `{"error":{"code":"http_error","status":<HTTP 状态码>,"message":"..."}}`；参数校验失败时 `code` 为 `validation_error`、`status` 为 `422`，并额外带 `details`。
 
 ### 查询文章
 
@@ -244,12 +249,12 @@ curl "http://localhost:8000/v1/articles?status=all&page_size=50"
 | `published_at` | 带时区的 ISO 8601 发布时间，例如 `2026-10-30T10:00:00+08:00` |
 | `published_at_utc` | 同一时间的 UTC 表示，以 `Z` 结尾 |
 | `published_raw` | 数据库里的原始发布时间字符串 |
-| `timezone` | 该站点使用的时区 |
+| `timezone` | 该文章写入时使用的站点时区（落库保存，站点配置变化不影响历史数据；`unknown_date` 等没有发布时间的结果不会写入该列） |
 | `content` / `content_length` | 正文（列表默认不返回，详情始终返回）与字数 |
 | `images` | 图片 URL 数组 |
 | `status` / `error` | 抓取状态与错误信息 |
 
-> 时间排序与过滤基于数据库内的站点本地时间。若同时接入不同时区的来源，分页排序可能存在偏差：建议统一各站点的 `timezone`，或在展示层用 `published_at_utc` 做二次校准。
+> 时间排序与过滤基于数据库内的站点本地时间字符串。若同时接入不同时区的来源，分页排序与 `published_from`/`published_to` 区间可能存在偏差：建议统一各站点的 `timezone`，或在展示层用 `published_at_utc` 做二次校准。升级前写入的老数据没有 `timezone` 列，会回落到当前配置推断。
 
 详情示例：
 
@@ -260,6 +265,8 @@ curl "http://localhost:8000/v1/articles/<article_id>"
 ### 异步抓取
 
 创建任务后立即返回 `202` 和任务 ID，用任务详情轮询结果。任务持久化在 SQLite 的 `crawl_jobs` 表，服务重启时 `queued` 任务会继续执行，中断的 `running` 任务会标记为失败。排队与运行中的作业总数受 `NEWS_MAX_PENDING_JOBS` 限制，超出返回 `429`；相同类型与参数的未完成作业会复用同一任务 ID；已完成作业保留 30 天后自动清理。
+>
+> 任务写库采用“部分更新”语义：某次抓取失败只会把该文章标记为 `error` 并记录原因，已经成功抓到的正文、标题、发布时间不会被清空。
 
 ```bash
 # 按 sources.local.json 抓取最近 3 天
