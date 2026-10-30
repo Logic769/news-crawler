@@ -38,14 +38,14 @@ GNE 本身只负责“从 HTML 中抽取新闻信息”，不负责发起 HTTP �
 | 语言 | Python 3.10+ | 使用联合类型、泛型语法等 Python 3.10 特性 |
 | HTML 解析 | lxml | GNE 抽取核心依赖，爬虫的 XPath 解析也使用它 |
 | 配置格式 | JSON | `sources.json` / `sources.local.json` |
-| 数据存储 | SQLite（标准库 sqlite3） | 单文件数据库，默认 `news.db` |
+| 数据存储 | SQLite（标准库 sqlite3） | 单文件数据库，默认 `/app/data/news.db`（宿主机挂载为 `./data/news.db`） |
 | 浏览器回退 | Playwright + Chrome/Chromium | 可选依赖 `[browser]`，处理 JS 渲染页面 |
 | HTTP 请求 | urllib（标准库） | 带 User-Agent、编码探测、SSL 降级 |
 | 并发模型 | concurrent.futures.ThreadPoolExecutor | 站点级并发，每个站点内部串行 |
 | 时区处理 | zoneinfo | 默认 `Asia/Shanghai` |
 | 打包 | hatchling + pyproject.toml | 支持 `pip install -e ".[browser]"` |
 | 依赖锁定 | uv.lock | 提供给使用 uv 的开发者 |
-| CI | GitHub Actions | `deploy-test.yml` 在 Ubuntu 上执行 `deploy.sh` 与 Docker 构建/冒烟 |
+| CI | GitHub Actions | `deploy-test.yml` 执行多 Python 版本静态检查、Docker 构建与容器冒烟测试 |
 
 运行依赖（必装）：
 
@@ -71,8 +71,6 @@ news-crawler/
 ├── smoke_test.py                   # 部署后的离线冒烟测试
 ├── sources.json                    # 仓库自带空模板（会被 Git 跟踪）
 ├── sources.local.json              # 本地私有站点配置（.gitignore 忽略）
-├── deploy.bat / deploy.ps1         # Windows 一键部署
-├── deploy.sh                       # Linux/macOS 一键部署
 ├── Dockerfile                      # 容器镜像定义（含 Playwright Chromium）
 ├── docker-compose.yml              # Docker Compose 编排（挂载配置/数据）
 ├── docker/entrypoint.sh            # 容器统一入口（run/init/test/smoke/shell）
@@ -109,8 +107,7 @@ news-crawler/
 ### 本地私有文件（绝对不要提交）
 
 - `sources.local.json`：真实站点配置；
-- `news.db`：抓取结果数据库；
-- `.venv/`：虚拟环境；
+- `data/news.db`：抓取结果数据库（挂载在 `data/` 目录）；
 - 任何包含 Token、Cookie、账号、密码、代理地址的文件。
 
 这些路径已写入 `.gitignore`。
@@ -255,9 +252,9 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 4. 用 `--limit-per-source 1` 小批量试跑；
 5. 确认无误后再全量运行。
 
-```powershell
-.\.venv\Scripts\python.exe -X utf8 news_crawler.py test --config sources.local.json --name example
-.\.venv\Scripts\python.exe -X utf8 news_crawler.py run --config sources.local.json --limit-per-source 1
+```bash
+docker compose run --rm crawler test --config sources.local.json --name example
+docker compose run --rm crawler run --config sources.local.json --limit-per-source 1
 ```
 
 ---
@@ -307,40 +304,38 @@ CREATE TABLE IF NOT EXISTS articles (
 
 ## 8. CLI 命令速查
 
-所有命令都使用虚拟环境 Python：
+所有命令都通过 Docker 容器执行（在宿主机项目根目录运行，无需本地安装 Python）：
 
-```powershell
-# Windows
-.\.venv\Scripts\python.exe -X utf8 <script> [args]
-
-# Linux/macOS
-.venv/bin/python -X utf8 <script> [args]
+```bash
+docker compose run --rm crawler <子命令> [args]
 ```
+
+需要直接运行脚本时用 `--entrypoint python` 覆盖入口。
 
 ### 初始化数据库
 
-```powershell
-.\.venv\Scripts\python.exe -X utf8 news_crawler.py init --db news.db
+```bash
+docker compose run --rm crawler init --db /app/data/news.db
 ```
 
 ### 测试列表解析（不抓正文）
 
-```powershell
-.\.venv\Scripts\python.exe -X utf8 news_crawler.py test --config sources.local.json --name example
+```bash
+docker compose run --rm crawler test --config sources.local.json --name example
 ```
 
 参数：`--limit` 控制每个站点输出条数。
 
 ### 运行抓取
 
-```powershell
-.\.venv\Scripts\python.exe -X utf8 news_crawler.py run --config sources.local.json --days 3
+```bash
+docker compose run --rm crawler run --config sources.local.json --days 3
 ```
 
 | 参数 | 说明 |
 | --- | --- |
 | `--config` | 配置文件路径，默认 `sources.json`（存在 `sources.local.json` 时自动切换） |
-| `--db` | 数据库路径，默认 `news.db` |
+| `--db` | 数据库路径，容器内默认 `/app/data/news.db` |
 | `--days` | 抓取最近 N 天，默认取配置文件中的 `days` |
 | `--since` | 起始日期 `YYYY-MM-DD` |
 | `--workers` | 站点级并发数 |
@@ -349,33 +344,15 @@ CREATE TABLE IF NOT EXISTS articles (
 
 ### 单 URL 抓取
 
-```powershell
-.\.venv\Scripts\python.exe -X utf8 url_extract.py "https://example.com/article.html"
+```bash
+docker compose run --rm --entrypoint python crawler -X utf8 url_extract.py "https://example.com/article.html"
 ```
 
 ---
 
 ## 9. 部署机制
 
-### 9.1 Windows
-
-- 入口：`deploy.bat`（纯 ASCII，调用 PowerShell，避免 cmd 编码问题）
-- 实现：`deploy.ps1`（带 UTF-8 BOM，兼容 Windows PowerShell 5.1）
-- 行为：检查 Python → 创建 `.venv` → 安装依赖 → 检测 Chrome（缺失则装 Playwright Chromium）→ 初始化数据库 → 运行 `smoke_test.py`
-
-### 9.2 Linux/macOS
-
-- 脚本：`deploy.sh`（LF 换行，Git 中带可执行位）
-- 行为与 Windows 一致，浏览器检测命令为 `google-chrome` / `chromium` 等
-- 可用 `SKIP_BROWSER=1 ./deploy.sh` 跳过浏览器下载
-
-### 9.3 国内网络加速（可选，写入 README）
-
-- GitHub 克隆：第三方代理镜像（有代码经手风险，谨慎使用）
-- PyPI：`https://pypi.tuna.tsinghua.edu.cn/simple`
-- Playwright：`https://npmmirror.com/mirrors/playwright`
-
-### 9.4 Docker（推荐方式）
+### 9.1 Docker（唯一部署方式）
 
 - 文件：`Dockerfile`、`.dockerignore`、`docker-compose.yml`、`docker/entrypoint.sh`、`docker-deploy.sh`、`docker-deploy.bat`
 - 基础镜像：`python:3.12-slim`；**默认镜像自带 Playwright Chromium**（`playwright install --with-deps chromium`，构建期会实际启动一次 Chromium 自检），可用构建参数 `INSTALL_BROWSER=0` 关闭以减小镜像但失去浏览器能力
@@ -387,13 +364,15 @@ CREATE TABLE IF NOT EXISTS articles (
 - 一键部署：`./docker-deploy.sh`（Linux/macOS）或 `.\docker-deploy.bat`（Windows）
 - 国内加速：`PIP_INDEX_URL`、`PLAYWRIGHT_DOWNLOAD_HOST` 通过环境变量/构建参数注入
 
-### 9.5 CI
+### 9.2 CI
 
 `.github/workflows/deploy-test.yml`：
 
 - 触发：push 到 `master`，或手动 `workflow_dispatch`
-- `linux-deploy` job：Ubuntu + Python 3.12，执行 `./deploy.sh`（原生部署冒烟）
+- `python-checks` job：Python 3.10–3.13 矩阵，执行 compileall、ruff 关键规则与 smoke
+- `shell-and-yaml` job：bash 语法检查、shellcheck 与 YAML 解析校验
 - `docker-build` job：Ubuntu，`docker build` 后执行 `docker run --rm news-crawler:ci smoke`
+- `docker-build-full` job：默认含浏览器镜像构建 + Chromium 启动校验 + smoke（仅 push 或手动运行）
 - 通过标准：各 job 退出码为 0（包含 `SMOKE TEST PASSED`）
 
 ---
@@ -410,15 +389,15 @@ CREATE TABLE IF NOT EXISTS articles (
 
 ### 提交前必须执行
 
-```powershell
-.\.venv\Scripts\python.exe -m py_compile news_crawler.py url_extract.py smoke_test.py
-.\.venv\Scripts\python.exe -X utf8 smoke_test.py
+```bash
+docker compose run --rm --entrypoint python crawler -m py_compile news_crawler.py url_extract.py smoke_test.py
+docker compose run --rm crawler smoke
 ```
 
 如果改动了抓取或日期逻辑，至少再执行：
 
-```powershell
-.\.venv\Scripts\python.exe -X utf8 news_crawler.py test --config sources.local.json --limit 2
+```bash
+docker compose run --rm crawler test --config sources.local.json --limit 2
 ```
 
 ### 测试缺口（后续可补）
@@ -474,7 +453,7 @@ CREATE TABLE IF NOT EXISTS articles (
 | B. 抓取调度 | 列表解析、日期过滤、并发、入库 | `news_crawler.py` |
 | C. 网络与渲染 | HTTP 抓取、编码、SSL、Playwright 回退 | `url_extract.py` |
 | D. 站点适配 | XPath 调优、真实站点接入（配置只放本地） | `sources.local.json` |
-| E. 工程化 | 部署脚本、CI、文档、发布 | `deploy.*`、`.github/`、`README.md`、`AGENTS.md` |
+| E. 工程化 | Docker 部署、CI、文档、发布 | `Dockerfile`、`docker/`、`docker-compose.yml`、`docker-deploy.*`、`.github/`、`README.md`、`AGENTS.md` |
 
 ### 12.3 文件冲突风险
 
@@ -524,19 +503,19 @@ CREATE TABLE IF NOT EXISTS articles (
 
 ## 14. 快速上手命令（Agent 版）
 
-```powershell
+```bash
 # 1. 同步代码
 git pull origin master
 
-# 2. 部署（首次或依赖变更后）
-.\deploy.bat
+# 2. 构建镜像（首次或依赖变更后）
+docker compose build
 
 # 3. 冒烟测试
-.\.venv\Scripts\python.exe -X utf8 smoke_test.py
+docker compose run --rm crawler smoke
 
 # 4. 列表解析测试
-.\.venv\Scripts\python.exe -X utf8 news_crawler.py test --config sources.local.json --limit 2
+docker compose run --rm crawler test --config sources.local.json --limit 2
 
 # 5. 小批量抓取
-.\.venv\Scripts\python.exe -X utf8 news_crawler.py run --config sources.local.json --limit-per-source 1
+docker compose run --rm crawler run --config sources.local.json --limit-per-source 1
 ```

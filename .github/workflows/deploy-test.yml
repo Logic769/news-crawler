@@ -48,21 +48,6 @@ jobs:
       - name: Smoke test
         run: python -X utf8 smoke_test.py
 
-  linux-deploy:
-    name: native one-click deploy (linux)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Run Linux one-click deploy
-        run: ./deploy.sh
-
   shell-and-yaml:
     name: shell + yaml lint
     runs-on: ubuntu-latest
@@ -72,12 +57,11 @@ jobs:
 
       - name: Bash syntax check
         run: |
-          bash -n deploy.sh
           bash -n docker-deploy.sh
           bash -n docker/entrypoint.sh
 
       - name: ShellCheck (error level, all scripts)
-        run: shellcheck -S error deploy.sh docker-deploy.sh docker/entrypoint.sh
+        run: shellcheck -S error docker-deploy.sh docker/entrypoint.sh
 
       - name: ShellCheck (warning+ for docker scripts)
         run: shellcheck -S warning docker-deploy.sh docker/entrypoint.sh
