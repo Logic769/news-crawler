@@ -32,6 +32,33 @@ def main() -> None:
         if parsed is None or parsed.strftime("%Y-%m-%d") != expected:
             raise AssertionError(f"date parse failed: {text!r} -> {parsed}")
 
+    # 视频页适配最小回归用例：防误判 / 标题截断 / 日期优先级
+    ordinary_url = "https://example.com/news/2026/10/30/abc.html?related=/video/1"
+    ordinary_html = (
+        "<html><head><title>普通文章</title></head><body><article>"
+        '<video><source type="video/mp4" src="a.mp4"></video><p>正文</p>'
+        "</article></body></html>"
+    )
+    if url_extract.is_video_page(ordinary_url, ordinary_html):
+        raise AssertionError("embedded video ordinary article misclassified as video page")
+
+    video_html = (
+        '<html><head><meta property="og:type" content="video.other">'
+        '<meta property="og:title" content="COVID-19疫苗获批-中新网视频">'
+        '<meta name="date" content="2026-10-30">'
+        '<script type="application/ld+json">'
+        '{"@type":"VideoObject","datePublished":"2020-01-05"}</script>'
+        "</head><body></body></html>"
+    )
+    video_url = "https://example.com/shipin/2026/10-30/news1.shtml"
+    if not url_extract.is_video_page(video_url, video_html):
+        raise AssertionError("video page not detected")
+    video_meta = url_extract.extract_video_meta(video_html, video_url)
+    if video_meta is None or video_meta["title"] != "COVID-19疫苗获批":
+        raise AssertionError(f"video title truncated: {video_meta}")
+    if video_meta["publish_time"] != "2020-01-05":
+        raise AssertionError(f"video publish priority wrong: {video_meta['publish_time']}")
+
     sample_html = (root / "tests" / "163" / "1.html").read_text(
         encoding="utf-8",
         errors="ignore",

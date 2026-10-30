@@ -1,6 +1,7 @@
 """Fetch a news article URL and extract title/content with GNE."""
 
 import json
+import os
 import re
 import ssl
 import sys
@@ -38,18 +39,28 @@ def content_needs_render(content: str) -> bool:
     return len(text) < 500 and any(p in text for p in placeholders)
 
 
-_VIDEO_URL_MARKERS = ("/shipin/", "/video/", "/vod/", "/videos/")
+_VIDEO_PATH_RE = re.compile(r"/(?:shipin|video|vod|videos)/", re.IGNORECASE)
 
 
 def is_video_page(url: str, html_text: str) -> bool:
-    """Heuristic: is this URL/HTML a video article page?"""
-    lowered = (url or "").lower()
-    if any(marker in lowered for marker in _VIDEO_URL_MARKERS):
+    """明确的视频页信号才返回 True，避免把内嵌播放器的普通文章误判为视频页。"""
+    from urllib.parse import urlparse
+
+    path = urlparse(url or "").path or ""
+    if _VIDEO_PATH_RE.search(path):
         return True
-    head = (html_text or "")[:40000].lower()
-    if 'og:type" content="video' in head or "og:type' content='video" in head:
+
+    head = (html_text or "")[:60000]
+    for match in re.finditer(r"(?is)<meta\b[^>]*>", head):
+        tag = match.group(0)
+        if re.search(r'(?is)(?:property|name)\s*=\s*["\']og:type["\']', tag) and re.search(
+            r'(?is)content\s*=\s*["\']video', tag
+        ):
+            return True
+    # 只有 JSON-LD 明确声明 VideoObject 才算；普通文章内嵌 <video> 不算
+    if re.search(r'(?is)"@type"\s*:\s*"(?:VideoObject|Video)"', head):
         return True
-    return "<video" in head and 'type="video/' in head
+    return False
 
 
 def _meta_map(html_text: str) -> dict:
@@ -96,18 +107,28 @@ def extract_video_meta(html_text: str, url: str) -> dict | None:
         if t:
             title = unescape(t.group(1)).strip()
     if title:
-        title = re.split(r"\s*[-_|]\s*", title)[0].strip()
+        # 仅剥离形如“-中新网视频”的站点后缀，不切分 COVID-19 这类普通连字符
+        title = re.sub(
+            r"\s*[-–|_]\s*[^-–|_]{1,20}(?:网|视频|新闻|频道|首页|网站|客户端|报)$",
+            "",
+            title,
+        ).strip()
 
     description = metas.get("og:description") or metas.get("description") or ""
     publish = (
         metas.get("article:published_time")
+        or metas.get("og:published_time")
+        or metas.get("publish_date")
+        or _json_ld_published(html_text)
         or metas.get("publishdate")
         or metas.get("pubdate")
-        or metas.get("date")
-        or _json_ld_published(html_text)
         or _date_from_url(url)
+        or metas.get("date")
+        or ""
     )
-    author = metas.get("author") or metas.get("og:site_name") or ""
+    if "T" in publish:
+        publish = publish[:10]
+    author = metas.get("author") or ""
     image = metas.get("og:image") or ""
     content = description or title
     if not title and not description:
@@ -133,7 +154,12 @@ def fetch_html_with_browser(url: str) -> str | None:
     try:
         with sync_playwright() as p:
             browser = None
-            launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+            launch_args = ["--disable-dev-shm-usage"]
+            try:
+                if os.geteuid() == 0:
+                    launch_args.insert(0, "--no-sandbox")
+            except AttributeError:
+                pass
             try:
                 browser = p.chromium.launch(channel="chrome", headless=True, args=launch_args)
             except Exception:
