@@ -36,7 +36,7 @@ COPY pyproject.toml pypi_desc.md uv.lock ./
 COPY docker/constraints.txt ./docker/constraints.txt
 COPY gne ./gne
 # 用 docker/constraints.txt（版本源自 uv.lock）锁定依赖，确保可复现构建
-RUN pip install --no-cache-dir --constraint docker/constraints.txt ".[browser]"
+RUN pip install --no-cache-dir --constraint docker/constraints.txt ".[browser,api]"
 
 # Playwright Chromium + 浏览器所需系统库（仅 INSTALL_BROWSER=1 时安装）
 RUN if [ "${INSTALL_BROWSER}" = "1" ]; then \

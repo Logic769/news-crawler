@@ -39,19 +39,22 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ".[browser]"
+          pip install ".[browser,api]"
           pip install ruff
 
       - name: Byte-compile all sources
-        run: python -m compileall -q news_crawler.py url_extract.py smoke_test.py verify_live_news.py gne
+        run: python -m compileall -q news_crawler.py url_extract.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api gne
 
       - name: "Ruff (blocking rules: syntax / undefined names)"
         run: >
           ruff check --select E9,F63,F7,F82 --target-version py310
-          news_crawler.py url_extract.py smoke_test.py verify_live_news.py gne
+          news_crawler.py url_extract.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api gne
 
       - name: Smoke test
         run: python -X utf8 smoke_test.py
+
+      - name: API smoke test
+        run: python -X utf8 api_smoke.py
 
   shell-and-yaml:
     name: shell + yaml lint
@@ -97,11 +100,49 @@ jobs:
       - name: Run smoke test inside container
         run: docker run --rm news-crawler:ci smoke
 
+      - name: Run API smoke test inside container
+        run: docker run --rm --entrypoint python news-crawler:ci -X utf8 api_smoke.py
+
       - name: Prepare config for compose
-        run: cp sources.json sources.local.json
+        run: |
+          cp sources.json sources.local.json
+          mkdir -p data
 
       - name: Compose smoke
         run: docker compose run --rm --no-deps crawler smoke
+
+      - name: Compose API smoke
+        run: |
+          docker tag news-crawler:ci news-crawler:local
+          docker compose up -d --no-build api
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/v1/health | grep '"database":"ok"' >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "${ready:-0}" = "1"
+          curl -fsS http://127.0.0.1:8000/v1/health
+          docker compose logs api
+          docker compose stop api
+
+      - name: Bare API entrypoint keeps persistent DB path
+        run: |
+          docker run -d --name news-api-entry -v "$PWD/data:/app/data" news-crawler:ci api
+          for _ in $(seq 1 30); do
+            if docker exec news-api-entry python -c "import urllib.request,json; print(json.load(urllib.request.urlopen('http://127.0.0.1:8000/v1/health'))['database'])" 2>/dev/null | grep -x ok; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "${ready:-0}" = "1"
+          docker exec news-api-entry sh -c 'tr "\0" "\n" < /proc/1/environ' | grep -xF 'NEWS_DB=/app/data/news.db'
+          echo "DB PATH OK: /app/data/news.db"
+          docker exec news-api-entry python -c "import urllib.request,json; data=json.load(urllib.request.urlopen('http://127.0.0.1:8000/v1/health')); assert data['database']=='ok', data; print('API HEALTH OK', data['api_version'])"
+          docker logs news-api-entry
+          docker stop news-api-entry
 
   docker-build-full:
     name: docker build (default, with browser) + smoke + live news
@@ -121,6 +162,9 @@ jobs:
 
       - name: Run smoke test inside container
         run: docker run --rm news-crawler:full smoke
+
+      - name: Run API smoke test inside container
+        run: docker run --rm --entrypoint python news-crawler:full -X utf8 api_smoke.py
 
       - name: Run live news verification (5 static / 3 JS-rendered / 2 video)
         # 真实站点与海外 Runner 的网络状况不可控，只作观测，不阻塞 master

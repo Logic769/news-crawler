@@ -25,11 +25,14 @@
 | --- | --- |
 | `news_crawler.py` | 多站点批量抓取主程序 |
 | `url_extract.py` | 单条文章网址抽取工具 |
+| `api.py` | FastAPI 应用入口（`uvicorn api:app`） |
+| `news_api/` | 新闻查询 API、异步任务与 SQLite 读模型 |
+| `api_smoke.py` | API 离线冒烟测试（CI 使用） |
 | `sources.json` | 仓库自带的空站点配置模板 |
 | `sources.local.json` | 本地私人站点配置（被 Git 忽略，不会提交） |
 | `Dockerfile` | 容器镜像定义（含 Playwright Chromium） |
 | `docker-compose.yml` | Docker Compose 编排（挂载配置与数据目录） |
-| `docker/entrypoint.sh` | 容器统一入口（run/init/test/smoke/live-news/shell） |
+| `docker/entrypoint.sh` | 容器统一入口（run/init/test/api/smoke/live-news/shell） |
 | `docker-deploy.sh` / `docker-deploy.bat` | Docker 一键部署脚本（Linux·macOS / Windows） |
 | `smoke_test.py` | 部署后的离线自检脚本 |
 | `verify_live_news.py` | CI 实时新闻抓取验证（5 静态 / 3 JS 渲染 / 2 视频） |
@@ -145,6 +148,145 @@ docker compose run --rm crawler smoke     # 可选：验证
 ```
 
 数据与配置都在宿主机挂载目录中，更新镜像不影响已有数据。
+
+---
+
+## 新闻 API（/v1）
+
+抓取结果除了直接读 SQLite，还可以通过标准 HTTP API 提供给下游系统。API 与抓取共用同一个数据库，默认只读查询；抓取动作通过异步任务执行。
+
+### 启动 API
+
+```bash
+docker compose up -d api
+docker compose logs -f api
+curl http://localhost:8000/v1/health
+```
+
+- Swagger 文档：<http://localhost:8000/docs>
+- OpenAPI：<http://localhost:8000/openapi.json>
+- 容器内固定监听 `8000`；宿主机端口用 `NEWS_API_PORT` 覆盖（例如 `NEWS_API_PORT=9000 docker compose up -d api`）。
+- 只启动 API 不会自动抓取；抓取仍用 `crawler` 服务或下面的异步任务。
+
+### 配置项
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `NEWS_DB` | `/app/data/news.db` | SQLite 路径（compose 已设置） |
+| `NEWS_CONFIG` | 代码内 `sources.json`；compose 设为 `/app/sources.local.json` | 站点配置路径 |
+| `NEWS_API_KEY` | 空 | 设置后所有 `/v1` 业务接口校验 API Key；`/v1/health` 与文档保持开放 |
+| `NEWS_API_BIND` | `127.0.0.1` | 仅 compose 的宿主机监听地址；需要局域网访问时设为 `0.0.0.0` |
+| `NEWS_API_PORT` | `8000` | 仅 compose 的宿主机映射端口 |
+| `NEWS_JOB_WORKERS` | `1` | 异步任务并发数；SQLite 单写者，建议保持 1 |
+| `NEWS_TIMEZONE` | `Asia/Shanghai` | 默认时区，用于无时区时间与日期过滤 |
+| `NEWS_CORS_ORIGINS` | 空 | 逗号分隔的允许来源；为空不启用 CORS |
+| `NEWS_ALLOW_PRIVATE_URLS` | 空（关闭） | 允许 `extract` 抓取回环/内网地址；仅可信环境开启 |
+| `NEWS_EXTRACT_ALLOW_BROWSER` | 空（关闭） | 允许 `extract` 在直接抓取失败时回退无头浏览器；仅在可信环境开启 |
+| `NEWS_MAX_PENDING_JOBS` | `50` | 排队 + 运行中的作业上限，超出返回 `429`；相同类型与参数的未完成作业会复用 |
+
+> 安全提示：未设置 `NEWS_API_KEY` 时接口完全开放。compose 默认只监听 `127.0.0.1`；如需局域网访问，请同时设置强随机 `NEWS_API_KEY` 再改 `NEWS_API_BIND=0.0.0.0`。`extract` 默认拒绝回环、内网与保留地址，并在每次 HTTP 重定向时重新校验目标；默认还禁用浏览器回退，避免通过页面 JS 绕过地址限制。确需抓取内网新闻时设置 `NEWS_ALLOW_PRIVATE_URLS=1`；确需浏览器渲染时再加 `NEWS_EXTRACT_ALLOW_BROWSER=1`。
+
+设置 API Key 的示例（bash）：
+
+```bash
+NEWS_API_KEY=change-me docker compose up -d api
+curl -H "X-API-Key: change-me" http://localhost:8000/v1/articles
+# 也支持：-H "Authorization: Bearer change-me"
+```
+
+### 端点
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/v1/health` | 健康检查，不需要 API Key |
+| GET | `/v1/articles` | 分页查询文章列表 |
+| GET | `/v1/articles/{id}` | 文章详情（始终包含正文） |
+| GET | `/v1/sources` | 按站点聚合的统计 |
+| GET | `/v1/stats` | 全库统计 |
+| POST | `/v1/jobs` | 创建异步任务（`crawl` 或 `extract`） |
+| GET | `/v1/jobs` | 任务列表 |
+| GET | `/v1/jobs/{id}` | 任务状态与结果 |
+
+`/v1/health` 在数据库异常时返回 `503` 和 `{"error":{"code":"database_unavailable","message":"数据库不可用"}}`，可直接作为容器健康检查探针。其余错误统一为 `{"error":{"code":"http_error","status":<HTTP 状态码>,"message":"..."}}`，参数校验失败时额外带 `details`。
+
+### 查询文章
+
+```bash
+# 最近发布（默认只返回 status=ok，列表不含正文）
+curl "http://localhost:8000/v1/articles?page_size=20"
+
+# 需要正文时显式开启
+curl "http://localhost:8000/v1/articles?include_content=true&page_size=5"
+
+# 按站点、时间范围、关键词过滤
+curl "http://localhost:8000/v1/articles?source=chinanews&published_from=2026-10-01&published_to=2026-10-30&q=经济"
+
+# 查看全部状态（ok/old/no_content/unknown_date/error）
+curl "http://localhost:8000/v1/articles?status=all&page_size=50"
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `status` | `ok`（默认）、`old`、`no_content`、`unknown_date`、`error`、`all` |
+| `source` | 站点名，对应配置里的 `name` |
+| `published_from` / `published_to` | 日期或 ISO 时间；只写日期时按 `NEWS_TIMEZONE` 解释，结束日期包含当天 |
+| `q` | 标题、列表标题、正文的模糊搜索 |
+| `page` / `page_size` | 分页，`page_size` 最大 100 |
+| `order` | `published_desc`（默认）、`published_asc`、`updated_desc` |
+| `include_content` | 列表是否返回正文，默认 `false` |
+
+文章对象中的关键字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 稳定文章 ID（按 `source + url` 生成），详情接口使用 |
+| `title` / `author` | 标题、作者 |
+| `published_at` | 带时区的 ISO 8601 发布时间，例如 `2026-10-30T10:00:00+08:00` |
+| `published_at_utc` | 同一时间的 UTC 表示，以 `Z` 结尾 |
+| `published_raw` | 数据库里的原始发布时间字符串 |
+| `timezone` | 该站点使用的时区 |
+| `content` / `content_length` | 正文（列表默认不返回，详情始终返回）与字数 |
+| `images` | 图片 URL 数组 |
+| `status` / `error` | 抓取状态与错误信息 |
+
+> 时间排序与过滤基于数据库内的站点本地时间。若同时接入不同时区的来源，分页排序可能存在偏差：建议统一各站点的 `timezone`，或在展示层用 `published_at_utc` 做二次校准。
+
+详情示例：
+
+```bash
+curl "http://localhost:8000/v1/articles/<article_id>"
+```
+
+### 异步抓取
+
+创建任务后立即返回 `202` 和任务 ID，用任务详情轮询结果。任务持久化在 SQLite 的 `crawl_jobs` 表，服务重启时 `queued` 任务会继续执行，中断的 `running` 任务会标记为失败。排队与运行中的作业总数受 `NEWS_MAX_PENDING_JOBS` 限制，超出返回 `429`；相同类型与参数的未完成作业会复用同一任务 ID；已完成作业保留 30 天后自动清理。
+
+```bash
+# 按 sources.local.json 抓取最近 3 天
+curl -X POST http://localhost:8000/v1/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"type":"crawl","days":3}'
+
+# 只抓某个站点，并限制条数
+curl -X POST http://localhost:8000/v1/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"type":"crawl","source":"chinanews","days":1,"limit_per_source":5}'
+
+# 抓取单篇文章（默认 source=on_demand）
+curl -X POST http://localhost:8000/v1/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"type":"extract","url":"https://example.com/article.html"}'
+
+# 轮询
+curl http://localhost:8000/v1/jobs/<job_id>
+```
+
+`crawl` 参数：`source`、`days`、`since`（`YYYY-MM-DD`）、`workers`、`limit_per_source`、`force`。
+`extract` 参数：`url`（必填）、`source`。
+
+`extract` 的目标地址在提交时即校验：回环、内网与保留地址返回 `400`（除非设置 `NEWS_ALLOW_PRIVATE_URLS=1`）。抓取或抽取失败时作业状态为 `failed`，同时该 URL 在 `articles` 中留一条 `status=error` 记录，便于后续重试。
+
+> 查询与抓取可以同时进行；但手动 `docker compose run crawler run` 与 `crawl` 任务都会写同一个 SQLite，建议错开执行，或把 `NEWS_JOB_WORKERS` 保持为 1。
 
 ---
 

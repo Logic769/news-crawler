@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import hashlib
 import json
 import logging
 import re
@@ -42,9 +43,11 @@ LOG = logging.getLogger("news_crawler")
 
 DEFAULT_SOURCES_FILE = "sources.json"
 DEFAULT_DB_FILE = "news.db"
+SCHEMA_VERSION = 1
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS articles (
+    article_id   TEXT,
     source       TEXT NOT NULL,
     url          TEXT NOT NULL,
     list_title   TEXT,
@@ -66,11 +69,36 @@ CREATE INDEX IF NOT EXISTS idx_articles_status
     ON articles(status);
 CREATE INDEX IF NOT EXISTS idx_articles_publish_time
     ON articles(publish_time);
+
+CREATE TABLE IF NOT EXISTS crawl_jobs (
+    id          TEXT PRIMARY KEY,
+    type        TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    result      TEXT,
+    error       TEXT,
+    created_at  TEXT NOT NULL,
+    started_at  TEXT,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_crawl_jobs_status
+    ON crawl_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_crawl_jobs_created_at
+    ON crawl_jobs(created_at);
+CREATE INDEX IF NOT EXISTS idx_crawl_jobs_dedupe
+    ON crawl_jobs(type, payload, status);
 """
 
 
 def now_iso() -> str:
     return dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def article_id_for(source: str, url: str) -> str:
+    """Return a stable, URL-safe article id derived from source + url."""
+    digest = hashlib.sha256(f"{source}\x1f{url}".encode("utf-8")).hexdigest()
+    return digest[:32]
 
 
 def get_timezone(name: str):
@@ -201,10 +229,49 @@ def parse_datetime(
         return None
 
 
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add columns/indexes introduced after the first schema version."""
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version >= SCHEMA_VERSION:
+        return
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(articles)")}
+    if "article_id" not in columns:
+        conn.execute("ALTER TABLE articles ADD COLUMN article_id TEXT")
+
+    rows = conn.execute(
+        "SELECT source, url FROM articles "
+        "WHERE article_id IS NULL OR article_id = ''"
+    ).fetchall()
+    if rows:
+        conn.executemany(
+            "UPDATE articles SET article_id = ? WHERE source = ? AND url = ?",
+            [(article_id_for(source, url), source, url) for source, url in rows],
+        )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_article_id "
+        "ON articles(article_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_crawl_jobs_dedupe "
+        "ON crawl_jobs(type, payload, status)"
+    )
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=30)
     conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA_SQL)
+    # 迁移必须串行执行：API 可能同时运行多个 extract 作业，
+    # 并发 ALTER TABLE / 回填会互相冲突。BEGIN IMMEDIATE 让其他
+    # 连接在 busy_timeout 内等待，进入后再重新读取列状态。
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _migrate_schema(conn)
+    except Exception:
+        conn.rollback()
+        raise
     conn.commit()
     return conn
 
@@ -392,14 +459,16 @@ def save_article(
     images: list[str] | None = None,
     status: str,
     error: str = "",
-) -> None:
+) -> str:
+    article_id = article_id_for(source, url)
     conn.execute(
         """
         INSERT INTO articles (
-            source, url, list_title, title, publish_time, author,
+            article_id, source, url, list_title, title, publish_time, author,
             content, images, status, error, first_seen_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source, url) DO UPDATE SET
+            article_id = excluded.article_id,
             list_title = excluded.list_title,
             title = excluded.title,
             publish_time = excluded.publish_time,
@@ -411,6 +480,7 @@ def save_article(
             updated_at = excluded.updated_at
         """,
         (
+            article_id,
             source,
             url,
             list_title,
@@ -426,6 +496,7 @@ def save_article(
         ),
     )
     conn.commit()
+    return article_id
 
 
 def process_entry(

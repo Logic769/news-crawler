@@ -14,7 +14,8 @@
 1. 给一个新闻文章网址，提取标题、发布时间、作者、正文和图片；
 2. 配置多个站点的新闻列表页，自动抓取“最近 N 天”的新闻；
 3. 对 JavaScript 动态渲染的页面自动回退到 Chrome/Chromium；
-4. 结果写入 SQLite，按 `(source, url)` 去重，支持重复运行。
+4. 结果写入 SQLite，按 `(source, url)` 去重，支持重复运行；
+5. 通过 FastAPI 暴露 `/v1` 标准接口，作为下游项目的新闻数据源。
 
 GNE 本身只负责“从 HTML 中抽取新闻信息”，不负责发起 HTTP 请求。本项目的抓取、过滤、渲染、入库逻辑都在 `news_crawler.py` 与 `url_extract.py` 中实现。
 
@@ -43,8 +44,9 @@ GNE 本身只负责“从 HTML 中抽取新闻信息”，不负责发起 HTTP �
 | HTTP 请求 | urllib（标准库） | 带 User-Agent、编码探测、SSL 降级 |
 | 并发模型 | concurrent.futures.ThreadPoolExecutor | 站点级并发，每个站点内部串行 |
 | 时区处理 | zoneinfo | 默认 `Asia/Shanghai` |
-| 打包 | hatchling + pyproject.toml | 支持 `pip install -e ".[browser]"` |
+| 打包 | hatchling + pyproject.toml | 支持 `pip install -e ".[browser,api]"` |
 | 依赖锁定 | uv.lock | 提供给使用 uv 的开发者 |
+| HTTP API | FastAPI + Uvicorn | 可选依赖 `[api]`，提供 `/v1` 标准新闻接口与异步作业 |
 | CI | GitHub Actions | `deploy-test.yml` 执行多 Python 版本静态检查、Docker 构建、容器冒烟与实时新闻抓取验证 |
 
 运行依赖（必装）：
@@ -69,12 +71,15 @@ news-crawler/
 ├── news_crawler.py                 # 多站点抓取主程序（核心）
 ├── url_extract.py                  # 单 URL 抓取 + HTTP/浏览器抓取基础设施
 ├── smoke_test.py                   # 部署后的离线冒烟测试
+├── api.py                          # FastAPI 入口（uvicorn api:app）
+├── news_api/                       # API 应用：设置、模型、查询、作业队列
+├── api_smoke.py                    # API 冒烟测试（本地 HTTP + 临时数据库）
 ├── verify_live_news.py             # 实时新闻抓取验证（5 静态 / 3 JS / 2 视频）
 ├── sources.json                    # 仓库自带空模板（会被 Git 跟踪）
 ├── sources.local.json              # 本地私有站点配置（.gitignore 忽略）
 ├── Dockerfile                      # 容器镜像定义（含 Playwright Chromium）
 ├── docker-compose.yml              # Docker Compose 编排（挂载配置/数据）
-├── docker/entrypoint.sh            # 容器统一入口（run/init/test/smoke/live-news/shell）
+├── docker/entrypoint.sh            # 容器统一入口（run/init/test/smoke/live-news/api/shell）
 ├── docker-deploy.sh / docker-deploy.bat  # Docker 一键部署（Linux·macOS / Windows）
 ├── pyproject.toml                  # 项目元数据与依赖
 ├── uv.lock                         # uv 依赖锁
@@ -149,7 +154,10 @@ process_entry()                 # 单篇文章处理
 | `parse_list_items` | `news_crawler.py` | 用站点配置的 XPath 解析列表页 |
 | `process_entry` | `news_crawler.py` | 单篇文章的抓取、过滤、抽取、入库 |
 | `run_source` | `news_crawler.py` | 单个站点的完整流程与错误隔离 |
-| `save_article` | `news_crawler.py` | SQLite upsert |
+| `save_article` | `news_crawler.py` | SQLite upsert，返回稳定 `article_id` |
+| `create_app` | `news_api/app.py` | 构建 FastAPI 应用、`/v1` 路由与鉴权 |
+| `JobManager` | `news_api/jobs.py` | 异步 crawl/extract 作业队列与持久化 |
+| `query_articles` | `news_api/db.py` | 只读分页查询、时间与时区标准化 |
 | `resolve_config_path` | `news_crawler.py` | 默认读 `sources.json`，存在 `sources.local.json` 时优先 |
 
 ---
@@ -194,6 +202,24 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 2. HTTP 401/403/406/429 时回退浏览器；
 3. 网络错误时输出友好提示并返回 `None`；
 4. GNE 正文为空或是加载占位时回退浏览器。
+
+### 5.3 HTTP API（/v1）
+
+启动：`docker compose up -d api`，默认 `http://localhost:8000`，交互文档 `/docs`。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/v1/articles` | 分页查询文章，默认 `status=ok` 且不含正文 |
+| GET | `/v1/articles/{article_id}` | 文章详情，始终含正文 |
+| GET | `/v1/sources` | 来源统计 |
+| GET | `/v1/stats` | 全局统计 |
+| POST | `/v1/jobs` | 提交 `crawl` 或 `extract` 异步作业，返回 202 |
+| GET | `/v1/jobs`、`/v1/jobs/{id}` | 作业列表与状态 |
+| GET | `/v1/health` | 健康检查（无需鉴权） |
+
+列表参数：`status`、`source`、`published_from`、`published_to`、`q`、`page`、`page_size`、`order`、`include_content`。文章列表与作业列表返回 `{"data": [...], "meta": {...}}`；文章详情、统计、健康检查返回对应对象；`/v1/sources` 返回 `{"data": [...]}`。
+
+设置 `NEWS_API_KEY` 后，除 `/v1/health` 与文档外都需 `X-API-Key` 或 `Authorization: Bearer <key>`。作业状态为 `queued`/`running`/`succeeded`/`failed`，单进程执行，避免 SQLite 并发写冲突。排队 + 运行中的作业上限为 `NEWS_MAX_PENDING_JOBS`（默认 50），超出返回 `429`；相同类型与参数的未完成作业复用同一 ID。`extract` 默认拒绝回环、内网与保留地址（`NEWS_ALLOW_PRIVATE_URLS=1` 可放开）；`fetch_html` 通过自定义 `HTTPRedirectHandler` 对每个重定向目标复用同一校验，默认还以 `allow_browser=False` 禁用浏览器回退（`NEWS_EXTRACT_ALLOW_BROWSER=1` 可放开），避免页面 JS 绕过地址限制。上述限制仍不能替代 API Key。已完成作业保留 30 天后自动清理。
 
 ---
 
@@ -267,6 +293,7 @@ docker compose run --rm crawler run --config sources.local.json --limit-per-sour
 ```sql
 CREATE TABLE IF NOT EXISTS articles (
     source        TEXT NOT NULL,   -- 站点标识
+    article_id    TEXT,            -- sha256(source\x1furl) 前 32 位，稳定对外 ID
     url           TEXT NOT NULL,   -- 文章 URL
     list_title    TEXT,            -- 列表页标题
     title         TEXT,            -- GNE 抽取标题
@@ -280,9 +307,23 @@ CREATE TABLE IF NOT EXISTS articles (
     updated_at    TEXT,
     PRIMARY KEY (source, url)
 );
+
+CREATE TABLE IF NOT EXISTS crawl_jobs (
+    id         TEXT PRIMARY KEY,   -- uuid4 hex
+    type       TEXT NOT NULL,      -- crawl/extract
+    status     TEXT NOT NULL,      -- queued/running/succeeded/failed
+    payload    TEXT NOT NULL,      -- 请求参数 JSON
+    result     TEXT,               -- 结果 JSON
+    error      TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
 ```
 
-索引：`source`、`status`、`publish_time`。
+索引：`source`、`status`、`publish_time`、`article_id`（唯一）；`crawl_jobs` 的 `status`、`created_at`、`(type, payload, status)` 去重索引。
+
+旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、回填、建唯一索引与去重索引，完成后置 `user_version = 1`，后续启动直接跳过。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
 
 ### 7.2 status 语义
 
@@ -299,7 +340,9 @@ CREATE TABLE IF NOT EXISTS articles (
 - `publish_time` 在 `process_entry()` 中统一格式化为 `YYYY-MM-DD HH:MM:SS`；
 - 用旧版本抓取过的数据可能仍是中文日期格式，需要 `--force` 重抓或重建数据库；
 - `content` 入库前会被 `clean_text()` 压缩空白，段落换行会丢失；
-- 同一 `(source, url)` 使用 upsert，不会产生重复记录。
+- 同一 `(source, url)` 使用 upsert，不会产生重复记录；
+- `article_id` 由 `sha256(source + \x1f + url)` 派生，不随数据库重建变化，可安全作为下游引用；
+- SQLite 启用 WAL 与 `busy_timeout=5000`，API 作业默认单 worker 写入。
 
 ---
 
@@ -349,6 +392,13 @@ docker compose run --rm crawler run --config sources.local.json --days 3
 docker compose run --rm --entrypoint python crawler -X utf8 url_extract.py "https://example.com/article.html"
 ```
 
+### 启动 HTTP API
+
+```bash
+docker compose up -d api
+curl http://localhost:8000/v1/health
+```
+
 ---
 
 ## 9. 部署机制
@@ -359,7 +409,8 @@ docker compose run --rm --entrypoint python crawler -X utf8 url_extract.py "http
 - 基础镜像：`python:3.12-slim`；**默认镜像自带 Playwright Chromium**（`playwright install --with-deps chromium`，构建期会实际启动一次 Chromium 自检），可用构建参数 `INSTALL_BROWSER=0` 关闭以减小镜像但失去浏览器能力
 - 浏览器运行：容器以 root 运行时 Chromium 必须带 `--no-sandbox --disable-dev-shm-usage`（`url_extract.py` 已内置）
 - 视频页适配：`/shipin/`、`/video/` 等视频页由 `url_extract.is_video_page()` 识别，改用 meta/JSON-LD/URL 提取标题、简介、发布时间（`extract_video_meta()`），避免正文过短与日期误判
-- 入口：`docker/entrypoint.sh` 统一处理 `run`/`init`/`test`/`smoke`/`live-news`/`shell`，数据库默认写入 `/app/data/news.db`
+- 入口：`docker/entrypoint.sh` 统一处理 `run`/`init`/`test`/`smoke`/`live-news`/`api`/`shell`，数据库默认写入 `/app/data/news.db`
+- API 服务：`docker compose up -d api` 启动 `news-crawler-api`，端口由 `NEWS_API_PORT` 控制（默认 8000）
 - 挂载：`sources.local.json` 只读挂载（私有配置不进镜像）；`./data` 持久化数据库
 - 容器以 root 运行，避免跨平台 bind mount 的 UID 权限问题；安全要求高时可改非 root + 命名卷
 - 一键部署：`./docker-deploy.sh`（Linux/macOS）或 `.\docker-deploy.bat`（Windows）
@@ -372,7 +423,7 @@ docker compose run --rm --entrypoint python crawler -X utf8 url_extract.py "http
 - 触发：push 到 `master`，或手动 `workflow_dispatch`
 - `python-checks` job：Python 3.10–3.13 矩阵，执行 compileall、ruff 关键规则与 smoke
 - `shell-and-yaml` job：bash 语法检查、shellcheck 与 YAML 解析校验
-- `docker-build` job：Ubuntu，`docker build` 后执行 `docker run --rm news-crawler:ci smoke`
+- `docker-build` job：Ubuntu，`docker build` 后执行容器内 `smoke`、`api_smoke.py`、compose API 健康检查，并校验裸 `docker run ... api` 的持久化数据库路径
 - `docker-build-full` job：默认含浏览器镜像构建 + Chromium 启动校验 + smoke + 实时新闻抓取验证（5 静态 / 3 JS 渲染 / 2 视频，仅 push 或手动运行）
 - 通过标准：`python-checks`、`shell-and-yaml`、`docker-build`、`docker-build-full` 的构建与 smoke 步骤必须退出码为 0（包含 `SMOKE TEST PASSED`）
 - `live-news` 步骤依赖公开新闻站点，设为 `continue-on-error: true` 仅作观测：失败会在日志中显示但不阻塞 master；本地可用 `--seed` 复现
@@ -387,14 +438,16 @@ docker compose run --rm --entrypoint python crawler -X utf8 url_extract.py "http
 - `test_list_page/`：列表页样本；
 - `visiable_test/`：可见性测试样本；
 - `smoke_test.py`：部署自检，验证导入、日期解析、GNE 抽取、SQLite 初始化；
+- `api_smoke.py`：启动临时 uvicorn + 临时 SQLite，验证鉴权、查询、详情、统计与异步作业全链路；
 - `verify_live_news.py`：访问公开新闻站点，验证 5 个静态文本、3 个 JS 渲染与 2 个视频页面的抽取；
 - `example.py`：遍历 `tests/**/*.html`，打印抽取结果（人工观察用）。
 
 ### 提交前必须执行
 
 ```bash
-docker compose run --rm --entrypoint python crawler -m py_compile news_crawler.py url_extract.py smoke_test.py verify_live_news.py
+docker compose run --rm --entrypoint python crawler -m py_compile news_crawler.py url_extract.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api
 docker compose run --rm crawler smoke
+docker compose run --rm --entrypoint python crawler -X utf8 api_smoke.py
 ```
 
 如果改动了抓取或日期逻辑，至少再执行：
@@ -434,7 +487,10 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 6. **MySQL 迁移未实现**
    当前只支持 SQLite；如需 MySQL，需要先抽象存储层，并处理 `ON CONFLICT` → `ON DUPLICATE KEY UPDATE`、URL 唯一索引长度、`DATETIME` 类型等差异。
 
-7. **上游测试样本中的误报告警**
+7. **API 作业队列为单进程**
+   `news_api/jobs.py` 使用进程内 `ThreadPoolExecutor`，默认 1 worker；多副本部署会出现任务抢占或重复执行，需要外部队列（如 Redis/Celery）才能水平扩展。
+
+8. **上游测试样本中的误报告警**
    `tests/stcn/1.html` 含上游页面的微信 `appId`，GitHub secret scanning 曾误报，已标记为 false positive。不要因为该告警删除上游测试样本，除非有明确决策。
 
 ---
@@ -467,12 +523,15 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 
 ### 12.4 共享接口约定
 
-- `fetch_html(url) -> str`：失败时抛出异常；
+- `fetch_html(url, *, url_validator: Callable[[str], None] | None = None) -> str`：失败时抛出异常；传入 `url_validator` 后每次 HTTP 重定向都会先用新 URL 调用它，抛异常即中断重定向；
 - `fetch_html_with_browser(url) -> str | None`：失败返回 `None`；
 - `content_needs_render(content: str) -> bool`：True 表示需要浏览器渲染（空、短于 100 字、或含加载占位词）；
 - `content_is_too_short(content: str) -> bool`：True 表示正文短于 `MIN_CONTENT_LENGTH`（100 字）；
-- `extract_article(url, extractor) -> dict | None`：单 URL 完整流程；
+- `extract_article(url, extractor, *, allow_browser: bool = True, url_validator=None) -> dict | None`：单 URL 完整流程；`allow_browser=False` 时禁用浏览器渲染回退（API 的 extract 默认如此）；
 - `GeneralNewsExtractor.extract(html, **kwargs) -> dict`：正文抽取入口；
+- `create_app(settings=None) -> FastAPI`：API 应用工厂，测试可注入独立设置；
+- `article_id_for(source, url) -> str`：稳定文章 ID，改动会破坏下游引用；
+- `POST /v1/jobs` 的 `crawl`/`extract` schema 属于对外契约，新增字段必须保持向后兼容；
 - 数据库字段与 status 语义保持向后兼容，新增字段需要迁移策略。
 
 ### 12.5 隐私与安全红线
@@ -515,10 +574,15 @@ docker compose build
 
 # 3. 冒烟测试
 docker compose run --rm crawler smoke
+docker compose run --rm --entrypoint python crawler -X utf8 api_smoke.py
 
 # 4. 列表解析测试
 docker compose run --rm crawler test --config sources.local.json --limit 2
 
 # 5. 小批量抓取
 docker compose run --rm crawler run --config sources.local.json --limit-per-source 1
+
+# 6. 启动 API
+docker compose up -d api
+curl http://localhost:8000/v1/health
 ```
