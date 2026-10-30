@@ -6,6 +6,8 @@
 #   init  [原 news_crawler.py init 参数]    初始化数据库
 #   test  [原 news_crawler.py test 参数]    只测列表解析
 #   smoke                                   运行离线冒烟测试
+#   live-news [--static 5 --dynamic 3 --video 2]
+#                                           实时新闻抓取验证（静态 / JS 渲染 / 视频）
 #   shell                                   进入 bash
 set -euo pipefail
 cd /app
@@ -31,6 +33,9 @@ case "$cmd" in
     ;;
   smoke)
     exec python -X utf8 smoke_test.py "$@"
+    ;;
+  live|live-news)
+    exec python -X utf8 verify_live_news.py "$@"
     ;;
   init|run)
     # 用户已显式传 --db 时尊重之，否则统一落到持久化数据目录

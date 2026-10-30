@@ -45,7 +45,7 @@ GNE 本身只负责“从 HTML 中抽取新闻信息”，不负责发起 HTTP �
 | 时区处理 | zoneinfo | 默认 `Asia/Shanghai` |
 | 打包 | hatchling + pyproject.toml | 支持 `pip install -e ".[browser]"` |
 | 依赖锁定 | uv.lock | 提供给使用 uv 的开发者 |
-| CI | GitHub Actions | `deploy-test.yml` 执行多 Python 版本静态检查、Docker 构建与容器冒烟测试 |
+| CI | GitHub Actions | `deploy-test.yml` 执行多 Python 版本静态检查、Docker 构建、容器冒烟与实时新闻抓取验证 |
 
 运行依赖（必装）：
 
@@ -69,11 +69,12 @@ news-crawler/
 ├── news_crawler.py                 # 多站点抓取主程序（核心）
 ├── url_extract.py                  # 单 URL 抓取 + HTTP/浏览器抓取基础设施
 ├── smoke_test.py                   # 部署后的离线冒烟测试
+├── verify_live_news.py             # 实时新闻抓取验证（5 静态 / 3 JS / 2 视频）
 ├── sources.json                    # 仓库自带空模板（会被 Git 跟踪）
 ├── sources.local.json              # 本地私有站点配置（.gitignore 忽略）
 ├── Dockerfile                      # 容器镜像定义（含 Playwright Chromium）
 ├── docker-compose.yml              # Docker Compose 编排（挂载配置/数据）
-├── docker/entrypoint.sh            # 容器统一入口（run/init/test/smoke/shell）
+├── docker/entrypoint.sh            # 容器统一入口（run/init/test/smoke/live-news/shell）
 ├── docker-deploy.sh / docker-deploy.bat  # Docker 一键部署（Linux·macOS / Windows）
 ├── pyproject.toml                  # 项目元数据与依赖
 ├── uv.lock                         # uv 依赖锁
@@ -358,7 +359,7 @@ docker compose run --rm --entrypoint python crawler -X utf8 url_extract.py "http
 - 基础镜像：`python:3.12-slim`；**默认镜像自带 Playwright Chromium**（`playwright install --with-deps chromium`，构建期会实际启动一次 Chromium 自检），可用构建参数 `INSTALL_BROWSER=0` 关闭以减小镜像但失去浏览器能力
 - 浏览器运行：容器以 root 运行时 Chromium 必须带 `--no-sandbox --disable-dev-shm-usage`（`url_extract.py` 已内置）
 - 视频页适配：`/shipin/`、`/video/` 等视频页由 `url_extract.is_video_page()` 识别，改用 meta/JSON-LD/URL 提取标题、简介、发布时间（`extract_video_meta()`），避免正文过短与日期误判
-- 入口：`docker/entrypoint.sh` 统一处理 `run`/`init`/`test`/`smoke`/`shell`，数据库默认写入 `/app/data/news.db`
+- 入口：`docker/entrypoint.sh` 统一处理 `run`/`init`/`test`/`smoke`/`live-news`/`shell`，数据库默认写入 `/app/data/news.db`
 - 挂载：`sources.local.json` 只读挂载（私有配置不进镜像）；`./data` 持久化数据库
 - 容器以 root 运行，避免跨平台 bind mount 的 UID 权限问题；安全要求高时可改非 root + 命名卷
 - 一键部署：`./docker-deploy.sh`（Linux/macOS）或 `.\docker-deploy.bat`（Windows）
@@ -372,8 +373,8 @@ docker compose run --rm --entrypoint python crawler -X utf8 url_extract.py "http
 - `python-checks` job：Python 3.10–3.13 矩阵，执行 compileall、ruff 关键规则与 smoke
 - `shell-and-yaml` job：bash 语法检查、shellcheck 与 YAML 解析校验
 - `docker-build` job：Ubuntu，`docker build` 后执行 `docker run --rm news-crawler:ci smoke`
-- `docker-build-full` job：默认含浏览器镜像构建 + Chromium 启动校验 + smoke（仅 push 或手动运行）
-- 通过标准：各 job 退出码为 0（包含 `SMOKE TEST PASSED`）
+- `docker-build-full` job：默认含浏览器镜像构建 + Chromium 启动校验 + smoke + 实时新闻抓取验证（5 静态 / 3 JS 渲染 / 2 视频，仅 push 或手动运行）
+- 通过标准：各 job 退出码为 0（包含 `SMOKE TEST PASSED` 与 `LIVE NEWS VERIFICATION PASSED`）
 
 ---
 
@@ -385,12 +386,13 @@ docker compose run --rm --entrypoint python crawler -X utf8 url_extract.py "http
 - `test_list_page/`：列表页样本；
 - `visiable_test/`：可见性测试样本；
 - `smoke_test.py`：部署自检，验证导入、日期解析、GNE 抽取、SQLite 初始化；
+- `verify_live_news.py`：访问公开新闻站点，验证 5 个静态文本、3 个 JS 渲染与 2 个视频页面的抽取；
 - `example.py`：遍历 `tests/**/*.html`，打印抽取结果（人工观察用）。
 
 ### 提交前必须执行
 
 ```bash
-docker compose run --rm --entrypoint python crawler -m py_compile news_crawler.py url_extract.py smoke_test.py
+docker compose run --rm --entrypoint python crawler -m py_compile news_crawler.py url_extract.py smoke_test.py verify_live_news.py
 docker compose run --rm crawler smoke
 ```
 
@@ -403,7 +405,7 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 ### 测试缺口（后续可补）
 
 - 目前没有 pytest 单元测试；
-- CI 只验证部署和冒烟测试，不验证真实抓取；
+- CI 的 live-news 只做小样本真实抓取，不覆盖所有站点；站点反爬/改版可能导致该 job 波动；
 - `content_needs_render()` 的占位判断是启发式规则；
 - 日期解析为多正则启发式，缺少系统化用例集。
 
@@ -425,8 +427,8 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 4. **日期解析属于多正则启发式**
    不同网站的日期格式可能互相干扰，优先通过站点 `date_xpath` + `date_format` 精确配置；新增格式时必须补充单元测试。
 
-5. **CI 未覆盖真实抓取**
-   网络抓取受站点变化影响大，建议后续增加 mock HTML 的单测，而不是在 CI 中访问真实网站。
+5. **CI 真实抓取覆盖有限**
+   `live-news` job 已抽样验证静态、JS 渲染与视频三类真实页面，但网络抓取受站点改版/反爬影响大，仍需补充 mock HTML 单测来覆盖解析逻辑。
 
 6. **MySQL 迁移未实现**
    当前只支持 SQLite；如需 MySQL，需要先抽象存储层，并处理 `ON CONFLICT` → `ON DUPLICATE KEY UPDATE`、URL 唯一索引长度、`DATETIME` 类型等差异。
