@@ -99,7 +99,7 @@ docker compose run --rm crawler run --config sources.local.json --days 3
 docker compose run --rm crawler test --config sources.local.json --name <站点名>
 ```
 
-### 实时新闻抓取验证（可选）
+### 实时新闻抓取验证
 
 ```bash
 # 默认 5 个静态文本页 + 3 个动态 JS 渲染页 + 2 个视频页

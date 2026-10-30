@@ -16,15 +16,17 @@ DATA_DIR="${DATA_DIR:-/app/data}"
 DB_PATH="${DB_PATH:-$DATA_DIR/news.db}"
 mkdir -p "$DATA_DIR"
 
-# 防御：宿主机缺少 sources.local.json 时，Docker 可能把只读挂载点建成目录
-if [ -d /app/sources.local.json ]; then
-  echo "错误：/app/sources.local.json 是一个目录（通常因宿主机缺少该文件，Docker 自动创建）。请先在项目根目录创建 sources.local.json（可从 sources.json 复制）后重试。" >&2
-  exit 1
-fi
-
 cmd="${1:-run}"
 if [ "$#" -gt 0 ]; then
   shift
+fi
+
+# 防御：run/test 需要站点配置；宿主机缺少 sources.local.json 时 Docker 可能把只读挂载点建成目录
+if [ "$cmd" = "run" ] || [ "$cmd" = "test" ]; then
+  if [ -d /app/sources.local.json ]; then
+    echo "错误：/app/sources.local.json 是一个目录（通常因宿主机缺少该文件，Docker 自动创建）。请先在项目根目录创建 sources.local.json（可从 sources.json 复制）后重试。" >&2
+    exit 1
+  fi
 fi
 
 case "$cmd" in

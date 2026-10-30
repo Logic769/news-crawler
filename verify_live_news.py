@@ -90,10 +90,15 @@ def _require_article(
 
 
 def _with_retry(label: str, fn, attempts: int):
+    if attempts < 1:
+        raise SystemExit("--attempts must be at least 1")
     last = None
     for index in range(attempts):
         try:
             return fn()
+        except AssertionError:
+            # 内容判定失败是确定性的，重试只会浪费时间
+            raise
         except Exception as exc:  # noqa: BLE001 - report live-network failures clearly
             last = exc
             print(f"[WARN] {label} attempt {index + 1}/{attempts} failed: {exc}")
@@ -123,9 +128,10 @@ def check_dynamic(url: str, extractor: GeneralNewsExtractor) -> dict:
         print(f"[INFO] {url}: direct fetch failed before render: {exc}")
 
     if direct_len >= MIN_RENDERED_CONTENT:
-        raise AssertionError(
-            f"{url}: direct extraction already returned {direct_len} chars; "
-            "this URL is not a JavaScript-rendered page"
+        # 页面改版为服务端渲染不应让 CI 失败；仍继续验证 Chromium 路径。
+        print(
+            f"[WARN] {url}: direct extraction already returned {direct_len} chars; "
+            "continuing to verify browser rendering anyway"
         )
 
     rendered_html = url_extract.fetch_html_with_browser(url)
