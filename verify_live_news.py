@@ -29,6 +29,10 @@ import url_extract
 MIN_STATIC_CONTENT = 100
 MIN_RENDERED_CONTENT = 200
 
+
+class ContentAssertion(AssertionError):
+    """确定性的内容判定失败；不重试，避免浪费时间。"""
+
 # 5 个静态文本页从以下站点中随机抽取（均为直接 HTTP 即可抽取正文的页面）
 STATIC_POOL = (
     "https://www.chinanews.com.cn/gn/2026/10-30/10723204.shtml",
@@ -77,13 +81,13 @@ def _require_article(
     label: str,
 ) -> int:
     if result is None:
-        raise AssertionError(f"{url}: {label} extraction returned no result")
+        raise ContentAssertion(f"{url}: {label} extraction returned no result")
     title = (result.get("title") or "").strip()
     content_len = len(_content(result))
     if not title:
-        raise AssertionError(f"{url}: {label} extraction returned empty title")
+        raise ContentAssertion(f"{url}: {label} extraction returned empty title")
     if content_len < min_length:
-        raise AssertionError(
+        raise ContentAssertion(
             f"{url}: {label} content too short: {content_len} < {min_length}"
         )
     return content_len
@@ -96,8 +100,8 @@ def _with_retry(label: str, fn, attempts: int):
     for index in range(attempts):
         try:
             return fn()
-        except AssertionError:
-            # 内容判定失败是确定性的，重试只会浪费时间
+        except ContentAssertion:
+            # 内容判定失败是确定性的，重试只会浪费时间；网络/浏览器失败仍会重试
             raise
         except Exception as exc:  # noqa: BLE001 - report live-network failures clearly
             last = exc
@@ -152,15 +156,16 @@ def check_dynamic(url: str, extractor: GeneralNewsExtractor) -> dict:
 def check_video(url: str, extractor: GeneralNewsExtractor) -> dict:
     result = url_extract.extract_article(url, extractor)
     if not result:
+        # 可能是网络/浏览器瞬时失败，交给 _with_retry 重试
         raise AssertionError(f"{url}: video extraction returned no result")
     if not result.get("is_video"):
-        raise AssertionError(f"{url}: not identified as a video page")
+        raise ContentAssertion(f"{url}: not identified as a video page")
     title = (result.get("title") or "").strip()
     publish_time = (result.get("publish_time") or "").strip()
     if not title:
-        raise AssertionError(f"{url}: video title is empty")
+        raise ContentAssertion(f"{url}: video title is empty")
     if not publish_time:
-        raise AssertionError(f"{url}: video publish_time is empty")
+        raise ContentAssertion(f"{url}: video publish_time is empty")
     return {
         "url": url,
         "title": title,
