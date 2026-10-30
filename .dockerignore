@@ -22,6 +22,7 @@ data
 sources.local.json
 sources.example.json
 backups
+tmp_validation
 
 # 与运行无关的上游资产（减小镜像体积；tests 需保留给冒烟测试）
 docs

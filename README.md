@@ -13,7 +13,7 @@
 - 自动识别大多数常见日期格式；
 - 页面正文由 JavaScript 加载时，自动使用 Chrome/Chromium 渲染后再提取；
 - 抓取结果自动存入 SQLite，避免重复抓取；
-- 提供 Docker（推荐）与 Windows、Linux/macOS 一键部署方式和冒烟测试。
+- 使用 Docker 一键部署，并提供部署后的冒烟测试。
 
 > 注意：GNE 本身是“正文抽取器”，不是通用爬虫框架。本工具负责请求网页，GNE 负责从 HTML 中提取新闻正文。
 
@@ -27,8 +27,6 @@
 | `url_extract.py` | 单条文章网址抽取工具 |
 | `sources.json` | 仓库自带的空站点配置模板 |
 | `sources.local.json` | 本地私人站点配置（被 Git 忽略，不会提交） |
-| `deploy.bat` / `deploy.ps1` | Windows 一键部署脚本 |
-| `deploy.sh` | Linux/macOS 一键部署脚本 |
 | `Dockerfile` | 容器镜像定义（含 Playwright Chromium） |
 | `docker-compose.yml` | Docker Compose 编排（挂载配置与数据目录） |
 | `docker/entrypoint.sh` | 容器统一入口（run/init/test/smoke/shell） |
@@ -42,83 +40,16 @@
 
 ## 环境要求
 
-**Docker 部署（推荐）只需要：**
+**Docker 部署只需要：**
 
 - Docker（含 Docker Compose **v2**，Docker Desktop 或 Docker Engine 均可）
 - 能访问 Docker Hub / PyPI 的网络
 
-**原生部署（不使用 Docker）需要：**
-
-- Python 3.10 或更高版本
-- Git
-- 能访问 GitHub / PyPI 的网络
-- 可选：Chrome 或 Chromium（用于 JS 渲染；没有时部署脚本会自动安装 Playwright Chromium）
-
 ---
 
-## 国内网络加速（可选）
+## 使用 Docker 部署
 
-如果直接访问 GitHub 或 PyPI 速度很慢，可以先按下面的方式加速。网络正常时不需要这些步骤。
-
-### GitHub 克隆加速
-
-GitHub 克隆/下载慢时，可以使用第三方代理镜像（仅用于网络加速）：
-
-```bash
-git clone https://ghfast.top/https://github.com/Logic769/news-crawler.git
-```
-
-如果某个镜像失效，可以尝试：
-
-```bash
-git clone https://gh-proxy.com/https://github.com/Logic769/news-crawler.git
-git clone https://ghproxy.net/https://github.com/Logic769/news-crawler.git
-```
-
-> 注意：第三方代理会经手仓库代码。对安全性要求较高时，请优先使用官方 GitHub 地址，
-> 或在克隆后核对仓库提交与 Release 信息。
-
-### Python 依赖加速
-
-使用清华大学 PyPI 镜像：
-
-Windows PowerShell（在运行 `deploy.bat` 之前设置）：
-
-```powershell
-$env:PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
-.\deploy.bat
-```
-
-Linux / macOS：
-
-```bash
-export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-./deploy.sh
-```
-
-### Playwright Chromium 下载加速
-
-没有 Chrome/Chromium 时，部署脚本会自动下载 Playwright Chromium。国内下载慢时使用 npmmirror：
-
-Windows PowerShell：
-
-```powershell
-$env:PLAYWRIGHT_DOWNLOAD_HOST = "https://npmmirror.com/mirrors/playwright"
-.\deploy.bat
-```
-
-Linux / macOS：
-
-```bash
-export PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
-./deploy.sh
-```
-
-也可以同时设置两个变量，一次性加速依赖安装和浏览器下载。
-
----
-
-## 使用 Docker 部署（推荐）
+先在项目根目录（首次使用可执行 `git clone https://github.com/Logic769/news-crawler.git && cd news-crawler`）操作。
 
 Docker 方式把运行环境（Python、依赖、Playwright Chromium）全部封装进镜像，一次构建即可在 Windows / Linux / macOS 上一致运行；更新时只需重新构建镜像，数据与配置通过挂载保留，便于统一管理和跨平台更新。
 
@@ -143,7 +74,8 @@ Windows（PowerShell 或直接双击）：
 
 ```bash
 # 1. 准备私有站点配置（首次）
-cp sources.json sources.local.json   # 然后按“多站点批量抓取”章节填写站点
+cp sources.json sources.local.json   # Windows 用：Copy-Item sources.json sources.local.json
+                                     # 然后按“多站点批量抓取”章节填写站点
 
 # 2. 构建镜像
 docker compose build
@@ -159,7 +91,7 @@ docker compose run --rm crawler smoke
 docker compose run --rm crawler run --config sources.local.json --days 3
 ```
 
-常用参数与原生一致（`--days`、`--since`、`--workers`、`--limit-per-source`、`--force`）。
+常用参数：`--days`、`--since`、`--workers`、`--limit-per-source`、`--force`。
 测试列表解析：
 
 ```bash
@@ -203,50 +135,10 @@ docker compose run --rm crawler smoke     # 可选：验证
 
 ---
 
-## 快速开始（原生部署，不使用 Docker）
-
-### Windows
-
-打开 PowerShell，依次执行：
-
-```powershell
-git clone https://github.com/Logic769/news-crawler.git
-cd news-crawler
-.\deploy.bat
-```
-
-看到以下输出表示部署成功：
-
-```text
-SMOKE TEST PASSED
-部署完成。
-```
-
-### Linux / macOS
-
-```bash
-git clone https://github.com/Logic769/news-crawler.git
-cd news-crawler
-chmod +x deploy.sh
-./deploy.sh
-```
-
-部署脚本会自动完成：
-
-1. 检查 Python 版本；
-2. 创建 `.venv` 虚拟环境；
-3. 安装项目依赖；
-4. 检测 Chrome/Chromium，没有则安装 Playwright Chromium；
-5. 初始化 `news.db`；
-6. 运行冒烟测试。
-
----
-
 ## 快速体验：抓取单篇文章
 
-```powershell
-cd news-crawler
-.\.venv\Scripts\python.exe -X utf8 url_extract.py "https://example.com/article.html"
+```bash
+docker compose run --rm --entrypoint python crawler -X utf8 url_extract.py "https://example.com/article.html"
 ```
 
 把网址替换成真实新闻文章页。成功后会在终端输出 JSON：
@@ -261,8 +153,6 @@ cd news-crawler
   "images": []
 }
 ```
-
-> Linux/macOS 用户把 `.venv\Scripts\python.exe` 换成 `.venv/bin/python` 即可。
 
 ---
 
@@ -331,16 +221,16 @@ cp sources.json sources.local.json
 
 先只测试一个站点，确认标题、链接、日期能正确解析：
 
-```powershell
-.\.venv\Scripts\python.exe -X utf8 news_crawler.py test --config sources.local.json --name 你的站点标识
+```bash
+docker compose run --rm crawler test --config sources.local.json --name 你的站点标识
 ```
 
 如果输出为空、标题重复或日期不对，需要调整该站点的 XPath。
 
 ### 第 4 步：运行批量抓取
 
-```powershell
-.\.venv\Scripts\python.exe -X utf8 news_crawler.py run --config sources.local.json --days 3
+```bash
+docker compose run --rm crawler run --config sources.local.json --days 3
 ```
 
 常用参数：
@@ -357,7 +247,7 @@ cp sources.json sources.local.json
 
 ## 查看抓取结果
 
-结果默认保存在项目目录的 `news.db` 中。
+结果默认保存在项目目录的 `data/news.db` 中。
 
 查看最近抓取的文章：
 
@@ -378,7 +268,7 @@ WHERE status = 'ok'
 ORDER BY publish_time DESC;
 ```
 
-也可以用图形工具 [DB Browser for SQLite](https://sqlitebrowser.org/) 打开 `news.db`。
+也可以用图形工具 [DB Browser for SQLite](https://sqlitebrowser.org/) 打开 `data/news.db`。
 
 ### 数据状态说明
 
@@ -408,17 +298,17 @@ ORDER BY publish_time DESC;
 
 ## 常见问题
 
-### 1. 提示找不到 python
+### 1. 提示找不到 docker
 
-Windows 上安装 Python 时勾选 “Add Python to PATH”，安装后重新打开 PowerShell。
+请先安装 Docker Desktop（Windows/macOS）或 Docker Engine + Compose v2（Linux），并确保重新打开终端后 `docker --version` 能正常输出版本。
 
-### 2. 提示无法执行脚本 / 执行策略受限
+### 2. 提示 docker compose 不是命令 / 版本过低
 
-直接运行 `deploy.bat`，脚本内部已经使用 `-ExecutionPolicy Bypass`，一般不会受 PowerShell 执行策略限制。
+本项目使用 Compose v2（`docker compose`）。请升级 Docker Desktop 或安装 Compose v2 插件；旧的 `docker-compose`（v1）不再推荐。
 
 ### 3. 抓取后正文为空，或者只有“正在加载”
 
-说明目标页面正文由 JavaScript 动态加载。工具会尝试自动回退到 Chrome 渲染；如果仍然失败，请确认本机安装了 Chrome，或者已经运行过 Playwright Chromium 安装。
+说明目标页面正文由 JavaScript 动态加载。默认镜像已自带 Playwright Chromium，工具会自动回退渲染；如果仍失败，请检查容器内浏览器是否可正常启动（`docker compose run --rm crawler smoke`）。
 
 ### 4. 站点配置里的真实网址会被上传吗
 
@@ -437,13 +327,6 @@ git pull
 docker compose build
 ```
 
-原生方式：
-
-```powershell
-git pull
-.\deploy.bat
-```
-
 ---
 
 ## 安全与合规建议
@@ -451,7 +334,7 @@ git pull
 - 不要提交任何网站后台地址、API Token、数据库密码或账号信息；
 - 抓取公开网站前，请阅读目标网站的 `robots.txt`、服务条款和访问频率要求；
 - 请合理设置 `delay`，避免对目标网站造成压力；
-- 本站点配置、数据库和虚拟环境都属于本地数据，不要误提交到 Git。
+- 站点配置、数据库和挂载目录都属于本地数据，不要误提交到 Git。
 
 ---
 
