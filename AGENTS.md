@@ -374,7 +374,8 @@ docker compose run --rm --entrypoint python crawler -X utf8 url_extract.py "http
 - `shell-and-yaml` job：bash 语法检查、shellcheck 与 YAML 解析校验
 - `docker-build` job：Ubuntu，`docker build` 后执行 `docker run --rm news-crawler:ci smoke`
 - `docker-build-full` job：默认含浏览器镜像构建 + Chromium 启动校验 + smoke + 实时新闻抓取验证（5 静态 / 3 JS 渲染 / 2 视频，仅 push 或手动运行）
-- 通过标准：各 job 退出码为 0（包含 `SMOKE TEST PASSED` 与 `LIVE NEWS VERIFICATION PASSED`）
+- 通过标准：`python-checks`、`shell-and-yaml`、`docker-build`、`docker-build-full` 的构建与 smoke 步骤必须退出码为 0（包含 `SMOKE TEST PASSED`）
+- `live-news` 步骤依赖公开新闻站点，设为 `continue-on-error: true` 仅作观测：失败会在日志中显示但不阻塞 master；本地可用 `--seed` 复现
 
 ---
 

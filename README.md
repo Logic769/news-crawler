@@ -109,7 +109,7 @@ docker compose run --rm crawler live-news
 docker compose run --rm crawler live-news --static 5 --dynamic 3 --video 2 --seed 20261030
 ```
 
-该命令会访问公开新闻站点，用于验证直接 HTTP、Chromium 渲染与视频页三条抽取路径。
+该命令会访问公开新闻站点，用于验证直接 HTTP、Chromium 渲染与视频页三条抽取路径。CI 中该步骤为非阻塞观测项（`continue-on-error`）；失败时按日志里的 seed 用 `--seed` 复现。
 
 ### 数据与配置
 
