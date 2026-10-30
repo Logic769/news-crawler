@@ -39,7 +39,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -c docker/constraints.txt ".[browser,api]"
+          # docker/constraints.txt 锁定的是镜像内解释器（Python 3.12）的依赖版本；
+          # 其它 Python 版本按 pyproject 的版本范围解析，否则新版本约束会排除老解释器。
+          if [ "${{ matrix.python-version }}" = "3.12" ]; then
+            pip install -c docker/constraints.txt ".[browser,api]"
+          else
+            pip install ".[browser,api]"
+          fi
           pip install ruff
 
       - name: Byte-compile all sources
