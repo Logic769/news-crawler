@@ -13,7 +13,7 @@
 - 自动识别大多数常见日期格式；
 - 页面正文由 JavaScript 加载时，自动使用 Chrome/Chromium 渲染后再提取；
 - 抓取结果自动存入 SQLite，避免重复抓取；
-- 使用 Docker 一键部署，并提供部署后的冒烟测试。
+- 使用 Docker 一键部署，并提供部署后的冒烟测试与实时新闻抓取验证。
 
 > 注意：GNE 本身是“正文抽取器”，不是通用爬虫框架。本工具负责请求网页，GNE 负责从 HTML 中提取新闻正文。
 
@@ -29,9 +29,10 @@
 | `sources.local.json` | 本地私人站点配置（被 Git 忽略，不会提交） |
 | `Dockerfile` | 容器镜像定义（含 Playwright Chromium） |
 | `docker-compose.yml` | Docker Compose 编排（挂载配置与数据目录） |
-| `docker/entrypoint.sh` | 容器统一入口（run/init/test/smoke/shell） |
+| `docker/entrypoint.sh` | 容器统一入口（run/init/test/smoke/live-news/shell） |
 | `docker-deploy.sh` / `docker-deploy.bat` | Docker 一键部署脚本（Linux·macOS / Windows） |
 | `smoke_test.py` | 部署后的离线自检脚本 |
+| `verify_live_news.py` | CI 实时新闻抓取验证（5 静态 / 3 JS 渲染 / 2 视频） |
 | `AGENTS.md` | 多 Agent 协作与开发说明（架构、规范、发布流程） |
 | `gne/` | GNE 新闻抽取核心库 |
 | `tests/` | 上游自带测试 HTML 样本 |
@@ -97,6 +98,18 @@ docker compose run --rm crawler run --config sources.local.json --days 3
 ```bash
 docker compose run --rm crawler test --config sources.local.json --name <站点名>
 ```
+
+### 实时新闻抓取验证
+
+```bash
+# 默认 5 个静态文本页 + 3 个动态 JS 渲染页 + 2 个视频页
+docker compose run --rm crawler live-news
+
+# 可指定数量或固定随机种子
+docker compose run --rm crawler live-news --static 5 --dynamic 3 --video 2 --seed 20261030
+```
+
+该命令会访问公开新闻站点，用于验证直接 HTTP、Chromium 渲染与视频页三条抽取路径。
 
 ### 数据与配置
 

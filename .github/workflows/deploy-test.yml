@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      live_news_seed:
+        description: "live-news 随机种子（留空则随机）"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -38,12 +43,12 @@ jobs:
           pip install ruff
 
       - name: Byte-compile all sources
-        run: python -m compileall -q news_crawler.py url_extract.py smoke_test.py gne
+        run: python -m compileall -q news_crawler.py url_extract.py smoke_test.py verify_live_news.py gne
 
       - name: "Ruff (blocking rules: syntax / undefined names)"
         run: >
           ruff check --select E9,F63,F7,F82 --target-version py310
-          news_crawler.py url_extract.py smoke_test.py gne
+          news_crawler.py url_extract.py smoke_test.py verify_live_news.py gne
 
       - name: Smoke test
         run: python -X utf8 smoke_test.py
@@ -99,9 +104,10 @@ jobs:
         run: docker compose run --rm --no-deps crawler smoke
 
   docker-build-full:
-    name: docker build (default, with browser) + smoke
+    name: docker build (default, with browser) + smoke + live news
     runs-on: ubuntu-latest
-    # 仅 push / 手动运行，避免每个 PR 都下载 Chromium
+    timeout-minutes: 45
+    # 仅 push / 手动运行，避免每个 PR 都下载 Chromium 并访问真实新闻站点
     if: github.event_name != 'pull_request'
     steps:
       - name: Checkout
@@ -115,3 +121,10 @@ jobs:
 
       - name: Run smoke test inside container
         run: docker run --rm news-crawler:full smoke
+
+      - name: Run live news verification (5 static / 3 JS-rendered / 2 video)
+        # 真实站点与海外 Runner 的网络状况不可控，只作观测，不阻塞 master
+        continue-on-error: true
+        env:
+          LIVE_NEWS_SEED: ${{ github.event.inputs.live_news_seed }}
+        run: docker run --rm -e LIVE_NEWS_SEED news-crawler:full live-news
