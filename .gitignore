@@ -109,3 +109,9 @@ venv.bak/
 # 本地站点配置（不要提交）
 sources.local.json
 sources.example.json
+
+# Docker 持久化数据（数据库等运行产物）
+/data/
+
+# 本地备份（改动前备份，不提交）
+/backups/

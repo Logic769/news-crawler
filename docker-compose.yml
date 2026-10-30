@@ -1,0 +1,28 @@
+# news-crawler Docker Compose
+# 常用命令：
+#   docker compose build
+#   docker compose run --rm crawler init
+#   docker compose run --rm crawler smoke
+#   docker compose run --rm crawler run --config sources.local.json --days 3
+#   docker compose run --rm crawler test --config sources.local.json --name <站点名>
+#   docker compose run --rm crawler shell
+services:
+  crawler:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        INSTALL_BROWSER: ${INSTALL_BROWSER:-1}
+        PLAYWRIGHT_DOWNLOAD_HOST: ${PLAYWRIGHT_DOWNLOAD_HOST:-}
+    image: news-crawler:local
+    container_name: news-crawler
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # 私有站点配置：只读挂载，不进镜像；首次部署脚本会自动从模板创建
+      - ./sources.local.json:/app/sources.local.json:ro
+      # 数据库持久化目录
+      - ./data:/app/data
+    # 默认行为：抓取最近 3 天（数据库由 entrypoint 落到 /app/data/news.db）
+    command: ["run", "--config", "sources.local.json", "--days", "3"]
+    restart: "no"
