@@ -150,6 +150,34 @@ jobs:
           docker logs news-api-entry
           docker stop news-api-entry
 
+  live-news:
+    name: live news (10 static / 10 JS-rendered / 10 video)
+    # 真实站点抽取是硬性门槛：随机抽取的静态、JS 渲染、视频页必须全部通过，
+    # 单个页面失效会由池子里的替补页面补上，但最终数量不足即失败。
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -c docker/constraints.txt ".[browser,api]"
+
+      - name: Install Chromium for Playwright
+        run: python -m playwright install --with-deps chromium
+
+      - name: Verify live news extraction
+        env:
+          LIVE_NEWS_SEED: ${{ github.event.inputs.live_news_seed }}
+        run: python -X utf8 verify_live_news.py --static 10 --dynamic 10 --video 10
+
   docker-build-full:
     name: docker build (default, with browser) + smoke + live news
     runs-on: ubuntu-latest
@@ -172,9 +200,8 @@ jobs:
       - name: Run API smoke test inside container
         run: docker run --rm --entrypoint python news-crawler:full -X utf8 api_smoke.py
 
-      - name: Run live news verification (5 static / 3 JS-rendered / 2 video)
-        # 真实站点与海外 Runner 的网络状况不可控，只作观测，不阻塞 master
-        continue-on-error: true
+      - name: Run live news verification (10 static / 10 JS-rendered / 10 video)
+        # 镜像内跑同一套硬性门槛，确保默认镜像（含 Chromium）真的能完成抽取
         env:
           LIVE_NEWS_SEED: ${{ github.event.inputs.live_news_seed }}
-        run: docker run --rm -e LIVE_NEWS_SEED news-crawler:full live-news
+        run: docker run --rm -e LIVE_NEWS_SEED news-crawler:full live-news --static 10 --dynamic 10 --video 10

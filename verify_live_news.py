@@ -1,15 +1,19 @@
 """Live news extraction verification used by CI.
 
 The check deliberately hits public news pages (not local fixtures):
-- 5 static text articles: direct HTTP fetch + GNE extraction
-- 3 JavaScript-rendered articles: direct HTML is insufficient; headless
+- static text articles: direct HTTP fetch + GNE extraction
+- JavaScript-rendered articles: direct HTML is insufficient; headless
   Chromium rendering + GNE extraction must succeed
-- 2 video pages: the url_extract video branch must identify the page and
+- video pages: the url_extract video branch must identify the page and
   return title/publish time
 
-Pools are curated from stable news sites. Each run randomly selects the
-requested count from each pool; the chosen seed is printed so a failing run
-can be reproduced with --seed or LIVE_NEWS_SEED.
+Pools live in live_news_pool.json next to this file (static / dynamic / video
+arrays). The built-in pools below are only a fallback used when that file is
+missing or a category is empty. Each run shuffles the pool and checks pages
+until the requested count passes; a failed page is replaced from the rest of
+the pool (deterministic content assertions are never retried on the same URL).
+The chosen seed is printed so a failing run can be reproduced with --seed or
+LIVE_NEWS_SEED.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import os
 import random
 import sys
 import time
+from pathlib import Path
 
 from gne import GeneralNewsExtractor, NoContentException
 
@@ -28,12 +33,14 @@ import url_extract
 
 MIN_STATIC_CONTENT = 100
 MIN_RENDERED_CONTENT = 200
+POOL_FILE = Path(__file__).with_name("live_news_pool.json")
 
 
 class ContentAssertion(AssertionError):
     """确定性的内容判定失败；不重试，避免浪费时间。"""
 
-# 5 个静态文本页从以下站点中随机抽取（均为直接 HTTP 即可抽取正文的页面）
+
+# 内置兜底池：仅在 live_news_pool.json 缺失或某类为空时使用。
 STATIC_POOL = (
     "https://www.chinanews.com.cn/gn/2026/10-30/10723204.shtml",
     "https://www.chinanews.com.cn/ty/2026/10-30/10723200.shtml",
@@ -45,20 +52,42 @@ STATIC_POOL = (
     "https://www.chinanews.com.cn/gn/2026/10-30/10723215.shtml",
 )
 
-# 3 个动态 JS 渲染页：直接抓取正文不足，必须由 Chromium 渲染后才能抽取
 DYNAMIC_POOL = (
     "https://news.cctv.com/2026/10/30/ARTIBWOGaadLbdChpDPhblyt261030.shtml",
     "https://news.cctv.com/2026/10/30/ARTIe0N25T5q8Q8jogffSnOc261029.shtml",
     "https://news.cctv.com/2026/10/30/ARTIZpZEh3a2ocOsZYX3GKsb261029.shtml",
 )
 
-# 2 个视频页：命中 /shipin/ 路径，走 url_extract.extract_article 的视频分支
 VIDEO_POOL = (
     "https://www.chinanews.com.cn/sh/shipin/2026/10-30/news1073348.shtml",
     "https://www.chinanews.com.cn/sh/shipin/2026/10-30/news1073347.shtml",
     "https://www.chinanews.com.cn/sh/shipin/cns/2026/10-30/news1073350.shtml",
     "https://www.chinanews.com.cn/cj/shipin/2026/10-30/news1073346.shtml",
 )
+
+
+def load_pool() -> dict[str, tuple[str, ...]]:
+    """优先读取 live_news_pool.json，缺失时回退内置池。"""
+    pools = {"static": STATIC_POOL, "dynamic": DYNAMIC_POOL, "video": VIDEO_POOL}
+    if not POOL_FILE.is_file():
+        print(f"[INFO] 未找到 {POOL_FILE.name}，使用内置池")
+        return pools
+    try:
+        raw = json.loads(POOL_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"[WARN] 读取 {POOL_FILE.name} 失败（{exc}），使用内置池")
+        return pools
+    for key in pools:
+        urls = [u.strip() for u in (raw.get(key) or []) if isinstance(u, str) and u.strip()]
+        if urls:
+            pools[key] = tuple(dict.fromkeys(urls))
+        else:
+            print(f"[WARN] {POOL_FILE.name} 缺少 {key} 池，使用内置池")
+    print(
+        "POOL SIZES: "
+        + ", ".join(f"{k}={len(v)}" for k, v in pools.items())
+    )
+    return pools
 
 
 def _content(result: dict | None) -> str:
@@ -173,27 +202,79 @@ def check_video(url: str, extractor: GeneralNewsExtractor) -> dict:
     }
 
 
-def _sample(pool: tuple[str, ...], count: int, rng: random.Random, label: str) -> list[str]:
+def run_category(
+    category: str,
+    check,
+    pool: tuple[str, ...],
+    count: int,
+    rng: random.Random,
+    attempts: int,
+    extractor: GeneralNewsExtractor,
+) -> tuple[list[dict], list[dict]]:
+    """随机抽取 count 个页面并逐个校验；失败时从剩余池补抽。"""
     if count < 0:
-        raise SystemExit(f"{label} count must be non-negative")
+        raise SystemExit(f"{category} count must be non-negative")
     if count > len(pool):
         raise SystemExit(
-            f"{label} count {count} exceeds pool size {len(pool)}; "
+            f"{category} count {count} exceeds pool size {len(pool)}; "
             "add more URLs to the pool first"
         )
-    return rng.sample(list(pool), count)
+    queue = list(pool)
+    rng.shuffle(queue)
+    # 每个目标页最多额外尝试 2 个替补页面，避免单个失效 URL 拖长 CI。
+    budget = min(len(queue), count * 3)
+    passed: list[dict] = []
+    failed: list[dict] = []
+    print(f"\n== {category}: 目标 {count} 页（池 {len(pool)}，最多检查 {budget}）==")
+
+    while len(passed) < count and queue and len(passed) + len(failed) < budget:
+        url = queue.pop()
+        index = len(passed) + len(failed) + 1
+        print(f"[{category} {index}/{budget}] {url}")
+        try:
+            result = _with_retry(
+                f"{category} {url}",
+                lambda url=url: check(url, extractor),
+                attempts,
+            )
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"url": url, "error": str(exc)})
+            print(f"  FAIL: {exc}", file=sys.stderr)
+            continue
+        passed.append(result)
+        if category == "video":
+            detail = f"发布时间 {result['publish_time']}"
+        else:
+            detail = f"{result.get('content_len', result.get('rendered_content_len', 0))} 字"
+        print(f"  OK: {result['title']}（{detail}）")
+
+    if len(passed) < count:
+        raise SystemExit(
+            f"{category}: 只有 {len(passed)}/{count} 个页面通过校验，"
+            "请检查池中 URL 是否失效"
+        )
+    return passed, failed
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Verify live news extraction: static, JS-rendered and video pages."
     )
-    parser.add_argument("--static", type=int, default=5, help="静态文本页数量（默认 5）")
-    parser.add_argument("--dynamic", type=int, default=3, help="动态 JS 渲染页数量（默认 3）")
-    parser.add_argument("--video", type=int, default=2, help="视频页数量（默认 2）")
+    parser.add_argument("--static", type=int, default=10, help="静态文本页数量（默认 10）")
+    parser.add_argument("--dynamic", type=int, default=10, help="动态 JS 渲染页数量（默认 10）")
+    parser.add_argument("--video", type=int, default=10, help="视频页数量（默认 10）")
     parser.add_argument("--seed", default=None, help="随机种子；也可用环境变量 LIVE_NEWS_SEED")
     parser.add_argument("--attempts", type=int, default=2, help="每个页面的尝试次数（默认 2）")
+    parser.add_argument(
+        "--pool-file",
+        default=None,
+        help="池文件路径（默认使用脚本同目录的 live_news_pool.json）",
+    )
     args = parser.parse_args()
+
+    global POOL_FILE
+    if args.pool_file:
+        POOL_FILE = Path(args.pool_file)
 
     seed = args.seed or os.environ.get("LIVE_NEWS_SEED")
     if not seed:
@@ -202,41 +283,43 @@ def main() -> None:
     print(f"LIVE NEWS SEED: {seed}")
 
     extractor = GeneralNewsExtractor()
-    selected = {
-        "static": _sample(STATIC_POOL, args.static, rng, "static"),
-        "dynamic": _sample(DYNAMIC_POOL, args.dynamic, rng, "dynamic"),
-        "video": _sample(VIDEO_POOL, args.video, rng, "video"),
+    pools = load_pool()
+    summary: dict[str, list[dict]] = {"static": [], "dynamic": [], "video": []}
+    failures: dict[str, list[dict]] = {"static": [], "dynamic": [], "video": []}
+    targets = {
+        "static": args.static,
+        "dynamic": args.dynamic,
+        "video": args.video,
     }
 
-    summary: dict[str, list[dict]] = {"static": [], "dynamic": [], "video": []}
-    checks = (
-        ("static", check_static),
-        ("dynamic", check_dynamic),
-        ("video", check_video),
-    )
-
     try:
-        for category, check in checks:
-            urls = selected[category]
-            print(f"\n== {category}: {len(urls)} page(s) ==")
-            for index, url in enumerate(urls, 1):
-                print(f"[{category} {index}/{len(urls)}] {url}")
-                result = _with_retry(
-                    f"{category} {url}",
-                    lambda url=url, check=check: check(url, extractor),
-                    args.attempts,
-                )
-                summary[category].append(result)
-                if category == "video":
-                    detail = f"发布时间 {result['publish_time']}"
-                else:
-                    detail = f"{result.get('content_len', result.get('rendered_content_len', 0))} 字"
-                print(f"  OK: {result['title']}（{detail}）")
+        for category, check in (
+            ("static", check_static),
+            ("dynamic", check_dynamic),
+            ("video", check_video),
+        ):
+            passed, failed = run_category(
+                category,
+                check,
+                pools[category],
+                targets[category],
+                rng,
+                args.attempts,
+                extractor,
+            )
+            summary[category] = passed
+            failures[category] = failed
     except Exception as exc:  # noqa: BLE001
         print(f"\nLIVE NEWS VERIFICATION FAILED: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 
     print("\nLIVE NEWS VERIFICATION PASSED")
+    print(
+        "PASSED COUNTS: "
+        + ", ".join(f"{k}={len(v)}" for k, v in summary.items())
+    )
+    if any(failures.values()):
+        print("REPLACED PAGES: " + json.dumps(failures, ensure_ascii=False))
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

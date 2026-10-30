@@ -74,7 +74,8 @@ news-crawler/
 ├── api.py                          # FastAPI 入口（uvicorn api:app）
 ├── news_api/                       # API 应用：设置、模型、查询、作业队列
 ├── api_smoke.py                    # API 冒烟测试（本地 HTTP + 临时数据库）
-├── verify_live_news.py             # 实时新闻抓取验证（5 静态 / 3 JS / 2 视频）
+├── verify_live_news.py             # 实时新闻抓取验证（默认抽取 10 静态 / 10 JS / 10 视频）
+├── live_news_pool.json             # 实时验证页面池（100 静态 / 50 JS / 50 视频）
 ├── sources.json                    # 仓库自带空模板（会被 Git 跟踪）
 ├── sources.local.json              # 本地私有站点配置（.gitignore 忽略）
 ├── Dockerfile                      # 容器镜像定义（含 Playwright Chromium）
@@ -427,9 +428,10 @@ curl http://localhost:8000/v1/health
 - `python-checks` job：Python 3.10–3.13 矩阵，执行 compileall、ruff 关键规则与 smoke
 - `shell-and-yaml` job：bash 语法检查、shellcheck 与 YAML 解析校验
 - `docker-build` job：Ubuntu，`docker build` 后执行容器内 `smoke`、`api_smoke.py`、compose API 健康检查，并校验裸 `docker run ... api` 的持久化数据库路径
-- `docker-build-full` job：默认含浏览器镜像构建 + Chromium 启动校验 + smoke + 实时新闻抓取验证（5 静态 / 3 JS 渲染 / 2 视频，仅 push 或手动运行）
-- 通过标准：`python-checks`、`shell-and-yaml`、`docker-build`、`docker-build-full` 的构建与 smoke 步骤必须退出码为 0（包含 `SMOKE TEST PASSED`）
-- `live-news` 步骤依赖公开新闻站点，设为 `continue-on-error: true` 仅作观测：失败会在日志中显示但不阻塞 master；本地可用 `--seed` 复现
+- `live-news` job：PR 与 push 都运行，安装 `[browser,api]` 与 Chromium 后用宿主机 Python 执行 `verify_live_news.py --static 10 --dynamic 10 --video 10`；这是**硬性门槛**，抽取数量不足即 job 失败
+- `docker-build-full` job：默认含浏览器镜像构建 + Chromium 启动校验 + smoke + 镜像内同类实时新闻验证（10 静态 / 10 JS 渲染 / 10 视频，仅 push 或手动运行）
+- 通过标准：`python-checks`、`shell-and-yaml`、`docker-build`、`live-news`、`docker-build-full` 全部退出码为 0（前者包含 `SMOKE TEST PASSED`，两个 live job 需打印 `LIVE NEWS VERIFICATION PASSED`）
+- 手动触发时可用 `live_news_seed` 输入固定随机种子，便于复现某次失败的抽样
 
 ---
 
@@ -442,8 +444,27 @@ curl http://localhost:8000/v1/health
 - `visiable_test/`：可见性测试样本；
 - `smoke_test.py`：部署自检，验证导入、日期解析、GNE 抽取、SQLite 初始化；
 - `api_smoke.py`：启动临时 uvicorn + 临时 SQLite，验证鉴权、查询、详情、统计与异步作业全链路；
-- `verify_live_news.py`：访问公开新闻站点，验证 5 个静态文本、3 个 JS 渲染与 2 个视频页面的抽取；
+- `verify_live_news.py` + `live_news_pool.json`：从 100 静态 / 50 JS 渲染 / 50 视频的页面池中随机抽取（默认 10/10/10）访问公开新闻站点，验证三条抽取路径；
 - `example.py`：遍历 `tests/**/*.html`，打印抽取结果（人工观察用）。
+
+### 实时新闻池维护
+
+`live_news_pool.json` 是 CI 抽样的页面池，格式为 `{"static": [...], "dynamic": [...], "video": [...]}`：
+
+- 池文件缺失或某类为空时，`verify_live_news.py` 回退到内置的小样本池，并打印 `POOL SIZES`；
+- 抽样用 `--seed` 决定；单页失败会从剩余池补抽（日志 `REPLACED PAGES`，预算为 `count * 3`），补不足数量则失败；
+- 站点改版导致的失效页面必须从池中剔除：本地复现失败后确认该 URL 确实无正文，再从 JSON 中删掉并补入同类的健康页面；
+- 校验单个 URL 可用：
+
+  ```bash
+  docker compose run --rm --entrypoint python crawler -X utf8 -c "
+  from gne import GeneralNewsExtractor
+  import verify_live_news as v
+  print(v.check_static('https://example.com/a.html', GeneralNewsExtractor()))"
+  ```
+
+  注意 `GeneralNewsExtractor` 实例不可跨线程共享（并发复用会抛 `math domain error`），批量校验时每个线程各自新建；
+- 池子生成脚本与探测结果保存在本地 `backups/pool_build/`（被 Git 忽略），不属于仓库内容。
 
 ### 提交前必须执行
 
@@ -462,7 +483,7 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 ### 测试缺口（后续可补）
 
 - 目前没有 pytest 单元测试；
-- CI 的 live-news 只做小样本真实抓取，不覆盖所有站点；站点反爬/改版可能导致该 job 波动；
+- CI 的 live-news 只覆盖池内 200 个页面（且每次只抽 10/10/10），不覆盖所有站点；站点反爬/改版会导致该 job 波动；
 - `content_needs_render()` 的占位判断是启发式规则；
 - 日期解析为多正则启发式，缺少系统化用例集。
 
@@ -485,7 +506,7 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
    不同网站的日期格式可能互相干扰，优先通过站点 `date_xpath` + `date_format` 精确配置；新增格式时必须补充单元测试。
 
 5. **CI 真实抓取覆盖有限**
-   `live-news` job 已抽样验证静态、JS 渲染与视频三类真实页面，但网络抓取受站点改版/反爬影响大，仍需补充 mock HTML 单测来覆盖解析逻辑。
+   `live-news` job 已用 100/50/50 的页面池随机抽样验证静态、JS 渲染与视频三类真实页面（10/10/10 硬门槛），但网络抓取受站点改版/反爬影响大，仍需补充 mock HTML 单测来覆盖解析逻辑。视频类池子只有 5 个来源站点（新华社、看看新闻、新浪视频、云南广电、澎湃），是最薄弱的一环。
 
 6. **MySQL 迁移未实现**
    当前只支持 SQLite；如需 MySQL，需要先抽象存储层，并处理 `ON CONFLICT` → `ON DUPLICATE KEY UPDATE`、URL 唯一索引长度、`DATETIME` 类型等差异。
