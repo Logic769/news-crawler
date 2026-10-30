@@ -2,12 +2,54 @@ name: deploy-test
 
 on:
   push:
-    branches:
-      - master
+    branches: [master]
+  pull_request:
+    branches: [master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  python-checks:
+    name: python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[browser]"
+          pip install ruff
+
+      - name: Byte-compile all sources
+        run: python -m compileall -q news_crawler.py url_extract.py smoke_test.py gne
+
+      - name: "Ruff (blocking rules: syntax / undefined names)"
+        run: >
+          ruff check --select E9,F63,F7,F82 --target-version py310
+          news_crawler.py url_extract.py smoke_test.py gne
+
+      - name: Smoke test
+        run: python -X utf8 smoke_test.py
+
   linux-deploy:
+    name: native one-click deploy (linux)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -20,3 +62,69 @@ jobs:
 
       - name: Run Linux one-click deploy
         run: ./deploy.sh
+
+  shell-and-yaml:
+    name: shell + yaml lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: |
+          bash -n deploy.sh
+          bash -n docker-deploy.sh
+          bash -n docker/entrypoint.sh
+
+      - name: ShellCheck (error level, all scripts)
+        run: shellcheck -S error deploy.sh docker-deploy.sh docker/entrypoint.sh
+
+      - name: ShellCheck (warning+ for docker scripts)
+        run: shellcheck -S warning docker-deploy.sh docker/entrypoint.sh
+
+      - name: Validate YAML files
+        run: |
+          python -m pip install --quiet pyyaml
+          python -c "import glob,yaml; files=glob.glob('.github/workflows/*.yml')+['docker-compose.yml']; [yaml.safe_load(open(f,encoding='utf-8')) for f in files]; print('YAML OK:', files)"
+
+  docker-build:
+    name: docker build + container smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate compose config
+        run: docker compose config -q
+
+      - name: Enforce reproducible build inputs
+        run: |
+          grep -Eq '^FROM python:3\.[0-9]+-slim@sha256:[0-9a-f]{64}' Dockerfile
+          test -f docker/constraints.txt
+
+      - name: Build image
+        run: docker build --build-arg INSTALL_BROWSER=0 -t news-crawler:ci .
+
+      - name: Run smoke test inside container
+        run: docker run --rm news-crawler:ci smoke
+
+      - name: Prepare config for compose
+        run: cp sources.json sources.local.json
+
+      - name: Compose smoke
+        run: docker compose run --rm --no-deps crawler smoke
+
+  docker-build-full:
+    name: docker build (with browser) + smoke
+    runs-on: ubuntu-latest
+    # only on push / manual, to avoid downloading Chromium on every PR
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image with Chromium (INSTALL_BROWSER=1)
+        run: docker build --build-arg INSTALL_BROWSER=1 -t news-crawler:full .
+
+      - name: Run smoke test inside container
+        run: docker run --rm news-crawler:full smoke

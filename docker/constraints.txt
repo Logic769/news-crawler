@@ -1,0 +1,9 @@
+# 可复现构建依赖锁定（版本与 uv.lock 对齐）
+# 仅约束运行所需依赖；gne 由本项目自身安装。
+# 更新方式：修改 pyproject 后执行 `uv lock`，再同步本文件版本号。
+lxml==6.0.2
+pyyaml==6.0.3
+playwright==1.62.0
+greenlet==3.5.5
+pyee==13.0.1
+typing-extensions==4.15.0

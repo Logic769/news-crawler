@@ -1,0 +1,38 @@
+# 版本控制与本地环境
+.git
+.gitignore
+.gitattributes
+.github
+.venv
+venv
+env
+ENV
+
+# Python 缓存与构建产物（递归匹配子目录）
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+build
+dist
+**/*.log
+
+# 运行时/本地私有数据（绝不进镜像）
+news.db
+data
+sources.local.json
+sources.example.json
+backups
+
+# 与运行无关的上游资产（减小镜像体积；tests 需保留给冒烟测试）
+docs
+screenshots
+site
+test_list_page
+visiable_test
+
+.DS_Store
+
+# 环境/临时探测产物，勿进镜像（递归匹配）
+**/_acl_recovery
+**/*.tmp
+**/*.bak

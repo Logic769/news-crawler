@@ -45,7 +45,7 @@ GNE 本身只负责“从 HTML 中抽取新闻信息”，不负责发起 HTTP �
 | 时区处理 | zoneinfo | 默认 `Asia/Shanghai` |
 | 打包 | hatchling + pyproject.toml | 支持 `pip install -e ".[browser]"` |
 | 依赖锁定 | uv.lock | 提供给使用 uv 的开发者 |
-| CI | GitHub Actions | `deploy-test.yml` 在 Ubuntu 上执行 `deploy.sh` |
+| CI | GitHub Actions | `deploy-test.yml` 在 Ubuntu 上执行 `deploy.sh` 与 Docker 构建/冒烟 |
 
 运行依赖（必装）：
 
@@ -73,6 +73,10 @@ news-crawler/
 ├── sources.local.json              # 本地私有站点配置（.gitignore 忽略）
 ├── deploy.bat / deploy.ps1         # Windows 一键部署
 ├── deploy.sh                       # Linux/macOS 一键部署
+├── Dockerfile                      # 容器镜像定义（含 Playwright Chromium）
+├── docker-compose.yml              # Docker Compose 编排（挂载配置/数据）
+├── docker/entrypoint.sh            # 容器统一入口（run/init/test/smoke/shell）
+├── docker-deploy.sh / docker-deploy.bat  # Docker 一键部署（Linux·macOS / Windows）
 ├── pyproject.toml                  # 项目元数据与依赖
 ├── uv.lock                         # uv 依赖锁
 ├── README.md                       # 面向用户的中文使用文档
@@ -371,14 +375,24 @@ CREATE TABLE IF NOT EXISTS articles (
 - PyPI：`https://pypi.tuna.tsinghua.edu.cn/simple`
 - Playwright：`https://npmmirror.com/mirrors/playwright`
 
-### 9.4 CI
+### 9.4 Docker（推荐方式）
+
+- 文件：`Dockerfile`、`.dockerignore`、`docker-compose.yml`、`docker/entrypoint.sh`、`docker-deploy.sh`、`docker-deploy.bat`
+- 基础镜像：`python:3.12-slim`；默认安装 Playwright Chromium（`playwright install --with-deps chromium`），可用构建参数 `INSTALL_BROWSER=0` 关闭以减小镜像
+- 入口：`docker/entrypoint.sh` 统一处理 `run`/`init`/`test`/`smoke`/`shell`，数据库默认写入 `/app/data/news.db`
+- 挂载：`sources.local.json` 只读挂载（私有配置不进镜像）；`./data` 持久化数据库
+- 容器以 root 运行，避免跨平台 bind mount 的 UID 权限问题；安全要求高时可改非 root + 命名卷
+- 一键部署：`./docker-deploy.sh`（Linux/macOS）或 `.\docker-deploy.bat`（Windows）
+- 国内加速：`PIP_INDEX_URL`、`PLAYWRIGHT_DOWNLOAD_HOST` 通过环境变量/构建参数注入
+
+### 9.5 CI
 
 `.github/workflows/deploy-test.yml`：
 
 - 触发：push 到 `master`，或手动 `workflow_dispatch`
-- 环境：Ubuntu + Python 3.12
-- 执行：`./deploy.sh`
-- 通过标准：脚本退出码为 0（包含 `SMOKE TEST PASSED`）
+- `linux-deploy` job：Ubuntu + Python 3.12，执行 `./deploy.sh`（原生部署冒烟）
+- `docker-build` job：Ubuntu，`docker build` 后执行 `docker run --rm news-crawler:ci smoke`
+- 通过标准：各 job 退出码为 0（包含 `SMOKE TEST PASSED`）
 
 ---
 

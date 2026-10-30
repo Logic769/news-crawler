@@ -13,7 +13,7 @@
 - 自动识别大多数常见日期格式；
 - 页面正文由 JavaScript 加载时，自动使用 Chrome/Chromium 渲染后再提取；
 - 抓取结果自动存入 SQLite，避免重复抓取；
-- 提供 Windows、Linux/macOS 一键部署脚本和冒烟测试。
+- 提供 Docker（推荐）与 Windows、Linux/macOS 一键部署方式和冒烟测试。
 
 > 注意：GNE 本身是“正文抽取器”，不是通用爬虫框架。本工具负责请求网页，GNE 负责从 HTML 中提取新闻正文。
 
@@ -29,6 +29,10 @@
 | `sources.local.json` | 本地私人站点配置（被 Git 忽略，不会提交） |
 | `deploy.bat` / `deploy.ps1` | Windows 一键部署脚本 |
 | `deploy.sh` | Linux/macOS 一键部署脚本 |
+| `Dockerfile` | 容器镜像定义（含 Playwright Chromium） |
+| `docker-compose.yml` | Docker Compose 编排（挂载配置与数据目录） |
+| `docker/entrypoint.sh` | 容器统一入口（run/init/test/smoke/shell） |
+| `docker-deploy.sh` / `docker-deploy.bat` | Docker 一键部署脚本（Linux·macOS / Windows） |
 | `smoke_test.py` | 部署后的离线自检脚本 |
 | `AGENTS.md` | 多 Agent 协作与开发说明（架构、规范、发布流程） |
 | `gne/` | GNE 新闻抽取核心库 |
@@ -37,6 +41,13 @@
 ---
 
 ## 环境要求
+
+**Docker 部署（推荐）只需要：**
+
+- Docker（含 Docker Compose **v2**，Docker Desktop 或 Docker Engine 均可）
+- 能访问 Docker Hub / PyPI 的网络
+
+**原生部署（不使用 Docker）需要：**
 
 - Python 3.10 或更高版本
 - Git
@@ -107,7 +118,90 @@ export PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
 
 ---
 
-## 快速开始
+## 使用 Docker 部署（推荐）
+
+Docker 方式把运行环境（Python、依赖、Playwright Chromium）全部封装进镜像，一次构建即可在 Windows / Linux / macOS 上一致运行；更新时只需重新构建镜像，数据与配置通过挂载保留，便于统一管理和跨平台更新。
+
+### 一键部署
+
+Linux / macOS：
+
+```bash
+chmod +x docker-deploy.sh
+./docker-deploy.sh
+```
+
+Windows（PowerShell 或直接双击）：
+
+```powershell
+.\docker-deploy.bat
+```
+
+脚本会自动完成：构建镜像 → 初始化数据库 → 运行冒烟测试，看到 `SMOKE TEST PASSED` 即表示成功。
+
+### 手动步骤（等价）
+
+```bash
+# 1. 准备私有站点配置（首次）
+cp sources.json sources.local.json   # 然后按“多站点批量抓取”章节填写站点
+
+# 2. 构建镜像
+docker compose build
+
+# 3. 初始化数据库 + 冒烟测试
+docker compose run --rm crawler init
+docker compose run --rm crawler smoke
+```
+
+### 运行抓取
+
+```bash
+docker compose run --rm crawler run --config sources.local.json --days 3
+```
+
+常用参数与原生一致（`--days`、`--since`、`--workers`、`--limit-per-source`、`--force`）。
+测试列表解析：
+
+```bash
+docker compose run --rm crawler test --config sources.local.json --name <站点名>
+```
+
+### 数据与配置
+
+- 私有站点配置 `sources.local.json` 以**只读**方式挂载进容器，不会打包进镜像，也不会提交到 Git；
+- 数据库落在宿主机 `./data/news.db`（容器内 `/app/data/news.db`），重新构建镜像不会丢失；
+- 已有的旧 `news.db` 可直接移动到 `data/news.db` 继续使用；
+- 首次使用裸 `docker compose run` 前请确保已存在 `sources.local.json`（否则 Docker 会把只读挂载点建成目录导致报错）；`docker-deploy.sh`/`.bat` 已自动处理；
+- 容器默认以 root 运行，以规避 Windows/Linux 之间 bind mount 的 UID 权限不一致；如需更高安全可改用非 root 用户 + 命名卷；
+- **构建可复现**：基础镜像按 digest 固定（`Dockerfile` 的 `FROM ...@sha256:...`），依赖版本由 `docker/constraints.txt` 锁定（源自 `uv.lock`）；升级依赖请同步 `uv.lock` 与 `docker/constraints.txt`。
+
+### 国内网络加速（可选）
+
+```bash
+# PyPI 镜像加速
+PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple docker compose build
+
+# 同时加速 Playwright 浏览器下载
+PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright \
+docker compose build
+```
+
+> 不需要 JS 渲染、希望镜像更小：`INSTALL_BROWSER=0 docker compose build`（之后遇到动态页面将无法回退渲染）。
+
+### 更新项目（Docker）
+
+```bash
+git pull
+docker compose build                      # 重新构建镜像
+docker compose run --rm crawler smoke     # 可选：验证
+```
+
+数据与配置都在宿主机挂载目录中，更新镜像不影响已有数据。
+
+---
+
+## 快速开始（原生部署，不使用 Docker）
 
 ### Windows
 
@@ -333,6 +427,15 @@ Windows 上安装 Python 时勾选 “Add Python to PATH”，安装后重新打
 不会。单个文章异常会被记录为 `error`，其他文章和站点会继续抓取。
 
 ### 6. 如何更新项目
+
+Docker 方式：
+
+```bash
+git pull
+docker compose build
+```
+
+原生方式：
 
 ```powershell
 git pull
