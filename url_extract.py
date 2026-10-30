@@ -6,6 +6,7 @@ import ssl
 import sys
 import urllib.error
 import urllib.request
+from html import unescape
 
 from gne import GeneralNewsExtractor, NoContentException
 
@@ -37,6 +38,90 @@ def content_needs_render(content: str) -> bool:
     return len(text) < 500 and any(p in text for p in placeholders)
 
 
+_VIDEO_URL_MARKERS = ("/shipin/", "/video/", "/vod/", "/videos/")
+
+
+def is_video_page(url: str, html_text: str) -> bool:
+    """Heuristic: is this URL/HTML a video article page?"""
+    lowered = (url or "").lower()
+    if any(marker in lowered for marker in _VIDEO_URL_MARKERS):
+        return True
+    head = (html_text or "")[:40000].lower()
+    if 'og:type" content="video' in head or "og:type' content='video" in head:
+        return True
+    return "<video" in head and 'type="video/' in head
+
+
+def _meta_map(html_text: str) -> dict:
+    metas = {}
+    for match in re.finditer(r"(?is)<meta\b[^>]*>", html_text or ""):
+        tag = match.group(0)
+        km = re.search(r'(?is)\b(?:property|name)\s*=\s*["\']([^"\']+)["\']', tag)
+        cm = re.search(r'(?is)\bcontent\s*=\s*["\'](.*?)["\']', tag)
+        if km and cm:
+            key = km.group(1).strip().lower()
+            if key not in metas:
+                metas[key] = unescape(cm.group(1)).strip()
+    return metas
+
+
+def _json_ld_published(html_text: str) -> str:
+    for match in re.finditer(
+        r'(?is)<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html_text or "",
+    ):
+        dm = re.search(r'(?is)"datePublished"\s*:\s*"([^"]+)"', match.group(1))
+        if dm:
+            return dm.group(1).strip()
+    return ""
+
+
+def _date_from_url(url: str) -> str:
+    match = re.search(r"/(20\d{2})[-/]?(\d{1,2})[-/]?(\d{1,2})/", url or "")
+    if match:
+        return "%s-%02d-%02d" % (match.group(1), int(match.group(2)), int(match.group(3)))
+    return ""
+
+
+def extract_video_meta(html_text: str, url: str) -> dict | None:
+    """Extract title/summary/publish time for video pages from meta/JSON-LD/URL."""
+    metas = _meta_map(html_text)
+    title = metas.get("og:title", "")
+    if not title:
+        h1 = re.search(r"(?is)<h1\b[^>]*>(.*?)</h1>", html_text or "")
+        if h1:
+            title = unescape(re.sub(r"<[^>]+>", "", h1.group(1))).strip()
+    if not title:
+        t = re.search(r"(?is)<title>(.*?)</title>", html_text or "")
+        if t:
+            title = unescape(t.group(1)).strip()
+    if title:
+        title = re.split(r"\s*[-_|]\s*", title)[0].strip()
+
+    description = metas.get("og:description") or metas.get("description") or ""
+    publish = (
+        metas.get("article:published_time")
+        or metas.get("publishdate")
+        or metas.get("pubdate")
+        or metas.get("date")
+        or _json_ld_published(html_text)
+        or _date_from_url(url)
+    )
+    author = metas.get("author") or metas.get("og:site_name") or ""
+    image = metas.get("og:image") or ""
+    content = description or title
+    if not title and not description:
+        return None
+    return {
+        "title": title,
+        "author": author,
+        "publish_time": publish,
+        "content": content,
+        "images": [image] if image else [],
+        "is_video": True,
+    }
+
+
 def fetch_html_with_browser(url: str) -> str | None:
     """Render a page with headless Chrome (Playwright) as a fallback."""
     try:
@@ -48,10 +133,11 @@ def fetch_html_with_browser(url: str) -> str | None:
     try:
         with sync_playwright() as p:
             browser = None
+            launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
             try:
-                browser = p.chromium.launch(channel="chrome", headless=True)
+                browser = p.chromium.launch(channel="chrome", headless=True, args=launch_args)
             except Exception:
-                browser = p.chromium.launch(headless=True)
+                browser = p.chromium.launch(headless=True, args=launch_args)
             try:
                 page = browser.new_page(
                     user_agent=HEADERS["User-Agent"],
@@ -117,6 +203,12 @@ def extract_article(url: str, extractor: GeneralNewsExtractor) -> dict | None:
     except (urllib.error.URLError, ValueError, TimeoutError, ConnectionError) as exc:
         print(f"抓取失败（网络错误或网址无效）：{exc}")
         return None
+
+    if is_video_page(url, html):
+        video = extract_video_meta(html, url)
+        if video is not None:
+            print("识别为视频页，使用 meta 适配抽取。")
+            return video
 
     try:
         result = extractor.extract(html)

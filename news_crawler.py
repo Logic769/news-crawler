@@ -32,8 +32,10 @@ from url_extract import (
     MIN_CONTENT_LENGTH,
     content_is_too_short,
     content_needs_render,
+    extract_video_meta,
     fetch_html,
     fetch_html_with_browser,
+    is_video_page,
 )
 
 LOG = logging.getLogger("news_crawler")
@@ -343,6 +345,11 @@ def fetch_article_html(url: str) -> str | None:
 
 
 def extract_article(html: str, url: str) -> dict | None:
+    if is_video_page(url, html):
+        video = extract_video_meta(html, url)
+        if video is not None:
+            LOG.info("识别为视频页，使用 meta 适配抽取 %s", url)
+            return video
     extractor = GeneralNewsExtractor()
     try:
         result = extractor.extract(html)

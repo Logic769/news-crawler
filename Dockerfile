@@ -5,7 +5,7 @@
 #   # 国内加速：docker build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple -t news-crawler:local .
 # 构建参数：
 #   PIP_INDEX_URL            PyPI 镜像地址，默认官方源
-#   INSTALL_BROWSER=1        是否安装 Playwright Chromium（用于 JS 渲染回退）；设为 0 可显著减小镜像，但丢失动态页面抓取能力
+#   INSTALL_BROWSER=1        默认值，安装 Playwright Chromium（默认镜像自带浏览器，用于 JS 动态页面与视频页）；设为 0 可构建更小的精简镜像但丢失浏览器能力
 #   PLAYWRIGHT_DOWNLOAD_HOST  Playwright 浏览器下载镜像（国内可用 https://npmmirror.com/mirrors/playwright）
 
 # 基础镜像按 digest 固定，保证可复现构建（升级时手动更新 digest）
@@ -43,6 +43,11 @@ RUN if [ "${INSTALL_BROWSER}" = "1" ]; then \
       if [ -n "${PLAYWRIGHT_DOWNLOAD_HOST}" ]; then export PLAYWRIGHT_DOWNLOAD_HOST; fi ; \
       python -m playwright install --with-deps chromium ; \
       rm -rf /var/lib/apt/lists/* ; \
+    fi
+
+# 默认镜像必须真的带浏览器：构建期启动一次 Chromium，确保运行时可用（含 root 的 --no-sandbox）
+RUN if [ "${INSTALL_BROWSER}" = "1" ]; then \
+      python -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage']); b.close(); p.stop(); print('chromium launch OK')" ; \
     fi
 
 # 拷贝应用代码
