@@ -115,16 +115,19 @@ jobs:
         run: docker compose run --rm --no-deps crawler smoke
 
   docker-build-full:
-    name: docker build (with browser) + smoke
+    name: docker build (default, with browser) + smoke
     runs-on: ubuntu-latest
-    # only on push / manual, to avoid downloading Chromium on every PR
+    # 仅 push / 手动运行，避免每个 PR 都下载 Chromium
     if: github.event_name != 'pull_request'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build image with Chromium (INSTALL_BROWSER=1)
-        run: docker build --build-arg INSTALL_BROWSER=1 -t news-crawler:full .
+      - name: Build default image (browser included)
+        run: docker build -t news-crawler:full .
+
+      - name: Verify Chromium launch inside container
+        run: docker run --rm --entrypoint python news-crawler:full -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage']); b.close(); p.stop(); print('chromium launch OK')"
 
       - name: Run smoke test inside container
         run: docker run --rm news-crawler:full smoke

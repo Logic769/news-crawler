@@ -378,7 +378,9 @@ CREATE TABLE IF NOT EXISTS articles (
 ### 9.4 Docker（推荐方式）
 
 - 文件：`Dockerfile`、`.dockerignore`、`docker-compose.yml`、`docker/entrypoint.sh`、`docker-deploy.sh`、`docker-deploy.bat`
-- 基础镜像：`python:3.12-slim`；默认安装 Playwright Chromium（`playwright install --with-deps chromium`），可用构建参数 `INSTALL_BROWSER=0` 关闭以减小镜像
+- 基础镜像：`python:3.12-slim`；**默认镜像自带 Playwright Chromium**（`playwright install --with-deps chromium`，构建期会实际启动一次 Chromium 自检），可用构建参数 `INSTALL_BROWSER=0` 关闭以减小镜像但失去浏览器能力
+- 浏览器运行：容器以 root 运行时 Chromium 必须带 `--no-sandbox --disable-dev-shm-usage`（`url_extract.py` 已内置）
+- 视频页适配：`/shipin/`、`/video/` 等视频页由 `url_extract.is_video_page()` 识别，改用 meta/JSON-LD/URL 提取标题、简介、发布时间（`extract_video_meta()`），避免正文过短与日期误判
 - 入口：`docker/entrypoint.sh` 统一处理 `run`/`init`/`test`/`smoke`/`shell`，数据库默认写入 `/app/data/news.db`
 - 挂载：`sources.local.json` 只读挂载（私有配置不进镜像）；`./data` 持久化数据库
 - 容器以 root 运行，避免跨平台 bind mount 的 UID 权限问题；安全要求高时可改非 root + 命名卷

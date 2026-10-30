@@ -173,6 +173,8 @@ docker compose run --rm crawler test --config sources.local.json --name <站点�
 - 已有的旧 `news.db` 可直接移动到 `data/news.db` 继续使用；
 - 首次使用裸 `docker compose run` 前请确保已存在 `sources.local.json`（否则 Docker 会把只读挂载点建成目录导致报错）；`docker-deploy.sh`/`.bat` 已自动处理；
 - 容器默认以 root 运行，以规避 Windows/Linux 之间 bind mount 的 UID 权限不一致；如需更高安全可改用非 root 用户 + 命名卷；
+- **默认镜像自带浏览器**：默认构建即安装 Playwright Chromium（`INSTALL_BROWSER=1`），可处理 JS 动态页面与视频页；仅在确定不需要浏览器时用 `INSTALL_BROWSER=0` 构建精简版。
+- **视频页适配**：对 `/shipin/`、`/video/` 等视频页，改用页面 meta、JSON-LD 与 URL 日期提取标题、简介与发布时间，避免正文过短和发布时间误判（默认镜像已带 Chromium，可渲染后再判断）。
 - **构建可复现**：基础镜像按 digest 固定（`Dockerfile` 的 `FROM ...@sha256:...`），依赖版本由 `docker/constraints.txt` 锁定（源自 `uv.lock`）；升级依赖请同步 `uv.lock` 与 `docker/constraints.txt`。
 
 ### 国内网络加速（可选）
