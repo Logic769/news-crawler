@@ -7,6 +7,7 @@ import ssl
 import sys
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from html import unescape
 
 from gne import GeneralNewsExtractor, NoContentException
@@ -21,6 +22,18 @@ HEADERS = {
 
 
 MIN_CONTENT_LENGTH = 100
+
+
+class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-check every redirect target before urllib follows it."""
+
+    def __init__(self, validator: Callable[[str], None]) -> None:
+        super().__init__()
+        self._validator = validator
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        self._validator(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def content_is_too_short(content: str) -> bool:
@@ -237,12 +250,21 @@ def fetch_html_with_browser(url: str) -> str | None:
         return None
 
 
-def fetch_html(url: str) -> str:
-    """Fetch a page and decode it using the charset from headers/meta tags."""
+def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) -> str:
+    """Fetch a page and decode it using the charset from headers/meta tags.
+
+    url_validator, when given, is called again for every redirect target so a
+    caller-side allow-list cannot be bypassed by a 3xx response.
+    """
 
     def _fetch(context: ssl.SSLContext) -> bytes:
+        handlers: list[urllib.request.BaseHandler] = []
+        if url_validator is not None:
+            handlers.append(_ValidatingRedirectHandler(url_validator))
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+        opener = urllib.request.build_opener(*handlers)
         req = urllib.request.Request(url, headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=25, context=context) as resp:
+        with opener.open(req, timeout=25) as resp:
             return resp.read(), resp.headers.get_content_charset()
 
     try:
@@ -268,13 +290,22 @@ def fetch_html(url: str) -> str:
     return raw.decode("utf-8", "ignore")
 
 
-def extract_article(url: str, extractor: GeneralNewsExtractor) -> dict | None:
+def extract_article(
+    url: str,
+    extractor: GeneralNewsExtractor,
+    *,
+    allow_browser: bool = True,
+    url_validator: Callable[[str], None] | None = None,
+) -> dict | None:
     print("正在抓取:", url)
     try:
-        html = fetch_html(url)
+        html = fetch_html(url, url_validator=url_validator)
     except urllib.error.HTTPError as exc:
         if exc.code not in (401, 403, 406, 429):
             print(f"抓取失败（HTTP {exc.code}）。")
+            return None
+        if not allow_browser:
+            print(f"直接抓取被拒绝(HTTP {exc.code})，且浏览器回退已禁用。")
             return None
         print(f"直接抓取被拒绝(HTTP {exc.code})，正在用本机 Chrome 无头模式渲染...")
         html = fetch_html_with_browser(url)
@@ -297,6 +328,9 @@ def extract_article(url: str, extractor: GeneralNewsExtractor) -> dict | None:
         result = None
 
     if result is None or content_needs_render(result.get("content")):
+        if not allow_browser:
+            print("直接抓取未提取到正文，且浏览器回退已禁用。")
+            return None
         print("直接抓取未提取到正文，正在用本机 Chrome 无头模式渲染...")
         html = fetch_html_with_browser(url)
         if html is None:

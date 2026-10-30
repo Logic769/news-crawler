@@ -31,9 +31,14 @@ $DC run --rm crawler init
 echo "运行冒烟测试..."
 $DC run --rm crawler smoke
 
+echo "运行 API 冒烟测试..."
+$DC run --rm --entrypoint python crawler -X utf8 api_smoke.py
+
 echo ""
 echo "Docker 部署完成。常用命令："
 echo "  抓取：      $DC run --rm crawler run --config sources.local.json --days 3"
 echo "  测试解析：  $DC run --rm crawler test --config sources.local.json --name <站点名>"
 echo "  进入容器：  $DC run --rm crawler shell"
+echo "  启动 API：  $DC up -d api"
+echo "  API 文档：  http://localhost:8000/docs"
 echo "  数据库文件：./data/news.db"

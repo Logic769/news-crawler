@@ -26,3 +26,39 @@ services:
     # 默认行为：抓取最近 3 天（数据库由 entrypoint 落到 /app/data/news.db）
     command: ["run", "--config", "sources.local.json", "--days", "3"]
     restart: "no"
+
+  api:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        INSTALL_BROWSER: ${INSTALL_BROWSER:-1}
+        PLAYWRIGHT_DOWNLOAD_HOST: ${PLAYWRIGHT_DOWNLOAD_HOST:-}
+    image: news-crawler:local
+    container_name: news-crawler-api
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      NEWS_DB: /app/data/news.db
+      NEWS_CONFIG: /app/sources.local.json
+      NEWS_API_KEY: ${NEWS_API_KEY:-}
+      NEWS_JOB_WORKERS: ${NEWS_JOB_WORKERS:-1}
+      NEWS_TIMEZONE: ${NEWS_TIMEZONE:-Asia/Shanghai}
+      NEWS_CORS_ORIGINS: ${NEWS_CORS_ORIGINS:-}
+      NEWS_ALLOW_PRIVATE_URLS: ${NEWS_ALLOW_PRIVATE_URLS:-}
+      NEWS_EXTRACT_ALLOW_BROWSER: ${NEWS_EXTRACT_ALLOW_BROWSER:-}
+      NEWS_MAX_PENDING_JOBS: ${NEWS_MAX_PENDING_JOBS:-50}
+    volumes:
+      - ./sources.local.json:/app/sources.local.json:ro
+      - ./data:/app/data
+    command: ["api"]
+    ports:
+      # 默认只绑定宿主机回环地址，避免未设置 NEWS_API_KEY 时暴露到局域网
+      - "${NEWS_API_BIND:-127.0.0.1}:${NEWS_API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    stop_grace_period: 10s
+    restart: unless-stopped

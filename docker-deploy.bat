@@ -38,10 +38,16 @@ echo Running smoke test...
 docker compose run --rm crawler smoke
 if errorlevel 1 exit /b 1
 
+echo Running API smoke test...
+docker compose run --rm --entrypoint python crawler -X utf8 api_smoke.py
+if errorlevel 1 exit /b 1
+
 echo.
 echo Docker deployment completed. Common commands:
 echo   Crawl:      docker compose run --rm crawler run --config sources.local.json --days 3
 echo   Test parse: docker compose run --rm crawler test --config sources.local.json --name ^<site^>
 echo   Shell:      docker compose run --rm crawler shell
+echo   Start API:  docker compose up -d api
+echo   API docs:   http://localhost:8000/docs
 echo   Database:   .\data\news.db
 endlocal
