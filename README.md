@@ -35,7 +35,8 @@
 | `docker/entrypoint.sh` | 容器统一入口（run/init/test/api/smoke/live-news/shell） |
 | `docker-deploy.sh` / `docker-deploy.bat` | Docker 一键部署脚本（Linux·macOS / Windows） |
 | `smoke_test.py` | 部署后的离线自检脚本 |
-| `verify_live_news.py` | CI 实时新闻抓取验证（5 静态 / 3 JS 渲染 / 2 视频） |
+| `verify_live_news.py` | 实时新闻抓取验证（默认抽取 10 静态 / 10 JS 渲染 / 10 视频） |
+| `live_news_pool.json` | 实时验证页面池（100 静态 / 50 JS 渲染 / 50 视频） |
 | `AGENTS.md` | 多 Agent 协作与开发说明（架构、规范、发布流程） |
 | `gne/` | GNE 新闻抽取核心库 |
 | `tests/` | 上游自带测试 HTML 样本 |
@@ -104,15 +105,17 @@ docker compose run --rm crawler test --config sources.local.json --name <站点�
 
 ### 实时新闻抓取验证
 
+仓库内置 `live_news_pool.json`（100 个静态文本页 / 50 个 JS 渲染页 / 50 个视频页，覆盖国内媒体、高校与政府网站），从中随机抽取页面做真实抽取：
+
 ```bash
-# 默认 5 个静态文本页 + 3 个动态 JS 渲染页 + 2 个视频页
+# 默认抽取 10 静态 + 10 JS 渲染 + 10 视频，全部通过才算成功
 docker compose run --rm crawler live-news
 
-# 可指定数量或固定随机种子
-docker compose run --rm crawler live-news --static 5 --dynamic 3 --video 2 --seed 20261030
+# 指定数量或固定随机种子（便于复现失败）
+docker compose run --rm crawler live-news --static 10 --dynamic 10 --video 10 --seed 20261030
 ```
 
-该命令会访问公开新闻站点，用于验证直接 HTTP、Chromium 渲染与视频页三条抽取路径。CI 中该步骤为非阻塞观测项（`continue-on-error`）；失败时按日志里的 seed 用 `--seed` 复现。
+该命令访问公开新闻站点，覆盖直接 HTTP、Chromium 渲染与视频页三条抽取路径。抽到的页面失效时会自动从池中补抽（日志打印 `REPLACED PAGES`），补不足目标数量则直接失败；失败时按日志里的 `LIVE NEWS SEED` 用 `--seed` 复现。池子维护方法见 `AGENTS.md` 第 10 章。
 
 ### 数据与配置
 
