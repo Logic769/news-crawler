@@ -189,6 +189,8 @@ curl http://localhost:8000/v1/health
 >
 > 开启 `NEWS_EXTRACT_ALLOW_BROWSER=1` 等于放弃上述地址限制：Chromium 会自行解析 DNS 并跟随跳转，`extract` 只对初始 URL 与 HTTP 层的每一跳做校验。另外 DNS 解析与真正建连是两次独立查询，仍存在 DNS rebinding 的理论窗口。因此公网部署请始终设置 `NEWS_API_KEY`（或 `NEWS_REQUIRE_AUTH=1`），并保持浏览器回退关闭。
 
+> 用 `docker compose` 部署时，API 的变量通过 compose 的白名单透传，需要在项目根目录的 `.env` 或当前 shell 中设置后才生效（例如 `NEWS_API_KEY=... docker compose up -d api`）。
+
 设置 API Key 的示例（bash）：
 
 ```bash
@@ -247,7 +249,7 @@ curl "http://localhost:8000/v1/articles?status=all&page_size=50"
 | `published_at` | 带时区的 ISO 8601 发布时间，例如 `2026-10-30T10:00:00+08:00` |
 | `published_at_utc` | 同一时间的 UTC 表示，以 `Z` 结尾 |
 | `published_raw` | 数据库里的原始发布时间字符串 |
-| `timezone` | 该文章写入时使用的时区（落库保存，站点配置变化不影响历史数据） |
+| `timezone` | 该文章写入时使用的站点时区（落库保存，站点配置变化不影响历史数据；`unknown_date` 等没有发布时间的结果不会写入该列） |
 | `content` / `content_length` | 正文（列表默认不返回，详情始终返回）与字数 |
 | `images` | 图片 URL 数组 |
 | `status` / `error` | 抓取状态与错误信息 |

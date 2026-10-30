@@ -167,11 +167,20 @@ class JobManager:
             result = execute_job(row["type"], payload, self._settings)
         except BaseException as exc:  # noqa: BLE001 - 包括 KeyboardInterrupt，避免作业卡在 running
             LOG.exception("任务 %s 失败", job_id)
-            self._finish(job_id, "failed", error=str(exc)[:2000] or exc.__class__.__name__)
+            try:
+                self._finish(
+                    job_id, "failed", error=str(exc)[:2000] or exc.__class__.__name__
+                )
+            except Exception:  # 收尾失败不应掩盖原始异常，重启后 start() 会兜底
+                LOG.exception("任务 %s 的失败状态写入失败", job_id)
             if not isinstance(exc, Exception):
                 raise
         else:
-            self._finish(job_id, "succeeded", result=result)
+            try:
+                self._finish(job_id, "succeeded", result=result)
+            except Exception:
+                LOG.exception("任务 %s 的结果写入失败", job_id)
+                raise
 
     def _finish(
         self,

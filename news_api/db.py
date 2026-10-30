@@ -7,6 +7,7 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -24,7 +25,9 @@ def connect(db_path: str, *, read_only: bool = True) -> sqlite3.Connection:
         # mode=ro 让缺失的数据库直接报错，而不是静默创建空文件；
         # 路径需转义 ?/#，否则会被当成 URI 参数。注意 WAL 库仍需要目录可写
         # 才能创建 -shm/-wal，只读挂载的卷请改用不可变快照或只读模式关闭。
-        target = f"file:{quote(db_path, safe='/:')}?mode=ro"
+        # Windows 盘符路径的反斜杠会被当成转义序列，统一转成 POSIX 形式再编码。
+        posix_path = Path(db_path).as_posix()
+        target = f"file:{quote(posix_path, safe='/:')}?mode=ro"
         conn = sqlite3.connect(target, timeout=30, uri=True)
     else:
         conn = sqlite3.connect(db_path, timeout=30)
@@ -232,8 +235,13 @@ def list_sources(
                    COUNT(*) AS total,
                    SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok,
                    MAX(publish_time) AS latest_publish,
+                   -- 取最新那条记录写入的时区，保证与 /v1/articles 的口径一致
+                   (SELECT a2.timezone FROM articles a2
+                     WHERE a2.source = a.source
+                     ORDER BY a2.publish_time DESC, a2.updated_at DESC
+                     LIMIT 1) AS latest_tz,
                    MAX(updated_at) AS latest_update
-            FROM articles
+            FROM articles a
             GROUP BY source
             ORDER BY source ASC
             """
@@ -245,7 +253,8 @@ def list_sources(
             "ok": int(row["ok"] or 0),
             "latest_published_at": iso_or_none(
                 row["latest_publish"],
-                _source_timezone(row["source"], timezones, default_tz),
+                str(row["latest_tz"] or "").strip()
+                or _source_timezone(row["source"], timezones, default_tz),
             ),
             "latest_updated_at": local_iso(row["latest_update"]),
         }

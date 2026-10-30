@@ -233,9 +233,11 @@ def parse_datetime(
 def _migrate_schema(conn: sqlite3.Connection) -> None:
     """Add columns/indexes introduced after the first schema version."""
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-    if version >= SCHEMA_VERSION:
-        return
     columns = {row[1] for row in conn.execute("PRAGMA table_info(articles)")}
+    # 只有“版本号到位且列确实齐全”才跳过迁移：手工改库、降级或中途异常都可能
+    # 让 user_version 已置位而列缺失，此时早退会让后续 INSERT/SELECT 直接报错。
+    if version >= SCHEMA_VERSION and {"article_id", "timezone"} <= columns:
+        return
     if "article_id" not in columns:
         conn.execute("ALTER TABLE articles ADD COLUMN article_id TEXT")
     if "timezone" not in columns:
@@ -281,13 +283,22 @@ def _ensure_wal(conn: sqlite3.Connection) -> None:
         return
     for attempt in range(3):
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            return
+            row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
         except sqlite3.OperationalError as exc:
             if attempt == 2:
                 LOG.warning("切换到 WAL 失败，继续使用当前日志模式：%s", exc)
                 return
             time.sleep(0.2)
+            continue
+        # 不支持的库（如 :memory: 或网络文件系统）不抛异常，只返回原模式，
+        # 因此必须校验返回值，否则会静默跑在 delete 模式。
+        mode = str(row[0]).lower() if row else ""
+        if mode == "wal":
+            return
+        if attempt == 2:
+            LOG.warning("无法切换到 WAL，继续使用日志模式：%s", mode or "unknown")
+            return
+        time.sleep(0.2)
 
 
 def init_db(db_path: str) -> sqlite3.Connection:
@@ -501,6 +512,7 @@ def save_article(
     """
     article_id = article_id_for(source, url)
     images_json = json.dumps(images, ensure_ascii=False) if images else ""
+    stamp = now_iso()
     conn.execute(
         """
         INSERT INTO articles (
@@ -533,8 +545,8 @@ def save_article(
             images_json,
             status,
             error,
-            now_iso(),
-            now_iso(),
+            stamp,
+            stamp,
         ),
     )
     conn.commit()
@@ -567,6 +579,7 @@ def process_entry(
             url,
             list_title=entry.get("title", ""),
             publish_time=list_date.strftime("%Y-%m-%d %H:%M:%S"),
+            timezone=source.get("timezone", "Asia/Shanghai"),
             status="old",
         )
         return "old"

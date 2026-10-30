@@ -219,7 +219,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 
 列表参数：`status`、`source`、`published_from`、`published_to`、`q`、`page`、`page_size`、`order`、`include_content`。文章列表与作业列表返回 `{"data": [...], "meta": {...}}`；文章详情、统计、健康检查返回对应对象；`/v1/sources` 返回 `{"data": [...]}`。
 
-设置 `NEWS_API_KEY` 后，除 `/v1/health` 与文档外都需 `X-API-Key` 或 `Authorization: Bearer <key>`。作业状态为 `queued`/`running`/`succeeded`/`failed`，单进程执行，避免 SQLite 并发写冲突。排队 + 运行中的作业上限为 `NEWS_MAX_PENDING_JOBS`（默认 50），超出返回 `429`；相同类型与参数的未完成作业复用同一 ID。`extract` 默认拒绝回环、内网与保留地址（`NEWS_ALLOW_PRIVATE_URLS=1` 可放开）；`fetch_html` 通过自定义 `HTTPRedirectHandler` 对每个重定向目标复用同一校验，默认还以 `allow_browser=False` 禁用浏览器回退（`NEWS_EXTRACT_ALLOW_BROWSER=1` 可放开），避免页面 JS 绕过地址限制。上述限制仍不能替代 API Key。已完成作业保留 30 天后自动清理。未设置 `NEWS_API_KEY` 时默认开放（仅提示 warning）；设置 `NEWS_REQUIRE_AUTH=1` 可在无 key 时直接拒绝未鉴权请求（401）。错误响应统一为 `{"status": <HTTP 码>, "error": {"code", "message", "details"?}}`，参数校验错误为 422 且带 `details`。
+设置 `NEWS_API_KEY` 后，除 `/v1/health` 与文档外都需 `X-API-Key` 或 `Authorization: Bearer <key>`。作业状态为 `queued`/`running`/`succeeded`/`failed`，单进程执行，避免 SQLite 并发写冲突。排队 + 运行中的作业上限为 `NEWS_MAX_PENDING_JOBS`（默认 50），超出返回 `429`；相同类型与参数的未完成作业复用同一 ID。`extract` 默认拒绝回环、内网与保留地址（`NEWS_ALLOW_PRIVATE_URLS=1` 可放开）；`fetch_html` 通过自定义 `HTTPRedirectHandler` 对每个重定向目标复用同一校验，默认还以 `allow_browser=False` 禁用浏览器回退（`NEWS_EXTRACT_ALLOW_BROWSER=1` 可放开），避免页面 JS 绕过地址限制。上述限制仍不能替代 API Key。已完成作业保留 30 天后自动清理。未设置 `NEWS_API_KEY` 时默认开放（仅提示 warning）；设置 `NEWS_REQUIRE_AUTH=1` 后行为是"未配置 key 则业务请求一律 401，已配置 key 时按 key 校验"（401 带 `WWW-Authenticate`，`/v1/health`、`/docs`、openapi 与根路径始终开放）。错误响应统一为 `{"error": {"code", "status": <HTTP 码>, "message", "details"?}}`，参数校验错误为 422 且带 `details`。`docker compose` 通过白名单透传 API 变量，需在 `.env` 或 shell 中设置后生效。
 
 ---
 
@@ -301,7 +301,7 @@ CREATE TABLE IF NOT EXISTS articles (
     timezone      TEXT,            -- 写入时的站点时区，历史行可能为空
     author        TEXT,
     content       TEXT,            -- 正文纯文本
-    images        TEXT,            -- JSON 数组字符串
+    images        TEXT,            -- JSON 数组字符串；空串表示本次未取到，不覆盖库中原值
     status        TEXT NOT NULL,   -- ok/old/no_content/unknown_date/error
     error         TEXT,
     first_seen_at TEXT,

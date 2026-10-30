@@ -27,8 +27,14 @@ API_KEY = "smoke-secret"
 
 class _ArticleHandler(BaseHTTPRequestHandler):
     body = b""
+    flaky_fail = False
 
     def do_GET(self) -> None:  # noqa: N802 - http.server API
+        if self.path.startswith("/flaky") and _ArticleHandler.flaky_fail:
+            self.send_response(500)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(self.body)))
@@ -82,6 +88,17 @@ def _wait_health(base: str, deadline: float) -> None:
             pass
         time.sleep(0.2)
     raise AssertionError("API 未在限定时间内就绪")
+
+
+def _wait_job(base: str, job_id: str, deadline: float) -> dict:
+    job: dict = {}
+    while time.time() < deadline:
+        status, job = _request(base, "GET", f"/v1/jobs/{job_id}")
+        assert status == 200, (status, job)
+        if job["status"] in ("succeeded", "failed"):
+            return job
+        time.sleep(0.2)
+    raise AssertionError(f"作业 {job_id} 未在限定时间内结束：{job}")
 
 
 def main() -> None:
@@ -176,6 +193,7 @@ def main() -> None:
                 base, "GET", "/v1/articles?page_size=10&include_content=true"
             )
             assert status == 200, (status, with_content)
+            assert with_content["meta"]["total"] == 1, with_content
             full_item = with_content["data"][0]
             assert full_item["content"], full_item
             assert full_item["content_length"] == item["content_length"], full_item
@@ -241,6 +259,10 @@ def main() -> None:
                 _wait_health(auth_base, time.time() + 20)
                 status, denied = _request(auth_base, "GET", "/v1/articles", key=None)
                 assert status == 401, (status, denied)
+                status, denied_job = _request(
+                    auth_base, "POST", "/v1/jobs", {"type": "crawl"}, key=None
+                )
+                assert status == 401, (status, denied_job)
             finally:
                 auth_server.should_exit = True
                 auth_thread.join(timeout=10)
@@ -250,15 +272,7 @@ def main() -> None:
                 base, "POST", "/v1/jobs", {"type": "extract", "url": fixture_url}
             )
             assert status == 202, (status, created)
-            job_id = created["data"]["id"]
-            job = {}
-            job_deadline = time.time() + 60
-            while time.time() < job_deadline:
-                status, job = _request(base, "GET", f"/v1/jobs/{job_id}")
-                assert status == 200, (status, job)
-                if job["status"] in ("succeeded", "failed"):
-                    break
-                time.sleep(0.2)
+            job = _wait_job(base, created["data"]["id"], time.time() + 60)
             assert job["status"] == "succeeded", job
             assert job["result"]["status"] == "ok", job
             assert job["result"]["article_id"], job
@@ -287,6 +301,35 @@ def main() -> None:
 
             status, jobs = _request(base, "GET", "/v1/jobs?page_size=10")
             assert status == 200 and jobs["meta"]["total"] == 1, jobs
+
+            # 真实失败路径：同一 URL 先成功入库，再让源站返回 500，
+            # 验证失败只标记 status/error，已抓到的正文不会被清空。
+            flaky_url = f"http://127.0.0.1:{fixture_port}/flaky.html"
+            status, created_flaky = _request(
+                base, "POST", "/v1/jobs", {"type": "extract", "url": flaky_url}
+            )
+            assert status == 202, (status, created_flaky)
+            flaky_job = _wait_job(base, created_flaky["data"]["id"], time.time() + 60)
+            assert flaky_job["status"] == "succeeded", flaky_job
+            flaky_article_id = flaky_job["result"]["article_id"]
+            _ArticleHandler.flaky_fail = True
+            try:
+                status, failed_created = _request(
+                    base, "POST", "/v1/jobs", {"type": "extract", "url": flaky_url}
+                )
+                assert status == 202, (status, failed_created)
+                failed_job = _wait_job(
+                    base, failed_created["data"]["id"], time.time() + 60
+                )
+            finally:
+                _ArticleHandler.flaky_fail = False
+            assert failed_job["status"] == "failed", failed_job
+            status, preserved = _request(
+                base, "GET", f"/v1/articles/{flaky_article_id}"
+            )
+            assert status == 200 and preserved["content"], preserved
+            assert preserved["status"] == "error", preserved
+            assert preserved["title"], preserved
 
             raw = sqlite3.connect(db_path)
             try:
