@@ -8,6 +8,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
+from urllib.parse import quote
 
 from news_crawler import article_id_for, load_config, resolve_config_path
 from news_api.timeutil import (
@@ -20,8 +21,10 @@ from news_api.timeutil import (
 
 def connect(db_path: str, *, read_only: bool = True) -> sqlite3.Connection:
     if read_only:
-        # mode=ro 让缺失的数据库直接报错，而不是静默创建空文件
-        target = f"file:{db_path}?mode=ro"
+        # mode=ro 让缺失的数据库直接报错，而不是静默创建空文件；
+        # 路径需转义 ?/#，否则会被当成 URI 参数。注意 WAL 库仍需要目录可写
+        # 才能创建 -shm/-wal，只读挂载的卷请改用不可变快照或只读模式关闭。
+        target = f"file:{quote(db_path, safe='/:')}?mode=ro"
         conn = sqlite3.connect(target, timeout=30, uri=True)
     else:
         conn = sqlite3.connect(db_path, timeout=30)
@@ -87,8 +90,10 @@ def row_to_article(
 ) -> dict[str, Any]:
     source = str(row["source"])
     url = str(row["url"])
-    tz_name = _source_timezone(source, timezones, default_tz)
     keys = row.keys()
+    # 写入时落库的时区优先；旧行没有记录时才回落到当前配置。
+    stored_tz = str(row["timezone"] or "").strip() if "timezone" in keys else ""
+    tz_name = stored_tz or _source_timezone(source, timezones, default_tz)
     content = (row["content"] or "") if "content" in keys else ""
     content_length = (
         int(row["content_length"] or 0) if "content_length" in keys else len(content)
@@ -168,8 +173,8 @@ def query_articles(
         )
         offset = (page - 1) * page_size
         columns = "*" if include_content else (
-            "article_id, source, url, list_title, title, publish_time, author, "
-            "length(content) AS content_length, images, status, error, "
+            "article_id, source, url, list_title, title, publish_time, timezone, "
+            "author, length(content) AS content_length, images, status, error, "
             "first_seen_at, updated_at"
         )
         rows = conn.execute(
@@ -250,6 +255,8 @@ def list_sources(
 
 def stats(db_path: str, *, default_tz: str) -> dict[str, Any]:
     with read_connection(db_path) as conn:
+        # 四条查询必须看到同一快照，否则 total 与 by_status 可能互相矛盾。
+        conn.execute("BEGIN")
         total = int(
             conn.execute("SELECT COUNT(*) AS n FROM articles").fetchone()["n"]
         )
@@ -263,6 +270,7 @@ def stats(db_path: str, *, default_tz: str) -> dict[str, Any]:
             conn.execute("SELECT COUNT(DISTINCT source) AS n FROM articles")
             .fetchone()["n"]
         )
+        conn.commit()
     return {
         "total": total,
         "by_status": {row["status"]: int(row["n"]) for row in status_rows},

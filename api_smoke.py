@@ -172,6 +172,14 @@ def main() -> None:
             status, detail = _request(base, "GET", f"/v1/articles/{article_id}")
             assert status == 200 and detail["content"], detail
 
+            status, with_content = _request(
+                base, "GET", "/v1/articles?page_size=10&include_content=true"
+            )
+            assert status == 200, (status, with_content)
+            full_item = with_content["data"][0]
+            assert full_item["content"], full_item
+            assert full_item["content_length"] == item["content_length"], full_item
+
             status, sources = _request(base, "GET", "/v1/sources")
             assert status == 200 and sources["data"][0]["source"] == "fixture", sources
 
@@ -219,6 +227,24 @@ def main() -> None:
                 strict_server.should_exit = True
                 strict_thread.join(timeout=10)
 
+            auth_settings = Settings(
+                db_path=db_path,
+                config_path=config_path,
+                api_key=None,
+                job_workers=1,
+                timezone="Asia/Shanghai",
+                allow_private_urls=True,
+                require_auth=True,
+            )
+            auth_server, auth_thread, auth_base = _serve(create_app(auth_settings))
+            try:
+                _wait_health(auth_base, time.time() + 20)
+                status, denied = _request(auth_base, "GET", "/v1/articles", key=None)
+                assert status == 401, (status, denied)
+            finally:
+                auth_server.should_exit = True
+                auth_thread.join(timeout=10)
+
             fixture_url = f"http://127.0.0.1:{fixture_port}/article.html"
             status, created = _request(
                 base, "POST", "/v1/jobs", {"type": "extract", "url": fixture_url}
@@ -236,6 +262,24 @@ def main() -> None:
             assert job["status"] == "succeeded", job
             assert job["result"]["status"] == "ok", job
             assert job["result"]["article_id"], job
+
+            regression_conn = news_crawler.init_db(db_path)
+            try:
+                news_crawler.save_article(
+                    regression_conn,
+                    "on_demand",
+                    fixture_url,
+                    status="error",
+                    error="模拟抓取失败",
+                )
+            finally:
+                regression_conn.close()
+            status, preserved = _request(
+                base, "GET", f"/v1/articles/{job['result']['article_id']}"
+            )
+            assert status == 200 and preserved["status"] == "error", preserved
+            assert preserved["content"], preserved
+            assert preserved["title"], preserved
             status, extracted = _request(
                 base, "GET", f"/v1/articles/{job['result']['article_id']}"
             )

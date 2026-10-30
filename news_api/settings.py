@@ -34,6 +34,7 @@ class Settings:
     allow_private_urls: bool = False
     max_pending_jobs: int = 50
     extract_allow_browser: bool = False
+    require_auth: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -55,4 +56,5 @@ class Settings:
             allow_private_urls=_env_bool("NEWS_ALLOW_PRIVATE_URLS"),
             max_pending_jobs=max(1, _env_int("NEWS_MAX_PENDING_JOBS", 50)),
             extract_allow_browser=_env_bool("NEWS_EXTRACT_ALLOW_BROWSER"),
+            require_auth=_env_bool("NEWS_REQUIRE_AUTH"),
         )
