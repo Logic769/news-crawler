@@ -23,7 +23,7 @@ GNE 本身只负责“从 HTML 中抽取新闻信息”，不负责发起 HTTP �
 
 | 项目 | 内容 |
 | --- | --- |
-| 当前正式版本 | `v1.0.2` |
+| 当前正式版本 | `v1.1.0` |
 | 开源协议 | MIT（继承自上游 GeneralNewsExtractor） |
 | 主仓库 | https://github.com/Logic769/news-crawler |
 | 上游仓库 | https://github.com/kingname/GeneralNewsExtractor |

@@ -1,5 +1,47 @@
 # General News Extractor Changelog
 
+## 1.1.0 (2026-10-31)
+
+### New Feature
+
+1. 新增 Docker 部署：`Dockerfile`（`python:3.12-slim` 按 digest 固定 + `docker/constraints.txt` 锁定依赖）、`docker-compose.yml`、统一入口 `docker/entrypoint.sh`（`run`/`init`/`test`/`smoke`/`live-news`/`api`/`shell`）与一键脚本 `docker-deploy.sh`/`docker-deploy.bat`。默认镜像内置 Playwright Chromium，保证 JS 渲染回退可用
+2. 新增标准新闻 HTTP API（`/v1`，FastAPI + Uvicorn）：`GET /v1/articles`、`GET /v1/articles/{article_id}`、`GET /v1/sources`、`GET /v1/stats`、`GET /v1/health`、`POST /v1/jobs`、`GET /v1/jobs`、`GET /v1/jobs/{id}`。列表响应统一为 `{"data": [...], "meta": {...}}`，错误统一为 `{"error": {"code", "status", "message", "details"?}}`
+3. 新增稳定文章 ID：`article_id = sha256(f"{source}\x1f{url}").hexdigest()[:32]`，`articles` 增加该列并建唯一索引；旧库启动时按 `PRAGMA user_version` 一次性迁移（`SCHEMA_VERSION = 2`），回填按 2000 行分批
+4. 新增 `crawl_jobs` 作业表与单进程作业队列：`POST /v1/jobs` 支持 `crawl`（按站点配置批量抓取）与 `extract`（单 URL 抽取入库）；相同类型与参数的未完成作业复用同一 ID；`NEWS_MAX_PENDING_JOBS`（默认 50）超限返回 429；已结束作业保留 30 天后自动清理
+5. `articles` 新增 `timezone` 列记录写入时的站点时区，接口据此输出 `published_at`（源时区 ISO 8601）、`published_at_utc`（UTC）与 `published_raw`（数据库原值）
+6. 新增可选鉴权：设置 `NEWS_API_KEY` 后校验 `X-API-Key` 或 `Authorization: Bearer`；`NEWS_REQUIRE_AUTH=1` 时未配置 key 一律拒绝
+7. 新增 `[api]` 可选依赖与 `api` 启动入口（`docker compose up -d api`，默认绑定 `127.0.0.1:8000`，交互文档 `/docs`）
+
+### Breaking Changes
+
+1. 移除原生部署入口：删除 `deploy.sh`、`deploy.bat`、`deploy.ps1`，Docker 成为唯一受支持的部署方式
+2. 容器内数据默认落在 `/app/data/news.db`（宿主机 `./data/news.db`），可用 `DATA_DIR` / `DB_PATH` 覆盖
+
+### Security
+
+1. `POST /v1/jobs` 的 `extract` 默认拒绝回环、内网与保留地址，HTTP 重定向逐跳复检；`NEWS_ALLOW_PRIVATE_URLS=1` 才放开
+2. `extract` 作业默认禁用浏览器回退（`NEWS_EXTRACT_ALLOW_BROWSER=1` 可放开），避免页面 JS 绕开地址限制
+3. API 默认只绑定 `127.0.0.1`；对局域网或公网暴露需显式设置 `NEWS_API_BIND` 并配置强随机 `NEWS_API_KEY`
+
+### Bug fix
+
+1. `save_article()` 改为部分更新语义：抓取失败只更新 `status`/`error`，不再清空已入库的正文与元数据
+2. `PRAGMA journal_mode=WAL` 切换改为校验返回值 + 短重试，旧库并发初始化不再抛 `database is locked`
+3. 列表页判 `old` 的分支补写 `timezone`；`/v1/sources` 的 `latest_published_at` 改用行内时区，避免改配置后时间偏移
+4. 修正视频页 JSON-LD 误判与日期截断，视频页改用 meta/JSON-LD/URL 提取标题、简介与发布时间
+
+### CI
+
+1. 新增 `live-news` job（PR 与 push 均执行）：从 200 个真实页面池抽样 10 静态 / 10 JS 渲染 / 10 视频，不足即失败
+2. 新增 `python-checks`（Python 3.10–3.13）、`shell-and-yaml`、`docker-build`、`docker-build-full`（含 Chromium 启动校验）四个 job
+3. `docker-build-full` 的镜像内实时验证由 `continue-on-error` 改为硬门槛
+
+### Docs
+
+1. README 增加 Docker 部署、新闻 API（端点、参数、鉴权、错误信封、安全提示）与实时新闻抓取验证章节
+2. AGENTS 同步 API 契约、数据库迁移、作业队列、CI 拓扑与实时新闻池维护方法
+3. 新增 `live_news_pool.json` 页面池（100 静态 / 50 JS 渲染 / 50 视频）与抽样补抽机制说明
+
 ## 1.0.2 (2026-09-30)
 
 ### Bug fix
