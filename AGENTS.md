@@ -23,7 +23,7 @@ GNE 本身只负责“从 HTML 中抽取新闻信息”，不负责发起 HTTP �
 
 | 项目 | 内容 |
 | --- | --- |
-| 当前正式版本 | `v1.1.0` |
+| 当前正式版本 | `v1.1.1` |
 | 开源协议 | MIT（继承自上游 GeneralNewsExtractor） |
 | 主仓库 | https://github.com/Logic769/news-crawler |
 | 上游仓库 | https://github.com/kingname/GeneralNewsExtractor |
@@ -136,9 +136,9 @@ parse_list_items()              # XPath 解析标题/链接/日期
 run_source()                    # 站点级调度、时间过滤、并发
         │
         ▼
-process_entry()                 # 单篇文章处理
+process_entry()                 # 单篇文章处理（详情请求同样遵守站点 delay）
         │
-        ├── fetch_article_html()        # 直接抓取，失败回退浏览器
+        ├── fetch_article_html()        # 直接抓取；仅 401/403/406/429 才回退浏览器
         ├── extract_article()           # GNE 抽取，正文为占位时回退浏览器
         └── save_article()              # 写入 SQLite（upsert）
 ```
@@ -147,8 +147,10 @@ process_entry()                 # 单篇文章处理
 
 | 函数 | 位置 | 职责 |
 | --- | --- | --- |
-| `fetch_html` | `url_extract.py` | 标准库 HTTP 抓取、编码探测、SSL 兼容 |
-| `fetch_html_with_browser` | `url_extract.py` | Playwright 无头 Chrome 渲染，返回渲染后 HTML |
+| `fetch_html` | `url_extract.py` | 标准库 HTTP 抓取、gzip 解压、编码探测、SSL 兼容（上下文复用） |
+| `fetch_html_with_browser` | `url_extract.py` | Playwright 无头 Chrome 渲染；浏览器按线程复用，`close_thread_browser()` 释放 |
+| `normalize_images` | `url_extract.py` | 把 `//cdn/x.jpg` 这类相对图片地址补全为绝对 URL |
+| `should_skip_stored` | `news_crawler.py` | 已入库条目是否可跳过（`old` 在窗口放宽后允许重抓） |
 | `content_needs_render` | `url_extract.py` | 判断正文是否为空或只是“正在加载”占位 |
 | `extract_article` | `url_extract.py` | 单 URL 完整流程：抓取 → GNE → 必要时渲染 |
 | `parse_datetime` | `news_crawler.py` | 解析中文/数字/相对日期，返回带时区 datetime |
@@ -262,7 +264,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | `date_format` | 否 | 指定 `strptime` 格式 |
 | `timezone` | 否 | 默认 `Asia/Shanghai` |
 | `render` | 否 | 列表页是否强制 Chrome 渲染 |
-| `delay` | 否 | 请求间隔秒数，默认 0.5 |
+| `delay` | 否 | 请求间隔秒数，默认 0.5；列表页与文章详情页请求前都会等待 |
 
 ### XPath 编写约定
 
@@ -323,16 +325,16 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 );
 ```
 
-索引：`source`、`status`、`publish_time`、`article_id`（唯一）；`crawl_jobs` 的 `status`、`created_at`、`(type, payload, status)` 去重索引。
+索引：`source`、`status`、`publish_time`、`article_id`（唯一），以及两条查询性能覆盖索引：`(status, publish_time DESC, source, url)` 供列表分页、`(source, publish_time DESC, updated_at DESC, timezone, status)` 供 `/v1/sources` 聚合；`crawl_jobs` 的 `status`、`created_at`、`(type, payload, status)` 去重索引。
 
-旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 2`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id` 与 `timezone`，按 2000 行分批回填 `article_id` 并建唯一索引与去重索引，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
+旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 3`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id` 与 `timezone`，按 2000 行分批回填 `article_id` 并建唯一索引与去重索引；v3 额外补建两条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这两条，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外），迁移早退条件同时校验这两条索引是否齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
 
 ### 7.2 status 语义
 
 | status | 含义 | 是否会被后续运行跳过 |
 | --- | --- | --- |
 | `ok` | 抓取成功，且在时间范围内 | 是 |
-| `old` | 已确认超出时间范围 | 是 |
+| `old` | 已确认超出时间范围 | 是；但放宽 `--days`/`--since` 让窗口前移后会重新抓取 |
 | `no_content` | 正文抽取失败 | 否，会重试 |
 | `unknown_date` | 无法解析日期 | 否，会重试 |
 | `error` | 抓取或处理异常 | 否，会重试 |
@@ -387,7 +389,7 @@ docker compose run --rm crawler run --config sources.local.json --days 3
 | `--days` | 抓取最近 N 天，默认取配置文件中的 `days` |
 | `--since` | 起始日期 `YYYY-MM-DD` |
 | `--workers` | 站点级并发数 |
-| `--limit-per-source` | 每个站点最多处理条数，调试用 |
+| `--limit-per-source` | 每个站点最多处理多少条（只计实际处理的条目；已入库被跳过的条目不占名额），调试用 |
 | `--force` | 忽略已抓记录，强制重抓 |
 
 ### 单 URL 抓取
@@ -442,8 +444,8 @@ curl http://localhost:8000/v1/health
 - `tests/`：约 62 个上游新闻页面 HTML 样本，覆盖 30 个站点目录；
 - `test_list_page/`：列表页样本；
 - `visiable_test/`：可见性测试样本；
-- `smoke_test.py`：部署自检，验证导入、日期解析、GNE 抽取、SQLite 初始化；
-- `api_smoke.py`：启动临时 uvicorn + 临时 SQLite，验证鉴权、查询、详情、统计与异步作业全链路；
+- `smoke_test.py`：部署自检，验证导入、日期解析、GNE 抽取、SQLite 初始化、视频页判定、图片地址补全、浏览器回退状态码白名单、性能索引是否建齐、`old` 在窗口放宽后是否重抓；
+- `api_smoke.py`：启动临时 uvicorn + 临时 SQLite，验证鉴权、查询、详情、统计、异步作业全链路，以及入库图片必须为绝对 URL；
 - `verify_live_news.py` + `live_news_pool.json`：从 100 静态 / 50 JS 渲染 / 50 视频的页面池中随机抽取（默认 10/10/10）访问公开新闻站点，验证三条抽取路径；
 - `example.py`：遍历 `tests/**/*.html`，打印抽取结果（人工观察用）。
 
@@ -547,7 +549,12 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 
 ### 12.4 共享接口约定
 
-- `fetch_html(url, *, url_validator: Callable[[str], None] | None = None) -> str`：失败时抛出异常；传入 `url_validator` 后每次 HTTP 重定向都会先用新 URL 调用它，抛异常即中断重定向；
+- `fetch_html(url, *, url_validator: Callable[[str], None] | None = None) -> str`：失败时抛出异常；请求带 `Accept-Encoding: gzip` 并解压，遇到 br 等无法解码的编码抛 `UnsupportedContentEncoding`；传入 `url_validator` 后每次 HTTP 重定向都会先用新 URL 调用它，抛异常即中断重定向；
+- `normalize_images(images, base_url) -> list[str]`：把 `//cdn/x.jpg` 等相对图片地址补全为绝对 URL，去重去空，并只保留 `http/https`（过滤 `data:`/`javascript:`/`ftp:`）；`/v1` 读取侧同样调用，历史行也会被归一化；
+- `MAX_DECODED_BYTES = 32 * 1024 * 1024`：解压后响应体上限，超限抛 `UnsupportedContentEncoding`，用于抵御压缩炸弹；
+- `close_thread_browser() -> None`：释放当前线程复用的 Playwright 浏览器；`run_source` / `cmd_test` / `extract_article` 的 CLI 入口都会调用；
+- `BROWSER_FALLBACK_HTTP_CODES = frozenset({401, 403, 406, 429})`：只有这些状态才回退浏览器，404/410/500 渲染后仍是同样错误；
+- `should_skip_stored(conn, source, url, cutoff, timezone_name) -> bool`：已入库条目是否可跳过，`old` 在窗口放宽后返回 False（重抓）；
 - `fetch_html_with_browser(url) -> str | None`：失败返回 `None`；
 - `content_needs_render(content: str) -> bool`：True 表示需要浏览器渲染（空、短于 100 字、或含加载占位词）；
 - `content_is_too_short(content: str) -> bool`：True 表示正文短于 `MIN_CONTENT_LENGTH`（100 字）；

@@ -21,6 +21,7 @@ import re
 import sqlite3
 import sys
 import time
+import urllib.error
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
@@ -30,20 +31,23 @@ import lxml.html
 from gne import GeneralNewsExtractor, NoContentException
 
 from url_extract import (
+    BROWSER_FALLBACK_HTTP_CODES,
     MIN_CONTENT_LENGTH,
+    close_thread_browser,
     content_is_too_short,
     content_needs_render,
     extract_video_meta,
     fetch_html,
     fetch_html_with_browser,
     is_video_page,
+    normalize_images,
 )
 
 LOG = logging.getLogger("news_crawler")
 
 DEFAULT_SOURCES_FILE = "sources.json"
 DEFAULT_DB_FILE = "news.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS articles (
@@ -71,6 +75,10 @@ CREATE INDEX IF NOT EXISTS idx_articles_status
 CREATE INDEX IF NOT EXISTS idx_articles_publish_time
     ON articles(publish_time);
 
+-- 两条查询性能覆盖索引由 _PERFORMANCE_INDEX_SQL 建（见 init_db 的迁移事务），
+-- 不写在这里：executescript 会隐式提交，放进 SCHEMA_SQL 会让建索引落在
+-- BEGIN IMMEDIATE 之外，多进程并发首启老库时可能撞上 database is locked。
+
 CREATE TABLE IF NOT EXISTS crawl_jobs (
     id          TEXT PRIMARY KEY,
     type        TEXT NOT NULL,
@@ -90,6 +98,21 @@ CREATE INDEX IF NOT EXISTS idx_crawl_jobs_created_at
 CREATE INDEX IF NOT EXISTS idx_crawl_jobs_dedupe
     ON crawl_jobs(type, payload, status);
 """
+
+
+# 查询性能覆盖索引。放在迁移事务内执行，新建库（user_version=0）同样会走到，
+# 与老库升级路径一致，避免两条路径建出不同的索引集合。
+# - (status, publish_time DESC, source, url)：列表分页。没有它时 SQLite 要取出
+#   全部 status='ok' 的行再 TEMP B-TREE 排序（10 万行实测 220ms），有它之后
+#   索引本身即最终顺序，实测 0.1ms。
+# - (source, publish_time DESC, updated_at DESC, timezone, status)：/v1/sources
+#   的分组与相关子查询，10 万行实测 3.8s → 56ms。
+_PERFORMANCE_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_articles_status_published "
+    "ON articles(status, publish_time DESC, source, url)",
+    "CREATE INDEX IF NOT EXISTS idx_articles_source_cover "
+    "ON articles(source, publish_time DESC, updated_at DESC, timezone, status)",
+)
 
 
 def now_iso() -> str:
@@ -234,9 +257,22 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     """Add columns/indexes introduced after the first schema version."""
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     columns = {row[1] for row in conn.execute("PRAGMA table_info(articles)")}
-    # 只有“版本号到位且列确实齐全”才跳过迁移：手工改库、降级或中途异常都可能
-    # 让 user_version 已置位而列缺失，此时早退会让后续 INSERT/SELECT 直接报错。
-    if version >= SCHEMA_VERSION and {"article_id", "timezone"} <= columns:
+    indexes = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='articles'"
+        )
+    }
+    # 只有“版本号到位、列齐全、性能索引齐全”才跳过迁移：手工改库、降级、
+    # 中途异常都可能让 user_version 已置位而结构缺失，此时早退会让后续
+    # INSERT/SELECT 报错或让查询退化成全表排序。
+    required_indexes = {sql.split("INDEX IF NOT EXISTS ")[1].split(" ")[0]
+                        for sql in _PERFORMANCE_INDEX_SQL}
+    if (
+        version >= SCHEMA_VERSION
+        and {"article_id", "timezone"} <= columns
+        and required_indexes <= indexes
+    ):
         return
     if "article_id" not in columns:
         conn.execute("ALTER TABLE articles ADD COLUMN article_id TEXT")
@@ -265,6 +301,9 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_crawl_jobs_dedupe "
         "ON crawl_jobs(type, payload, status)"
     )
+    # 查询性能索引（v3 引入）：老库升级时补建；新建库 user_version=0 同样走这里。
+    for statement in _PERFORMANCE_INDEX_SQL:
+        conn.execute(statement)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -423,6 +462,13 @@ def fetch_list_html(url: str, render: bool) -> str | None:
         return fetch_html_with_browser(url)
     try:
         return fetch_html(url)
+    except urllib.error.HTTPError as exc:
+        # 与文章页同一套规则：404/410/500 渲染后仍是同样错误，不值得再启浏览器。
+        if exc.code not in BROWSER_FALLBACK_HTTP_CODES:
+            LOG.warning("直接抓取列表失败 %s (HTTP %s)，不回退浏览器。", url, exc.code)
+            return None
+        LOG.warning("直接抓取列表被拒绝 %s (HTTP %s)，尝试浏览器。", url, exc.code)
+        return fetch_html_with_browser(url)
     except Exception as exc:
         LOG.warning("直接抓取列表失败 %s (%s)，尝试浏览器。", url, exc)
         return fetch_html_with_browser(url)
@@ -449,6 +495,14 @@ def collect_list_entries(source: dict) -> list[dict]:
 def fetch_article_html(url: str) -> str | None:
     try:
         return fetch_html(url)
+    except urllib.error.HTTPError as exc:
+        # 404/410/500 之类渲染后仍然是同样的错误，回退只会白等一次浏览器
+        # 启动（实测单条 1.84s）；只有“被拒绝”的错误才值得换浏览器再试。
+        if exc.code not in BROWSER_FALLBACK_HTTP_CODES:
+            LOG.warning("直接抓取文章失败 %s (HTTP %s)，不回退浏览器。", url, exc.code)
+            return None
+        LOG.warning("直接抓取文章被拒绝 %s (HTTP %s)，尝试浏览器。", url, exc.code)
+        return fetch_html_with_browser(url)
     except Exception as exc:
         LOG.warning("直接抓取文章失败 %s (%s)，尝试浏览器。", url, exc)
         return fetch_html_with_browser(url)
@@ -553,23 +607,56 @@ def save_article(
     return article_id
 
 
+def should_skip_stored(
+    conn: sqlite3.Connection,
+    source: str,
+    url: str,
+    cutoff: dt.datetime,
+    timezone_name: str,
+) -> bool:
+    """已入库的条目是否可以跳过。
+
+    ok 是“已成功抓到且在当前窗口内”，永远跳过。
+    old 是“当时确认早于窗口”；判过期时同时写了当时的发布时间，因此只要它
+    仍早于当前窗口，结论不变。放宽 --days/--since 让窗口前移后重新抓取，
+    避免历史数据只能靠 --force 全量重抓。
+
+    时区优先用行内记录的那一个：站点 timezone 配置被修正后，旧行的墙钟是
+    按旧时区写入的，用当前配置重解析会把边界条目判错。
+
+    publish_time 为空或格式无法解析（例如旧版写入的中文日期）时返回 False，
+    也就是重抓一次：宁可多抓一次，也不要让一批条目永远停留在无法判定的状态。
+    """
+    row = conn.execute(
+        "SELECT status, publish_time, timezone FROM articles "
+        "WHERE source = ? AND url = ?",
+        (source, url),
+    ).fetchone()
+    if row is None:
+        return False
+    if row[0] == "ok":
+        return True
+    if row[0] != "old":
+        return False
+    stored_tz = (row[2] or "").strip() or timezone_name
+    stored_date = parse_datetime(row[1] or "", None, stored_tz)
+    return stored_date is not None and stored_date < cutoff
+
+
 def process_entry(
     conn: sqlite3.Connection,
     source: dict,
     entry: dict,
     cutoff: dt.datetime,
     force: bool,
+    delay: float = 0.0,
 ) -> str:
     url = entry["url"]
     source_name = source["name"]
+    tz_name = source.get("timezone", "Asia/Shanghai")
 
-    if not force:
-        row = conn.execute(
-            "SELECT status FROM articles WHERE source = ? AND url = ?",
-            (source_name, url),
-        ).fetchone()
-        if row and row[0] in ("ok", "old"):
-            return "skip"
+    if not force and should_skip_stored(conn, source_name, url, cutoff, tz_name):
+        return "skip"
 
     list_date = entry.get("parsed")
     if list_date and list_date < cutoff:
@@ -579,11 +666,15 @@ def process_entry(
             url,
             list_title=entry.get("title", ""),
             publish_time=list_date.strftime("%Y-%m-%d %H:%M:%S"),
-            timezone=source.get("timezone", "Asia/Shanghai"),
+            timezone=tz_name,
             status="old",
         )
         return "old"
 
+    # 详情页请求同样遵守站点 delay，否则单站点内会连续无间隔请求，
+    # 实测 3 篇文章之间的间隔只有 0.13s（配置 0.5s 未生效）。
+    if delay > 0:
+        time.sleep(delay)
     html = fetch_article_html(url)
     if not html:
         save_article(
@@ -612,7 +703,7 @@ def process_entry(
     publish_dt = parse_datetime(
         publish_text,
         None,
-        source.get("timezone", "Asia/Shanghai"),
+        tz_name,
     )
     if publish_dt is None:
         publish_dt = list_date
@@ -627,7 +718,7 @@ def process_entry(
             list_title=entry.get("title", ""),
             title=clean_text(result.get("title")),
             publish_time=publish_text,
-            timezone=source.get("timezone", "Asia/Shanghai"),
+            timezone=tz_name,
             author=clean_text(result.get("author")),
             status="old",
         )
@@ -641,7 +732,7 @@ def process_entry(
             list_title=entry.get("title", ""),
             title=clean_text(result.get("title")),
             content=clean_text(result.get("content")),
-            images=result.get("images") or [],
+            images=normalize_images(result.get("images"), url),
             status="unknown_date",
             error="无法解析发布日期",
         )
@@ -654,10 +745,10 @@ def process_entry(
         list_title=entry.get("title", ""),
         title=clean_text(result.get("title")),
         publish_time=publish_text,
-        timezone=source.get("timezone", "Asia/Shanghai"),
+        timezone=tz_name,
         author=clean_text(result.get("author")),
         content=clean_text(result.get("content")),
-        images=result.get("images") or [],
+        images=normalize_images(result.get("images"), url),
         status="ok",
     )
     return "ok"
@@ -692,12 +783,17 @@ def run_source(
         else:
             now = dt.datetime.now(get_timezone(source.get("timezone")))
             entries.sort(key=lambda item: item.get("parsed") or now, reverse=True)
+            # limit_per_source 只统计“实际处理”的条目；已入库被跳过的条目
+            # 不占用名额，否则增量运行会一直卡在同一批 skip 上无法前进。
             processed = 0
+            delay = float(source.get("delay", 0))
             for entry in entries:
                 if limit_per_source and processed >= limit_per_source:
                     break
                 try:
-                    status = process_entry(conn, source, entry, cutoff, force)
+                    status = process_entry(
+                        conn, source, entry, cutoff, force, delay
+                    )
                 except Exception as exc:
                     LOG.exception(
                         "[%s] 文章处理失败 %s: %s",
@@ -718,7 +814,8 @@ def run_source(
                         LOG.exception("[%s] 保存错误记录失败", source_name)
                     status = "error"
                 counts[status] = counts.get(status, 0) + 1
-                processed += 1
+                if status != "skip":
+                    processed += 1
             LOG.info(
                 "[%s] 完成：新增/更新 %d，跳过 %d，过期 %d，无正文 %d，"
                 "未知日期 %d，错误 %d",
@@ -735,6 +832,8 @@ def run_source(
         LOG.exception("[%s] 站点处理失败：%s", source_name, exc)
     finally:
         conn.close()
+        # 站点处理结束就释放该线程的浏览器，避免 worker 池长期占着 Chromium。
+        close_thread_browser()
     return source_name, counts
 
 
@@ -813,24 +912,28 @@ def cmd_test(args: argparse.Namespace) -> None:
             print(" -", source.get("name"))
         return
 
-    for raw_source in sources:
-        source = {**config, **raw_source}
-        print(f"\n===== {source['name']} =====")
-        try:
-            entries = collect_list_entries(source)
-            for entry in entries[: args.limit]:
-                parsed = entry.get("parsed")
-                date_show = (
-                    parsed.strftime("%Y-%m-%d %H:%M")
-                    if parsed
-                    else (entry.get("date_text") or "日期未知")
-                )
-                title = entry["title"]
-                url = entry["url"]
-                print(f"{date_show:<20} {title[:50]:<52} {url}")
-            print(f"共解析到 {len(entries)} 条")
-        except Exception as exc:
-            LOG.exception("测试站点失败：%s", exc)
+    try:
+        for raw_source in sources:
+            source = {**config, **raw_source}
+            print(f"\n===== {source['name']} =====")
+            try:
+                entries = collect_list_entries(source)
+                for entry in entries[: args.limit]:
+                    parsed = entry.get("parsed")
+                    date_show = (
+                        parsed.strftime("%Y-%m-%d %H:%M")
+                        if parsed
+                        else (entry.get("date_text") or "日期未知")
+                    )
+                    title = entry["title"]
+                    url = entry["url"]
+                    print(f"{date_show:<20} {title[:50]:<52} {url}")
+                print(f"共解析到 {len(entries)} 条")
+            except Exception as exc:
+                LOG.exception("测试站点失败：%s", exc)
+    finally:
+        # 列表页可能需要浏览器渲染，这里同样要回收主线程的 Chromium。
+        close_thread_browser()
 
 
 def build_parser() -> argparse.ArgumentParser:

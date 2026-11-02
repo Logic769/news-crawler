@@ -1,5 +1,36 @@
 # General News Extractor Changelog
 
+## 1.1.1 (2026-11-02)
+
+### Bug fix
+
+1. `delay` 现在同时作用于文章详情请求：此前只在列表页之间等待，单站点连续抓文章时实测间隔仅 0.13s（配置 0.5s 未生效），批量抓取容易触发反爬
+2. `old` 状态不再永久跳过：改为按入库时记录的发布时间复核，只要它仍早于当前窗口才跳过；放宽 `--days`/`--since` 后会自动重抓，历史数据不必再靠 `--force` 全量重抓
+3. `--limit-per-source` 只统计实际处理的条目，已入库被跳过的条目不占名额；此前第二次运行会被同一批 skip 卡死无法前进
+4. 入库 `images` 补全为绝对 URL：GNE 抽出的 `//cdn.example.com/x.jpg` 这类协议相对地址会按文章 URL 解析，下游可直接使用
+5. 只有 401/403/406/429 才回退浏览器：404/410/500 等错误渲染后仍是同样错误，此前每条失效链接都要白等一次浏览器启动（实测单条 1.84s）
+6. `fetch_html` 支持 gzip 响应：请求带 `Accept-Encoding: gzip` 并按 `Content-Encoding` 逆序解压（支持叠加编码与裸 deflate 流），实测三个真实页面的传输量分别降到 25%/66%/33%；无法解码的编码抛 `UnsupportedContentEncoding`，不再静默把压缩字节当 HTML 解码成乱码正文
+7. `fetch_html` 复用模块级 `SSLContext`：此前每个请求都新建上下文（实测 19.8ms/次），证书异常站点仍按需惰性创建不校验上下文
+8. `/v1` 读取侧同样归一化 `images`：v1.1.1 之前入库的历史行可能仍是协议相对地址，接口输出统一为绝对 URL
+9. `normalize_images` 只保留 `http/https`：`data:`、`javascript:`、`ftp:` 等 scheme 会从图片列表中过滤掉
+10. `_decompress` 增加解压输出上限 `MAX_DECODED_BYTES`（32MB），压缩炸弹会被拒绝而不是先吃满内存
+
+### Performance
+
+1. 新增两条查询覆盖索引（`SCHEMA_VERSION` 升到 3，老库启动时自动补建）：`(status, publish_time DESC, source, url)` 让 `GET /v1/articles` 从 10 万行的 220ms 降到 0.1ms；`(source, publish_time DESC, updated_at DESC, timezone, status)` 让 `GET /v1/sources` 从 3.8s 降到 56ms
+2. Playwright 浏览器按线程复用，单页渲染从 4.9s 降到约 1.2s（3 页均摊）；每页使用独立 `BrowserContext` 隔离 cookie，`run_source` / `cmd_test` / CLI 入口结束时调用 `close_thread_browser()` 释放；浏览器崩溃时先回收旧 driver 再重启，launch 失败也不会留下孤儿进程
+3. 渲染等待不再固定 `wait_for_timeout(2500)`，改为等 `networkidle` 且最多再等 1.5s：文档已就绪时立即返回，实测单页从 3.06s 降到 0.56s；单页导航失败不再销毁整只可复用的浏览器
+
+### Test
+
+1. `smoke_test.py` 增加图片地址补全、浏览器回退状态码白名单、两条性能索引是否建齐、`old` 在窗口放宽后是否重抓、gzip/deflate/叠加编码/未知编码/截断流、以及 v2→v3 老库升级补建索引的回归断言
+2. `api_smoke.py` 增加“入库图片必须是绝对 URL”的断言（针对 extract 作业真正产出的那一行，并另有一条 `//cdn` 种子行覆盖读取侧归一化）
+
+### Docs
+
+1. `AGENTS.md` 同步 delay 语义、`--limit-per-source` 只计实际处理、`old` 重抓规则、覆盖索引与 `SCHEMA_VERSION = 3` 迁移说明、新增共享接口 `normalize_images` / `should_skip_stored` / `close_thread_browser` / `BROWSER_FALLBACK_HTTP_CODES`
+2. `README.md` 补充 `--limit-per-source` 的计数语义
+
 ## 1.1.0 (2026-10-31)
 
 ### New Feature

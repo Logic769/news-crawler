@@ -405,7 +405,7 @@ docker compose run --rm crawler run --config sources.local.json --days 3
 | `--days 3` | 抓取最近 3 天 |
 | `--since 2026-09-01` | 从指定日期开始抓取 |
 | `--workers 5` | 同时处理 5 个站点 |
-| `--limit-per-source 20` | 每个站点最多处理 20 条 |
+| `--limit-per-source 20` | 每个站点最多处理 20 条（只计实际处理的条目，已入库被跳过的不占名额） |
 | `--force` | 忽略数据库已有记录，强制重新抓取 |
 
 ---
