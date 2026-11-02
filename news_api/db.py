@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import quote
 
 from news_crawler import article_id_for, load_config, resolve_config_path
+from url_extract import normalize_images
 from news_api.timeutil import (
     iso_or_none,
     local_iso,
@@ -115,7 +116,9 @@ def row_to_article(
         "timezone": tz_name,
         "content": content if include_content else None,
         "content_length": content_length,
-        "images": _images(row["images"]),
+        # 历史行可能存着 //cdn/x.jpg 这类协议相对地址（v1.1.1 之前写入的），
+        # 读取时按文章 URL 归一化，保证 /v1 对外始终是可直接使用的绝对地址。
+        "images": normalize_images(_images(row["images"]), url),
         "status": row["status"],
         "error": row["error"] or None,
         "fetched_at": local_iso(row["first_seen_at"]),

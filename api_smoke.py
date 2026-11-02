@@ -146,7 +146,7 @@ def main() -> None:
             publish_time="2026-10-30 10:00:00",
             author="测试作者",
             content="这是接口冒烟测试正文。" * 20,
-            images=["https://example.com/1.jpg"],
+            images=["//cdn.example.com/1.jpg", "https://example.com/2.jpg"],
             status="ok",
         )
         conn.close()
@@ -276,6 +276,24 @@ def main() -> None:
             assert job["status"] == "succeeded", job
             assert job["result"]["status"] == "ok", job
             assert job["result"]["article_id"], job
+
+            # 图片地址入库前必须补全为绝对 URL：协议相对地址会让下游无法直接使用。
+            # 断言针对 extract 作业真正产出的那一行（seed 行也刻意带了一条 //cdn 地址）。
+            status, produced = _request(
+                base, "GET", f"/v1/articles/{job['result']['article_id']}"
+            )
+            assert status == 200, (status, produced)
+            assert produced["images"], produced
+            assert all(
+                url.startswith(("http://", "https://")) for url in produced["images"]
+            ), produced["images"]
+            status, seeded = _request(base, "GET", "/v1/articles?page_size=10")
+            assert status == 200, (status, seeded)
+            assert all(
+                url.startswith(("http://", "https://"))
+                for item in seeded["data"]
+                for url in item["images"]
+            ), seeded["data"]
 
             regression_conn = news_crawler.init_db(db_path)
             try:

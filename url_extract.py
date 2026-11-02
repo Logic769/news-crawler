@@ -1,14 +1,19 @@
 """Fetch a news article URL and extract title/content with GNE."""
 
+import gzip
 import json
 import os
 import re
 import ssl
 import sys
+import threading
 import urllib.error
 import urllib.request
+import zlib
 from collections.abc import Callable
 from html import unescape
+from typing import Any
+from urllib.parse import urljoin
 
 from gne import GeneralNewsExtractor, NoContentException
 
@@ -17,11 +22,53 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/126.0 Safari/537.36"
-    )
+    ),
+    # 新闻页普遍开启压缩，实测传输量降到 25%~66%；解压后才是原始 HTML。
+    "Accept-Encoding": "gzip",
 }
 
 
 MIN_CONTENT_LENGTH = 100
+
+# 直接抓取被“拒绝”时浏览器才有意义（反爬/风控通常会放过真实浏览器）；
+# 404/410/500 这类错误渲染后仍然是同样的错误，回退只会白等一次浏览器启动。
+BROWSER_FALLBACK_HTTP_CODES = frozenset({401, 403, 406, 429})
+
+# SSLContext 创建一次约 20ms，模块级复用避免每个请求都重新加载 CA 证书。
+_SSL_CONTEXT = ssl.create_default_context()
+_UNVERIFIED_SSL_CONTEXT: ssl.SSLContext | None = None
+_SSL_CONTEXT_LOCK = threading.Lock()
+
+
+def _unverified_ssl_context() -> ssl.SSLContext:
+    """惰性创建“不校验证书”的上下文，只在证书链异常的站点上用到。"""
+    global _UNVERIFIED_SSL_CONTEXT
+    with _SSL_CONTEXT_LOCK:
+        if _UNVERIFIED_SSL_CONTEXT is None:
+            _UNVERIFIED_SSL_CONTEXT = ssl._create_unverified_context()
+        return _UNVERIFIED_SSL_CONTEXT
+
+
+def absolute_url(base: str, value: str) -> str:
+    """把相对/协议相对地址补全为绝对 URL；无法解析时原样返回。"""
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if text.startswith(("http://", "https://")):
+        return text
+    return urljoin(base, text) if base else text
+
+
+def normalize_images(images, base_url: str) -> list[str]:
+    """把抽取结果里的相对图片地址补全为绝对 URL，并去掉空值。"""
+    if not images:
+        return []
+    resolved: list[str] = []
+    for item in images:
+        url = absolute_url(base_url, str(item))
+        if url and url not in resolved:
+            resolved.append(url)
+    return resolved
 
 
 class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -206,48 +253,181 @@ def extract_video_meta(html_text: str, url: str) -> dict | None:
         "author": author,
         "publish_time": publish,
         "content": content,
-        "images": [image] if image else [],
+        "images": [absolute_url(url, image)] if image else [],
         "is_video": True,
     }
 
 
-def fetch_html_with_browser(url: str) -> str | None:
-    """Render a page with headless Chrome (Playwright) as a fallback."""
+# 浏览器渲染的单页开销里，启动约占 1s、固定等待曾占 2.5s。这里把浏览器进程
+# 在进程内复用，并把“死等 2.5 秒”改成「等 networkidle，最多再等 1.5 秒」，
+# 页面已就绪时立即返回。sync_playwright 不可跨线程共享，因此按线程隔离。
+_RENDER_LOCAL = threading.local()
+RENDER_SETTLE_TIMEOUT_MS = 1500
+RENDER_NAV_TIMEOUT_MS = 60000
+
+
+def _thread_browser() -> tuple[Any, Any]:
+    """Return this thread's (playwright, browser), launching on demand."""
+    state = getattr(_RENDER_LOCAL, "state", None)
+    if state is not None:
+        if _browser_alive():
+            return state
+        # 浏览器已断开：先清掉旧 state，否则重启后会留下孤儿 playwright 进程。
+        close_thread_browser()
+    from playwright.sync_api import sync_playwright
+
+    launch_args = ["--disable-dev-shm-usage"]
     try:
-        from playwright.sync_api import sync_playwright
+        if os.geteuid() == 0:
+            launch_args.insert(0, "--no-sandbox")
+    except AttributeError:
+        pass
+    playwright = sync_playwright().start()
+    try:
+        try:
+            browser = playwright.chromium.launch(
+                channel="chrome", headless=True, args=launch_args
+            )
+        except Exception:
+            browser = playwright.chromium.launch(headless=True, args=launch_args)
+    except BaseException:
+        # 启动失败必须回收 driver，否则每失败一次就留下一个常驻 node 进程。
+        try:
+            playwright.stop()
+        except Exception:
+            pass
+        raise
+    _RENDER_LOCAL.state = (playwright, browser)
+    return _RENDER_LOCAL.state
+
+
+def _browser_alive() -> bool:
+    """本线程的浏览器是否仍然可用；任何异常都视为已断开。"""
+    state = getattr(_RENDER_LOCAL, "state", None)
+    if state is None:
+        return False
+    try:
+        return bool(state[1].is_connected())
+    except Exception:
+        return False
+
+
+def close_thread_browser() -> None:
+    """Release this thread's browser (called when a worker finishes)."""
+    state = getattr(_RENDER_LOCAL, "state", None)
+    if state is None:
+        return
+    _RENDER_LOCAL.state = None
+    playwright, browser = state
+    for closer in (browser.close, playwright.stop):
+        try:
+            closer()
+        except Exception:
+            pass
+
+
+def fetch_html_with_browser(url: str) -> str | None:
+    """Render a page with headless Chrome (Playwright) as a fallback.
+
+    每个页面使用独立的 BrowserContext：context 之间 cookie/localStorage 相互
+    隔离，避免同一线程连续抓多个站点时把 A 站的会话带到 B 站，进而触发反爬
+    或拿到个性化内容。浏览器进程本身仍按线程复用。
+    """
+    try:
+        import playwright  # noqa: F401
     except ImportError:
         print("未安装 Playwright，无法使用浏览器回退。可运行: pip install playwright")
         return None
 
+    page = None
+    context = None
     try:
-        with sync_playwright() as p:
-            browser = None
-            launch_args = ["--disable-dev-shm-usage"]
-            try:
-                if os.geteuid() == 0:
-                    launch_args.insert(0, "--no-sandbox")
-            except AttributeError:
-                pass
-            try:
-                browser = p.chromium.launch(channel="chrome", headless=True, args=launch_args)
-            except Exception:
-                browser = p.chromium.launch(headless=True, args=launch_args)
-            try:
-                page = browser.new_page(
-                    user_agent=HEADERS["User-Agent"],
-                    locale="zh-CN",
-                )
-                try:
-                    page.goto(url, wait_until="networkidle", timeout=60000)
-                except Exception:
-                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(2500)
-                return page.content()
-            finally:
-                browser.close()
+        _playwright, _browser = _thread_browser()
+        context = _browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            locale="zh-CN",
+        )
+        page = context.new_page()
+        try:
+            page.goto(url, wait_until="networkidle", timeout=RENDER_NAV_TIMEOUT_MS)
+        except Exception:
+            page.goto(url, wait_until="domcontentloaded", timeout=RENDER_NAV_TIMEOUT_MS)
+        # 只给“正文容器出现”留很短的时间窗：页面已就绪时立即返回，
+        # 未就绪时最多再等 RENDER_SETTLE_TIMEOUT_MS，避免每页固定空等。
+        try:
+            page.wait_for_load_state("networkidle", timeout=RENDER_SETTLE_TIMEOUT_MS)
+        except Exception:
+            pass
+        return page.content()
     except Exception as exc:
         print("浏览器回退失败:", exc)
+        # 只有浏览器真的断开（进程崩溃/被系统杀掉）才丢掉线程状态；
+        # 单页导航失败（超时、4xx、DNS 失败）不应销毁可复用的浏览器。
+        # is_connected() 在 driver 已崩时自身会抛错，因此必须单独保护，
+        # 否则异常会从 except 块逃出，把「回退失败」变成「抓取异常」。
+        if not _browser_alive():
+            close_thread_browser()
         return None
+    finally:
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+
+class UnsupportedContentEncoding(ValueError):
+    """Response body is compressed with something we cannot decode."""
+
+
+def _decompress(raw: bytes, encoding: str | None) -> bytes:
+    """Decode a compressed response body.
+
+    只请求了 gzip，正常情况下服务端也只会回 gzip。遇到 br 或多段编码时
+    必须显式失败：静默透传会把压缩字节当成 HTML 解码，得到一堆乱码正文，
+    最终被记成 no_content，线上几乎无法定位。
+    """
+    normalized = (encoding or "").strip().lower()
+    if not normalized or normalized == "identity":
+        return raw
+
+    # Content-Encoding 可以叠加（"gzip, gzip"），解码顺序与编码顺序相反。
+    codings = [part.strip() for part in normalized.split(",") if part.strip()]
+    for coding in reversed(codings):
+        if coding in ("gzip", "x-gzip"):
+            try:
+                raw = gzip.decompress(raw)
+            except (OSError, EOFError, zlib.error) as exc:
+                raise UnsupportedContentEncoding(
+                    f"gzip 解压失败（响应可能被截断）: {exc}"
+                ) from exc
+        elif coding == "deflate":
+            # RFC 只要求 zlib 包装，但部分服务端发的是裸 deflate 流（wbits=-15）。
+            for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+                try:
+                    raw = zlib.decompress(raw, wbits)
+                except zlib.error:
+                    continue
+                break
+            else:
+                try:
+                    raw = gzip.decompress(raw)
+                except (OSError, EOFError, zlib.error) as exc:
+                    raise UnsupportedContentEncoding(
+                        f"deflate 解压失败（响应可能被截断）: {exc}"
+                    ) from exc
+        elif coding == "identity":
+            continue
+        else:
+            raise UnsupportedContentEncoding(
+                f"不支持的内容编码 {coding}；请求只声明了 gzip"
+            )
+    return raw
 
 
 def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) -> str:
@@ -257,7 +437,7 @@ def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) 
     caller-side allow-list cannot be bypassed by a 3xx response.
     """
 
-    def _fetch(context: ssl.SSLContext) -> bytes:
+    def _fetch(context: ssl.SSLContext) -> tuple[bytes, str | None]:
         handlers: list[urllib.request.BaseHandler] = []
         if url_validator is not None:
             handlers.append(_ValidatingRedirectHandler(url_validator))
@@ -265,15 +445,16 @@ def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) 
         opener = urllib.request.build_opener(*handlers)
         req = urllib.request.Request(url, headers=HEADERS)
         with opener.open(req, timeout=25) as resp:
-            return resp.read(), resp.headers.get_content_charset()
+            raw = _decompress(resp.read(), resp.headers.get("Content-Encoding"))
+            return raw, resp.headers.get_content_charset()
 
     try:
-        raw, charset = _fetch(ssl.create_default_context())
+        raw, charset = _fetch(_SSL_CONTEXT)
     except urllib.error.URLError as exc:
         if not isinstance(exc.reason, ssl.SSLCertVerificationError):
             raise
         # Some government/news sites use non-standard certificate chains.
-        raw, charset = _fetch(ssl._create_unverified_context())
+        raw, charset = _fetch(_unverified_ssl_context())
 
     if not charset:
         head = raw[:4096].decode("ascii", "ignore")
@@ -301,7 +482,7 @@ def extract_article(
     try:
         html = fetch_html(url, url_validator=url_validator)
     except urllib.error.HTTPError as exc:
-        if exc.code not in (401, 403, 406, 429):
+        if exc.code not in BROWSER_FALLBACK_HTTP_CODES:
             print(f"抓取失败（HTTP {exc.code}）。")
             return None
         if not allow_browser:
@@ -348,6 +529,9 @@ def extract_article(
                 print("浏览器渲染后仍无法提取正文。可能是列表页，或不是新闻文章页。")
                 return None
             print(f"警告：渲染回退后正文仍不足 {MIN_CONTENT_LENGTH} 字，仍按原文返回。")
+    # 抽取出的图片可能是 //cdn.example.com/x.jpg 这类协议相对地址，
+    # 按文章 URL 补全，避免下游拿到无法直接使用的地址。
+    result["images"] = normalize_images(result.get("images"), url)
     return result
 
 
@@ -363,7 +547,11 @@ def main() -> None:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    result = extract_article(url, GeneralNewsExtractor())
+    try:
+        result = extract_article(url, GeneralNewsExtractor())
+    finally:
+        # 单 URL 命令行入口用完即退出，但显式回收更安全（被当作库调用时同理）。
+        close_thread_browser()
     if result is None:
         return
 

@@ -14,6 +14,7 @@ import news_crawler
 import url_extract
 from news_api.netguard import ensure_url_allowed
 from news_api.settings import Settings
+from url_extract import close_thread_browser, normalize_images
 
 LOG = logging.getLogger("news_api.tasks")
 
@@ -90,6 +91,10 @@ def execute_crawl(payload: dict[str, Any], settings: Settings) -> dict[str, Any]
                 totals[key] = totals.get(key, 0) + value
 
     results.sort(key=lambda item: item["name"])
+    # 浏览器在 run_source 的 worker 线程里按线程复用，并由 run_source 的
+    # finally 逐个释放；作业线程本身通常没有浏览器，这里的调用是兜底
+    # （例如作业线程曾直接渲染过页面），不做也不会有泄漏。
+    close_thread_browser()
     return {
         "config": config_path,
         "cutoff": cutoff.isoformat(),
@@ -142,7 +147,7 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             timezone=settings.timezone,
             author=news_crawler.clean_text(result.get("author")),
             content=news_crawler.clean_text(result.get("content")),
-            images=result.get("images") or [],
+            images=normalize_images(result.get("images"), url),
             status=status,
             error=error,
         )
@@ -159,3 +164,6 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
         }
     finally:
         conn.close()
+        # extract 默认禁用浏览器回退；开启后同样要在作业结束时释放，
+        # 否则长期运行的 API 进程会在线程局部一直挂着一个 Chromium。
+        close_thread_browser()
