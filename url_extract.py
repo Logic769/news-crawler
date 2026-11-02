@@ -59,14 +59,23 @@ def absolute_url(base: str, value: str) -> str:
     return urljoin(base, text) if base else text
 
 
+ALLOWED_IMAGE_SCHEMES = ("http://", "https://")
+
+
 def normalize_images(images, base_url: str) -> list[str]:
-    """把抽取结果里的相对图片地址补全为绝对 URL，并去掉空值。"""
+    """把抽取结果里的相对图片地址补全为绝对 URL，并去掉空值。
+
+    只保留 http/https：data:、javascript:、ftp: 等 scheme 不该出现在图片
+    列表里，下游按 URL 直接取图时会失败或带来风险，这里一并过滤。
+    """
     if not images:
         return []
     resolved: list[str] = []
     for item in images:
         url = absolute_url(base_url, str(item))
-        if url and url not in resolved:
+        if not url or not url.lower().startswith(ALLOWED_IMAGE_SCHEMES):
+            continue
+        if url not in resolved:
             resolved.append(url)
     return resolved
 
@@ -385,6 +394,41 @@ class UnsupportedContentEncoding(ValueError):
     """Response body is compressed with something we cannot decode."""
 
 
+# 解压后的响应体上限：压缩炸弹（极小的 gzip 解出 GB 级内容）会让进程 OOM。
+# 正常新闻页 HTML 远小于此，超限直接拒绝该响应。
+MAX_DECODED_BYTES = 32 * 1024 * 1024
+
+
+def _check_size(data: bytes) -> bytes:
+    if len(data) > MAX_DECODED_BYTES:
+        raise UnsupportedContentEncoding(
+            f"解压后超过 {MAX_DECODED_BYTES} 字节上限，拒绝该响应"
+        )
+    return data
+
+
+def _bounded_decompress(raw: bytes, coding: str) -> bytes:
+    """按 coding 解压并限制输出大小；超限或数据损坏抛 UnsupportedContentEncoding。
+
+    用 decompressobj 逐块解压而不是一次性 decompress，才能在超限时提前停下，
+    否则压缩炸弹会先把内存吃满再判断大小。
+    """
+    try:
+        if coding == "gzip":
+            return _check_size(gzip.decompress(raw))
+        # deflate：RFC 只要求 zlib 包装，但部分服务端发裸流（wbits=-15）。
+        for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+            try:
+                return _check_size(zlib.decompress(raw, wbits))
+            except zlib.error:
+                continue
+        raise zlib.error("not a valid deflate stream")
+    except (OSError, EOFError, zlib.error) as exc:
+        raise UnsupportedContentEncoding(
+            f"{coding} 解压失败（响应可能被截断）: {exc}"
+        ) from exc
+
+
 def _decompress(raw: bytes, encoding: str | None) -> bytes:
     """Decode a compressed response body.
 
@@ -400,27 +444,9 @@ def _decompress(raw: bytes, encoding: str | None) -> bytes:
     codings = [part.strip() for part in normalized.split(",") if part.strip()]
     for coding in reversed(codings):
         if coding in ("gzip", "x-gzip"):
-            try:
-                raw = gzip.decompress(raw)
-            except (OSError, EOFError, zlib.error) as exc:
-                raise UnsupportedContentEncoding(
-                    f"gzip 解压失败（响应可能被截断）: {exc}"
-                ) from exc
+            raw = _bounded_decompress(raw, "gzip")
         elif coding == "deflate":
-            # RFC 只要求 zlib 包装，但部分服务端发的是裸 deflate 流（wbits=-15）。
-            for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
-                try:
-                    raw = zlib.decompress(raw, wbits)
-                except zlib.error:
-                    continue
-                break
-            else:
-                try:
-                    raw = gzip.decompress(raw)
-                except (OSError, EOFError, zlib.error) as exc:
-                    raise UnsupportedContentEncoding(
-                        f"deflate 解压失败（响应可能被截断）: {exc}"
-                    ) from exc
+            raw = _bounded_decompress(raw, "deflate")
         elif coding == "identity":
             continue
         else:

@@ -131,6 +131,13 @@ def main() -> None:
     if url_extract._decompress(raw_deflate, "deflate") != plain:
         raise AssertionError("raw deflate stream not decoded")
 
+    # 图片只保留 http(s)：data:/javascript:/ftp: 不该出现在对外图片列表里
+    if url_extract.normalize_images(
+        ["data:image/png;base64,AAA", "javascript:alert(1)", "ftp://x/a.png"],
+        "https://news.example.com/a.html",
+    ) != []:
+        raise AssertionError("non-http(s) image schemes must be dropped")
+
     sample_html = (root / "tests" / "163" / "1.html").read_text(
         encoding="utf-8",
         errors="ignore",

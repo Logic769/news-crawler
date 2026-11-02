@@ -12,6 +12,8 @@
 6. `fetch_html` 支持 gzip 响应：请求带 `Accept-Encoding: gzip` 并按 `Content-Encoding` 逆序解压（支持叠加编码与裸 deflate 流），实测三个真实页面的传输量分别降到 25%/66%/33%；无法解码的编码抛 `UnsupportedContentEncoding`，不再静默把压缩字节当 HTML 解码成乱码正文
 7. `fetch_html` 复用模块级 `SSLContext`：此前每个请求都新建上下文（实测 19.8ms/次），证书异常站点仍按需惰性创建不校验上下文
 8. `/v1` 读取侧同样归一化 `images`：v1.1.1 之前入库的历史行可能仍是协议相对地址，接口输出统一为绝对 URL
+9. `normalize_images` 只保留 `http/https`：`data:`、`javascript:`、`ftp:` 等 scheme 会从图片列表中过滤掉
+10. `_decompress` 增加解压输出上限 `MAX_DECODED_BYTES`（32MB），压缩炸弹会被拒绝而不是先吃满内存
 
 ### Performance
 

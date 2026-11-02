@@ -550,7 +550,8 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 ### 12.4 共享接口约定
 
 - `fetch_html(url, *, url_validator: Callable[[str], None] | None = None) -> str`：失败时抛出异常；请求带 `Accept-Encoding: gzip` 并解压，遇到 br 等无法解码的编码抛 `UnsupportedContentEncoding`；传入 `url_validator` 后每次 HTTP 重定向都会先用新 URL 调用它，抛异常即中断重定向；
-- `normalize_images(images, base_url) -> list[str]`：把 `//cdn/x.jpg` 等相对图片地址补全为绝对 URL，并去重去空；`/v1` 读取侧同样调用，历史行也会被归一化；
+- `normalize_images(images, base_url) -> list[str]`：把 `//cdn/x.jpg` 等相对图片地址补全为绝对 URL，去重去空，并只保留 `http/https`（过滤 `data:`/`javascript:`/`ftp:`）；`/v1` 读取侧同样调用，历史行也会被归一化；
+- `MAX_DECODED_BYTES = 32 * 1024 * 1024`：解压后响应体上限，超限抛 `UnsupportedContentEncoding`，用于抵御压缩炸弹；
 - `close_thread_browser() -> None`：释放当前线程复用的 Playwright 浏览器；`run_source` / `cmd_test` / `extract_article` 的 CLI 入口都会调用；
 - `BROWSER_FALLBACK_HTTP_CODES = frozenset({401, 403, 406, 429})`：只有这些状态才回退浏览器，404/410/500 渲染后仍是同样错误；
 - `should_skip_stored(conn, source, url, cutoff, timezone_name) -> bool`：已入库条目是否可跳过，`old` 在窗口放宽后返回 False（重抓）；
