@@ -20,8 +20,8 @@ from news_api.app import create_app
 from news_api.jobs import JobManager
 from news_api.netguard import UnsafeUrlError, ensure_url_allowed
 from news_api.settings import Settings
+from smoke_fixture import load_sample_html
 
-FIXTURE = Path(__file__).resolve().parent / "tests" / "163" / "1.html"
 API_KEY = "smoke-secret"
 
 
@@ -102,7 +102,6 @@ def _wait_job(base: str, job_id: str, deadline: float) -> dict:
 
 
 def main() -> None:
-    assert FIXTURE.exists(), f"缺少测试样本: {FIXTURE}"
     try:
         ensure_url_allowed("http://127.0.0.1/")
     except UnsafeUrlError:
@@ -110,7 +109,9 @@ def main() -> None:
     else:
         raise AssertionError("私网 URL 未被拒绝")
     ensure_url_allowed("http://127.0.0.1/", allow_private=True)
-    _ArticleHandler.body = FIXTURE.read_bytes()
+    # 镜像内没有 tests/，与 smoke_test.py 一样回退到内置样本；
+    # 内置页故意带一张 // 开头的图片，用来验证图片地址补全。
+    _ArticleHandler.body = load_sample_html(Path(__file__).resolve().parent).encode("utf-8")
     fixture_server = ThreadingHTTPServer(("127.0.0.1", 0), _ArticleHandler)
     fixture_port = fixture_server.server_address[1]
     threading.Thread(target=fixture_server.serve_forever, daemon=True).start()
@@ -146,6 +147,7 @@ def main() -> None:
             publish_time="2026-10-30 10:00:00",
             author="测试作者",
             content="这是接口冒烟测试正文。" * 20,
+            raw_content=("这是接口冒烟测试正文。\n" * 20).strip(),
             images=["//cdn.example.com/1.jpg", "https://example.com/2.jpg"],
             status="ok",
         )
@@ -188,6 +190,9 @@ def main() -> None:
 
             status, detail = _request(base, "GET", f"/v1/articles/{article_id}")
             assert status == 200 and detail["content"], detail
+            # raw_content 保留段落换行，只在详情返回。seed 行的 content 是人工写入的
+            # 单行文本，"content 已被压成单行"由下面 extract 作业的真实产出断言。
+            assert "\n" in detail["raw_content"], detail
 
             status, with_content = _request(
                 base, "GET", "/v1/articles?page_size=10&include_content=true"
@@ -197,6 +202,8 @@ def main() -> None:
             full_item = with_content["data"][0]
             assert full_item["content"], full_item
             assert full_item["content_length"] == item["content_length"], full_item
+            # 列表即使 include_content=true 也不返回 raw_content（大字段只走详情）。
+            assert full_item["raw_content"] is None, full_item
 
             status, sources = _request(base, "GET", "/v1/sources")
             assert status == 200 and sources["data"][0]["source"] == "fixture", sources
@@ -284,6 +291,9 @@ def main() -> None:
             )
             assert status == 200, (status, produced)
             assert produced["images"], produced
+            assert "\n" in produced["raw_content"], produced
+            # 真实抽取产出的 content 必须已被 clean_text 压成单行，raw_content 才留换行。
+            assert "\n" not in produced["content"], produced
             assert all(
                 url.startswith(("http://", "https://")) for url in produced["images"]
             ), produced["images"]

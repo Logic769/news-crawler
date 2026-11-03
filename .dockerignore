@@ -16,6 +16,13 @@ build
 dist
 **/*.log
 
+# 测试样本与离线回归：不参与运行，进镜像只是白白变大。
+# 容器内 smoke 与 api_smoke.py 都通过 smoke_fixture.load_sample_html() 取样本：
+# 有 tests/163/1.html 就读它，没有则回退内置新闻页，所以排除 tests 不会让冒烟失效。
+# 离线回归（regression/）只在宿主机和 CI 的 python-checks 里跑，同样不进镜像。
+tests
+regression
+
 # 运行时/本地私有数据（绝不进镜像）
 news.db
 data

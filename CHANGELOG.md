@@ -1,5 +1,36 @@
 # General News Extractor Changelog
 
+## Unreleased
+
+### Security
+
+1. SSL 证书校验失败不再静默降级：此前 `fetch_html` 捕获 `SSLCertVerificationError` 后直接用不校验的 `SSLContext` 重试，且没有任何日志，等于对所有站点默认关闭证书校验。现在默认 `LOG.error` 并抛出原异常；只有显式设置 `NEWS_INSECURE_SSL=1`（接受 `true`/`yes`/`on`）才降级重试，并留下 WARNING
+
+### Bug fix
+
+1. 新增 `raw_content` 列（`SCHEMA_VERSION` 升到 4，老库启动时自动补列）：`content` 仍是 `clean_text()` 归一化后的单行文本，GNE 原始正文的段落换行保存在 `raw_content`，正文展示与导出不再丢段落。该字段只在 `GET /v1/articles/{id}` 详情返回（列表接口即使 `include_content=true` 也只给单行 `content`）。历史行只补列不自动回填（原文已不可得），需要换行正文时用 `--force` 重抓，或用新增的 `backfill_raw_content.py` 批量重抓回填（只写 `raw_content`，不改 `content`）
+2. `extract_article` 不再向 stdout 打印进度：15 处 `print` 改为标准库日志（`url_extract` logger），作为库被 API 调用时不再污染宿主进程输出；命令行入口保留 `print` 并配置了 `logging.basicConfig`
+3. `ArticleOut` 补上 `raw_content` 字段：此前 db 层已把换行正文塞进响应字典，但响应模型没有该字段，Pydantic 默认 `extra=ignore` 把它静默丢弃，导致详情接口拿不到换行正文
+4. 抓取的 `ok` 分支补写 `raw_content`：此前只有 `unknown_date` 分支传了该字段，绝大多数正常入库的文章 `raw_content` 恒为 NULL
+
+### CI
+
+1. PR 不再运行真实网络抓取：`live-news` job 只在 push `master`、夜间定时与手动触发时执行，避免站点反爬/改版把无关 PR 卡住
+2. 新增夜间定时（北京时间 02:00）真实抓取，失败自动开/更新 issue 留痕
+3. `python-checks` 矩阵补到 Python 3.14（与 classifier 一致），并新增 `ruff check .`、`mypy` 与 `regression` 离线回归
+4. 62 篇上游 HTML 样本的抽取基线随仓库提交（`regression/baseline.json`），PR 用离线回归替代真实网络验证
+5. 固定 `ruff==0.17.3` 与 `mypy==2.4.1`：规则集较宽，跟随上游最新版会让无关 PR 因新增规则变红；基线比对同时排除 `gne_version`，发版 bump 版本号不再要求重建基线
+
+### Refactor
+
+1. `pyproject.toml` 补齐 `[tool.ruff]` 与 `[tool.mypy]` 配置，规则集从 4 条扩到 `E,F,W,I,UP,B`，CI 与本地共用同一份配置
+2. `.dockerignore` 排除 `tests/` 与 `regression/`，镜像不再打包 62 个样本
+
+### Docs
+
+1. `pypi_desc.md` 澄清 PyPI 上的 `gne` 属于上游 GeneralNewsExtractor，本项目不向 PyPI 发布；`pyproject.toml` 同步标注 source-distribution only 与真实维护者
+2. `AGENTS.md` 同步 SSL 开关、`raw_content`、CI 分层与离线回归基线
+
 ## 1.1.2 (2026-11-03)
 
 ### Refactor

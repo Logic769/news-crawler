@@ -26,10 +26,8 @@ import sys
 import time
 from pathlib import Path
 
-from gne import GeneralNewsExtractor, NoContentException
-
 import url_extract
-
+from gne import GeneralNewsExtractor, NoContentException
 
 MIN_STATIC_CONTENT = 100
 MIN_RENDERED_CONTENT = 200
@@ -144,6 +142,7 @@ def check_static(url: str, extractor: GeneralNewsExtractor) -> dict:
     html = url_extract.fetch_html(url)
     result = _extract(html, extractor)
     content_len = _require_article(result, url, MIN_STATIC_CONTENT, "static")
+    assert result is not None  # _require_article 已保证
     return {
         "url": url,
         "title": result.get("title", "").strip(),
@@ -174,6 +173,7 @@ def check_dynamic(url: str, extractor: GeneralNewsExtractor) -> dict:
     content_len = _require_article(
         result, url, MIN_RENDERED_CONTENT, "browser-rendered"
     )
+    assert result is not None  # _require_article 已保证
     return {
         "url": url,
         "title": result.get("title", "").strip(),

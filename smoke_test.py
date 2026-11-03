@@ -7,19 +7,24 @@ extract from a bundled sample page, and SQLite can be initialized.
 from __future__ import annotations
 
 import sqlite3
-import sys
 import tempfile
 from pathlib import Path
 
+from smoke_fixture import SAMPLE_RELATIVE_PATH, load_sample_html
+
 
 def main() -> None:
-    if sys.version_info < (3, 10):
-        raise SystemExit("Python 3.10+ is required.")
-
     import playwright  # noqa: F401
-    from gne import GeneralNewsExtractor
-    from news_crawler import init_db, load_config, parse_datetime
+
     import url_extract  # noqa: F401
+    from gne import GeneralNewsExtractor
+    from news_crawler import (
+        SCHEMA_VERSION,
+        init_db,
+        load_config,
+        parse_datetime,
+        save_article,
+    )
 
     root = Path(__file__).resolve().parent
 
@@ -108,7 +113,7 @@ def main() -> None:
     import gzip as gz
     import zlib
 
-    plain = "<html><body>新闻正文</body></html>".encode("utf-8")
+    plain = "<html><body>新闻正文</body></html>".encode()
     if url_extract._decompress(gz.compress(plain), "gzip") != plain:
         raise AssertionError("gzip body not decompressed")
     if url_extract._decompress(plain, None) != plain:
@@ -138,10 +143,11 @@ def main() -> None:
     ) != []:
         raise AssertionError("non-http(s) image schemes must be dropped")
 
-    sample_html = (root / "tests" / "163" / "1.html").read_text(
-        encoding="utf-8",
-        errors="ignore",
-    )
+    # 镜像不带 tests/（62 个上游样本，见 .dockerignore），容器内冒烟用内置样本，
+    # 仍然走完整的 GNE 抽取路径，宿主机上则始终比对真实上游页面。
+    if not (root / SAMPLE_RELATIVE_PATH).is_file():
+        print("（未找到 tests/163/1.html，改用内置样本）")
+    sample_html = load_sample_html(root)
     result = GeneralNewsExtractor().extract(sample_html)
     if not result.get("title") or not result.get("content"):
         raise AssertionError("GNE failed to extract sample page")
@@ -176,6 +182,7 @@ def main() -> None:
 
             cutoff_wide = parse_datetime("2010-01-01", None, "Asia/Shanghai")
             cutoff_narrow = parse_datetime("2026-11-01", None, "Asia/Shanghai")
+            assert cutoff_wide is not None and cutoff_narrow is not None
             save_article(
                 conn,
                 "smoke",
@@ -194,12 +201,14 @@ def main() -> None:
         finally:
             conn.close()
 
-        # v2 → v3 老库升级：删掉两条性能索引并把版本退回 2，init_db 必须补建回来。
+        # v2 → 当前版本的老库升级：删掉 v3 的两条性能索引、退回 v4 增加的 raw_content 列，
+        # 再把版本退回 2，init_db 必须把三者都补回来。
         # 这是生产上最容易出问题的一条路径（新库直接建、老库靠迁移补建）。
         legacy = sqlite3.connect(db_path)
         try:
             legacy.execute("DROP INDEX IF EXISTS idx_articles_status_published")
             legacy.execute("DROP INDEX IF EXISTS idx_articles_source_cover")
+            legacy.execute("ALTER TABLE articles DROP COLUMN raw_content")
             legacy.execute("PRAGMA user_version = 2")
             legacy.commit()
         finally:
@@ -215,8 +224,54 @@ def main() -> None:
             }
             if not {"idx_articles_status_published", "idx_articles_source_cover"} <= upgraded:
                 raise AssertionError(f"v2 -> v3 upgrade missed indexes: {upgraded}")
-            if int(conn.execute("PRAGMA user_version").fetchone()[0]) != 3:
-                raise AssertionError("v2 -> v3 upgrade did not bump user_version")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(articles)")}
+            if "raw_content" not in columns:
+                raise AssertionError(f"v2 -> v4 upgrade missed raw_content: {columns}")
+            current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if current != SCHEMA_VERSION:
+                raise AssertionError(
+                    f"v2 -> v{SCHEMA_VERSION} upgrade did not bump user_version: {current}"
+                )
+        finally:
+            conn.close()
+
+        # ok 路径曾漏传 raw_content，导致换行正文只存在于 unknown_date 分支。
+        # 这里同时验证写入与「本次没传就不覆盖」的部分更新语义。
+        conn = init_db(db_path)
+        try:
+            smoke_url = "https://example.com/smoke/raw.html"
+            save_article(
+                conn,
+                "smoke",
+                smoke_url,
+                title="换行正文",
+                publish_time="2026-10-01 09:30:00",
+                timezone="Asia/Shanghai",
+                content="第一段 第二段",
+                raw_content="第一段\n第二段",
+                status="ok",
+            )
+            stored = conn.execute(
+                "SELECT content, raw_content FROM articles WHERE url = ?",
+                (smoke_url,),
+            ).fetchone()
+            if stored is None or stored[1] != "第一段\n第二段":
+                raise AssertionError(f"raw_content not stored: {stored}")
+            if stored[0] != "第一段 第二段":
+                raise AssertionError(f"content should stay single-line: {stored[0]!r}")
+            save_article(
+                conn,
+                "smoke",
+                smoke_url,
+                status="error",
+                error="模拟抓取失败",
+            )
+            kept = conn.execute(
+                "SELECT raw_content FROM articles WHERE url = ?",
+                (smoke_url,),
+            ).fetchone()
+            if kept is None or kept[0] != "第一段\n第二段":
+                raise AssertionError(f"raw_content lost on partial update: {kept}")
         finally:
             conn.close()
 

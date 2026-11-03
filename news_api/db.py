@@ -11,14 +11,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from news_crawler import article_id_for, load_config, resolve_config_path
-from url_extract import normalize_images
 from news_api.timeutil import (
     iso_or_none,
     local_iso,
     resolve_timezone,
     utc_iso_or_none,
 )
+from news_crawler import article_id_for, load_config, resolve_config_path
+from url_extract import normalize_images
 
 
 def connect(db_path: str, *, read_only: bool = True) -> sqlite3.Connection:
@@ -115,6 +115,10 @@ def row_to_article(
         "published_raw": row["publish_time"] or "",
         "timezone": tz_name,
         "content": content if include_content else None,
+        # 保留段落换行的原始正文；与 content 一样只在详情（include_content）中返回。
+        "raw_content": (row["raw_content"] or "")
+        if include_content and "raw_content" in keys
+        else None,
         "content_length": content_length,
         # 历史行可能存着 //cdn/x.jpg 这类协议相对地址（v1.1.1 之前写入的），
         # 读取时按文章 URL 归一化，保证 /v1 对外始终是可直接使用的绝对地址。
@@ -178,11 +182,20 @@ def query_articles(
             ).fetchone()["n"]
         )
         offset = (page - 1) * page_size
-        columns = "*" if include_content else (
-            "article_id, source, url, list_title, title, publish_time, timezone, "
-            "author, length(content) AS content_length, images, status, error, "
-            "first_seen_at, updated_at"
-        )
+        # 列表接口用显式列清单：include_content=true 时给 content，但始终不给
+        # raw_content（这列体积约为正文两倍，只经由详情接口返回）。
+        if include_content:
+            columns = (
+                "article_id, source, url, list_title, title, publish_time, timezone, "
+                "author, content, length(content) AS content_length, images, status, "
+                "error, first_seen_at, updated_at"
+            )
+        else:
+            columns = (
+                "article_id, source, url, list_title, title, publish_time, timezone, "
+                "author, length(content) AS content_length, images, status, error, "
+                "first_seen_at, updated_at"
+            )
         rows = conn.execute(
             f"SELECT {columns} FROM articles{where_sql} "
             f"ORDER BY {order_sql} LIMIT ? OFFSET ?",

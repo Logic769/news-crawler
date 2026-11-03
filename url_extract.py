@@ -2,6 +2,7 @@
 
 import gzip
 import json
+import logging
 import os
 import re
 import ssl
@@ -28,7 +29,16 @@ HEADERS = {
 }
 
 
+LOG = logging.getLogger("url_extract")
+
 MIN_CONTENT_LENGTH = 100
+
+# 证书校验失败时的降级开关。默认关闭：曾出现过“遇到证书链不规范就静默换成
+# 不校验上下文重试”，等于对这类站点主动放弃 MITM 防护且不留痕。需要抓取
+# 政府站等自签/链异常站点时，显式设置 NEWS_INSECURE_SSL=1，并接受日志里的
+# WARNING。
+INSECURE_SSL_ENV = "NEWS_INSECURE_SSL"
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
 # 直接抓取被“拒绝”时浏览器才有意义（反爬/风控通常会放过真实浏览器）；
 # 404/410/500 这类错误渲染后仍然是同样的错误，回退只会白等一次浏览器启动。
@@ -40,8 +50,13 @@ _UNVERIFIED_SSL_CONTEXT: ssl.SSLContext | None = None
 _SSL_CONTEXT_LOCK = threading.Lock()
 
 
+def _insecure_ssl_allowed() -> bool:
+    """是否允许证书校验失败后降级重试（默认不允许）。"""
+    return os.environ.get(INSECURE_SSL_ENV, "").strip().lower() in _TRUE_ENV_VALUES
+
+
 def _unverified_ssl_context() -> ssl.SSLContext:
-    """惰性创建“不校验证书”的上下文，只在证书链异常的站点上用到。"""
+    """惰性创建“不校验证书”的上下文，仅在 NEWS_INSECURE_SSL 显式开启时使用。"""
     global _UNVERIFIED_SSL_CONTEXT
     with _SSL_CONTEXT_LOCK:
         if _UNVERIFIED_SSL_CONTEXT is None:
@@ -92,12 +107,12 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def content_is_too_short(content: str) -> bool:
+def content_is_too_short(content: str | None) -> bool:
     """Return True when the body is shorter than the useful minimum."""
     return len((content or "").strip()) < MIN_CONTENT_LENGTH
 
 
-def content_needs_render(content: str) -> bool:
+def content_needs_render(content: str | None) -> bool:
     """Return True when body is empty, too short, or a JS-loading placeholder."""
     text = (content or "").strip()
     if not text:
@@ -214,7 +229,9 @@ def _json_ld_published(html_text: str) -> str:
 def _date_from_url(url: str) -> str:
     match = re.search(r"/(20\d{2})[-/]?(\d{1,2})[-/]?(\d{1,2})/", url or "")
     if match:
-        return "%s-%02d-%02d" % (match.group(1), int(match.group(2)), int(match.group(3)))
+        return (
+            f"{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+        )
     return ""
 
 
@@ -286,11 +303,11 @@ def _thread_browser() -> tuple[Any, Any]:
     from playwright.sync_api import sync_playwright
 
     launch_args = ["--disable-dev-shm-usage"]
-    try:
-        if os.geteuid() == 0:
-            launch_args.insert(0, "--no-sandbox")
-    except AttributeError:
-        pass
+    # os.geteuid 只在 POSIX 存在；容器里以 root 运行时 Chromium 必须加
+    # --no-sandbox，Windows/macOS 本地开发则不需要。
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and geteuid() == 0:
+        launch_args.insert(0, "--no-sandbox")
     playwright = sync_playwright().start()
     try:
         try:
@@ -345,7 +362,7 @@ def fetch_html_with_browser(url: str) -> str | None:
     try:
         import playwright  # noqa: F401
     except ImportError:
-        print("未安装 Playwright，无法使用浏览器回退。可运行: pip install playwright")
+        LOG.warning("未安装 Playwright，无法使用浏览器回退。可运行: pip install playwright")
         return None
 
     page = None
@@ -369,7 +386,7 @@ def fetch_html_with_browser(url: str) -> str | None:
             pass
         return page.content()
     except Exception as exc:
-        print("浏览器回退失败:", exc)
+        LOG.warning("浏览器回退失败：%s", exc)
         # 只有浏览器真的断开（进程崩溃/被系统杀掉）才丢掉线程状态；
         # 单页导航失败（超时、4xx、DNS 失败）不应销毁可复用的浏览器。
         # is_connected() 在 driver 已崩时自身会抛错，因此必须单独保护，
@@ -479,7 +496,24 @@ def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) 
     except urllib.error.URLError as exc:
         if not isinstance(exc.reason, ssl.SSLCertVerificationError):
             raise
-        # Some government/news sites use non-standard certificate chains.
+        # 部分政府/新闻站点使用不规范证书链。默认严格失败，只有显式设置
+        # NEWS_INSECURE_SSL=1 才降级为不校验重试；两条路径都必须留下日志，
+        # 不允许再出现“静默缴械”。
+        if not _insecure_ssl_allowed():
+            LOG.error(
+                "SSL 证书校验失败，按默认严格策略中止：%s（%s）。"
+                "确认该站点可信后可设置 %s=1 允许降级。",
+                url,
+                exc.reason,
+                INSECURE_SSL_ENV,
+            )
+            raise
+        LOG.warning(
+            "SSL 证书校验失败，已按 %s=1 降级为不校验重试（存在中间人风险）：%s（%s）",
+            INSECURE_SSL_ENV,
+            url,
+            exc.reason,
+        )
         raw, charset = _fetch(_unverified_ssl_context())
 
     if not charset:
@@ -504,29 +538,30 @@ def extract_article(
     allow_browser: bool = True,
     url_validator: Callable[[str], None] | None = None,
 ) -> dict | None:
-    print("正在抓取:", url)
+    LOG.info("正在抓取: %s", url)
     try:
         html = fetch_html(url, url_validator=url_validator)
     except urllib.error.HTTPError as exc:
         if exc.code not in BROWSER_FALLBACK_HTTP_CODES:
-            print(f"抓取失败（HTTP {exc.code}）。")
+            LOG.warning("抓取失败（HTTP %s）。", exc.code)
             return None
         if not allow_browser:
-            print(f"直接抓取被拒绝(HTTP {exc.code})，且浏览器回退已禁用。")
+            LOG.info("直接抓取被拒绝(HTTP %s)，且浏览器回退已禁用。", exc.code)
             return None
-        print(f"直接抓取被拒绝(HTTP {exc.code})，正在用本机 Chrome 无头模式渲染...")
-        html = fetch_html_with_browser(url)
-        if html is None:
-            print("浏览器回退失败。")
+        LOG.info("直接抓取被拒绝(HTTP %s)，正在用本机 Chrome 无头模式渲染...", exc.code)
+        rendered = fetch_html_with_browser(url)
+        if rendered is None:
+            LOG.warning("浏览器回退失败。")
             return None
+        html = rendered
     except (urllib.error.URLError, ValueError, TimeoutError, ConnectionError) as exc:
-        print(f"抓取失败（网络错误或网址无效）：{exc}")
+        LOG.warning("抓取失败（网络错误或网址无效）：%s", exc)
         return None
 
     if is_video_page(url, html):
         video = extract_video_meta(html, url)
         if video is not None:
-            print("识别为视频页，使用 meta 适配抽取。")
+            LOG.info("识别为视频页，使用 meta 适配抽取。")
             return video
 
     try:
@@ -536,25 +571,26 @@ def extract_article(
 
     if result is None or content_needs_render(result.get("content")):
         if not allow_browser:
-            print("直接抓取未提取到正文，且浏览器回退已禁用。")
+            LOG.info("直接抓取未提取到正文，且浏览器回退已禁用。")
             return None
-        print("直接抓取未提取到正文，正在用本机 Chrome 无头模式渲染...")
-        html = fetch_html_with_browser(url)
-        if html is None:
-            print("无法提取正文。可能是列表页，或不是新闻文章页。")
+        LOG.info("直接抓取未提取到正文，正在用本机 Chrome 无头模式渲染...")
+        rendered = fetch_html_with_browser(url)
+        if rendered is None:
+            LOG.info("无法提取正文。可能是列表页，或不是新闻文章页。")
             return None
+        html = rendered
         try:
             result = extractor.extract(html)
         except NoContentException:
             result = None
         if result is None:
-            print("浏览器渲染后仍无法提取正文。可能是列表页，或不是新闻文章页。")
+            LOG.info("浏览器渲染后仍无法提取正文。可能是列表页，或不是新闻文章页。")
             return None
         if content_needs_render(result.get("content")):
             if not content_is_too_short(result.get("content")):
-                print("浏览器渲染后仍无法提取正文。可能是列表页，或不是新闻文章页。")
+                LOG.info("浏览器渲染后仍无法提取正文。可能是列表页，或不是新闻文章页。")
                 return None
-            print(f"警告：渲染回退后正文仍不足 {MIN_CONTENT_LENGTH} 字，仍按原文返回。")
+            LOG.warning("渲染回退后正文仍不足 %d 字，仍按原文返回。", MIN_CONTENT_LENGTH)
     # 抽取出的图片可能是 //cdn.example.com/x.jpg 这类协议相对地址，
     # 按文章 URL 补全，避免下游拿到无法直接使用的地址。
     result["images"] = normalize_images(result.get("images"), url)
@@ -562,6 +598,10 @@ def extract_article(
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     if len(sys.argv) > 1:
         url = sys.argv[1].strip()
     else:

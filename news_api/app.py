@@ -27,7 +27,6 @@ from news_api.db import (
     stats,
 )
 from news_api.jobs import JobManager, JobQueueFull
-from news_api.netguard import UnsafeUrlError, ensure_url_allowed
 from news_api.models import (
     ArticleListResponse,
     ArticleOut,
@@ -39,6 +38,7 @@ from news_api.models import (
     SourceListResponse,
     StatsOut,
 )
+from news_api.netguard import UnsafeUrlError, ensure_url_allowed
 from news_api.settings import Settings
 from news_api.timeutil import normalize_db_bound, resolve_timezone
 

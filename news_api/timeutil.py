@@ -5,7 +5,6 @@ from __future__ import annotations
 import datetime as dt
 from zoneinfo import ZoneInfo
 
-
 _FALLBACK_OFFSET = dt.timezone(dt.timedelta(hours=8))
 
 

@@ -37,7 +37,7 @@ class Settings:
     require_auth: bool = False
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         db_path = os.getenv("NEWS_DB") or os.getenv("DB_PATH") or "news.db"
         config_path = os.getenv("NEWS_CONFIG") or "sources.json"
         api_key = os.getenv("NEWS_API_KEY", "").strip() or None

@@ -45,7 +45,7 @@ class JobCreate(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _check_type_fields(self) -> "JobCreate":
+    def _check_type_fields(self) -> JobCreate:
         if self.type == "extract":
             if not self.url:
                 raise ValueError("extract 任务必须提供 url")
@@ -66,6 +66,8 @@ class ArticleOut(BaseModel):
     published_raw: str
     timezone: str
     content: str | None = None
+    # 保留段落换行的原始正文：只在详情返回，列表接口（include_content=false）为 null。
+    raw_content: str | None = None
     content_length: int = 0
     images: list[str] = Field(default_factory=list)
     status: str

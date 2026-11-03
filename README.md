@@ -187,6 +187,7 @@ curl http://localhost:8000/v1/health
 | `NEWS_EXTRACT_ALLOW_BROWSER` | 空（关闭） | 允许 `extract` 在直接抓取失败时回退无头浏览器；仅在可信环境开启 |
 | `NEWS_MAX_PENDING_JOBS` | `50` | 排队 + 运行中的作业上限，超出返回 `429`；相同类型与参数的未完成作业会复用 |
 | `NEWS_REQUIRE_AUTH` | 空（关闭） | 设为 `1` 时要求必须配置 `NEWS_API_KEY`，否则业务接口一律返回 `401` |
+| `NEWS_INSECURE_SSL` | 空（关闭） | 设为 `1`/`true`/`yes`/`on` 时，证书校验失败会打印 WARNING 并降级为不校验重试；默认直接抛错，避免中间人攻击 |
 
 > 安全提示：未设置 `NEWS_API_KEY` 时接口完全开放。compose 默认只监听 `127.0.0.1`；如需局域网访问，请同时设置强随机 `NEWS_API_KEY` 再改 `NEWS_API_BIND=0.0.0.0`。`extract` 默认拒绝回环、内网与保留地址，并在每次 HTTP 重定向时重新校验目标；默认还禁用浏览器回退，避免通过页面 JS 绕过地址限制。确需抓取内网新闻时设置 `NEWS_ALLOW_PRIVATE_URLS=1`；确需浏览器渲染时再加 `NEWS_EXTRACT_ALLOW_BROWSER=1`。
 >
@@ -253,7 +254,8 @@ curl "http://localhost:8000/v1/articles?status=all&page_size=50"
 | `published_at_utc` | 同一时间的 UTC 表示，以 `Z` 结尾 |
 | `published_raw` | 数据库里的原始发布时间字符串 |
 | `timezone` | 该文章写入时使用的站点时区（落库保存，站点配置变化不影响历史数据；`unknown_date` 等没有发布时间的结果不会写入该列） |
-| `content` / `content_length` | 正文（列表默认不返回，详情始终返回）与字数 |
+| `content` / `content_length` | 正文与字数（已归一化为单行；列表默认不返回，详情始终返回） |
+| `raw_content` | GNE 原始正文，保留段落换行；只在 `GET /v1/articles/{id}` 详情返回，列表（含 `include_content=true`）为 `null`；v4 之前入库的历史行为空，需 `--force` 重抓，或跑 `python -X utf8 backfill_raw_content.py --db data/news.db` 批量回填 |
 | `images` | 图片 URL 数组 |
 | `status` / `error` | 抓取状态与错误信息 |
 

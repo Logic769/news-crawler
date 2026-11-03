@@ -12,11 +12,11 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from news_crawler import now_iso
 from news_api.db import connect
 from news_api.settings import Settings
 from news_api.tasks import execute_job
 from news_api.timeutil import local_iso
+from news_crawler import now_iso
 
 LOG = logging.getLogger("news_api.jobs")
 

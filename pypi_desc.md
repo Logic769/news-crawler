@@ -2,7 +2,7 @@
 
 `gne` 是 [news-crawler](https://github.com/Logic769/news-crawler) 项目内置的新闻抽取核心库（GNE 重构版）。输入新闻页面 HTML，可提取标题、作者、发布时间、正文、图片和 meta 信息。
 
-> 注意：PyPI 上的 `gne` 发行包**只包含 `gne/` 抽取库**。完整应用（`news_crawler.py`、`url_extract.py`、`api.py`、`news_api/`、CLI 与 Docker 镜像）不在 wheel 内，需要通过源码或 Docker 部署使用，用法见仓库 README。
+> **发布状态：本项目不向 PyPI 发布。** PyPI 上的 `gne` 发行包属于上游 [GeneralNewsExtractor](https://github.com/kingname/GeneralNewsExtractor)，与本仓库无关；两者同名是因为本仓库的 `gne/` 是它的 GPL-3.0 派生重构版。本项目只提供源码分发与 Docker 镜像，下面的 `pip install` 命令都需要先克隆本仓库（进入项目根目录后执行）。
 
 ## 安装
 

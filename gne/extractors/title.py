@@ -8,7 +8,11 @@ import re
 from lxml.html import HtmlElement
 
 from ..config import config
-from ..constants import TITLE_HTAG_AND_TITLE_XPATH, TITLE_HTAG_XPATH, TITLE_SPLIT_CHAR_PATTERN
+from ..constants import (
+    TITLE_HTAG_AND_TITLE_XPATH,
+    TITLE_HTAG_XPATH,
+    TITLE_SPLIT_CHAR_PATTERN,
+)
 from ..text import get_longest_common_sub_string
 
 

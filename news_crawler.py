@@ -28,8 +28,8 @@ from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import lxml.html
-from gne import GeneralNewsExtractor, NoContentException
 
+from gne import GeneralNewsExtractor, NoContentException
 from url_extract import (
     BROWSER_FALLBACK_HTTP_CODES,
     MIN_CONTENT_LENGTH,
@@ -47,7 +47,7 @@ LOG = logging.getLogger("news_crawler")
 
 DEFAULT_SOURCES_FILE = "sources.json"
 DEFAULT_DB_FILE = "news.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS articles (
@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS articles (
     timezone     TEXT,
     author       TEXT,
     content      TEXT,
+    raw_content  TEXT,
     images       TEXT,
     status       TEXT NOT NULL,
     error        TEXT,
@@ -121,11 +122,13 @@ def now_iso() -> str:
 
 def article_id_for(source: str, url: str) -> str:
     """Return a stable, URL-safe article id derived from source + url."""
-    digest = hashlib.sha256(f"{source}\x1f{url}".encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(f"{source}\x1f{url}".encode()).hexdigest()
     return digest[:32]
 
 
-def get_timezone(name: str):
+def get_timezone(name: str | None):
+    if not name:
+        return dt.datetime.now().astimezone().tzinfo
     try:
         return ZoneInfo(name)
     except Exception:
@@ -270,7 +273,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
                         for sql in _PERFORMANCE_INDEX_SQL}
     if (
         version >= SCHEMA_VERSION
-        and {"article_id", "timezone"} <= columns
+        and {"article_id", "timezone", "raw_content"} <= columns
         and required_indexes <= indexes
     ):
         return
@@ -278,6 +281,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE articles ADD COLUMN article_id TEXT")
     if "timezone" not in columns:
         conn.execute("ALTER TABLE articles ADD COLUMN timezone TEXT")
+    # v4：正文保留段落换行。content 仍是 clean_text 归一化后的单行文本，
+    # raw_content 存 GNE 原始版本；老库只补列，不自动回填（原文已不可得）。
+    if "raw_content" not in columns:
+        conn.execute("ALTER TABLE articles ADD COLUMN raw_content TEXT")
 
     # 分批回填，避免大库一次性 fetchall 占满内存；仍在同一事务内，保证
     # article_id 全部回填后才会置位 user_version。
@@ -554,6 +561,7 @@ def save_article(
     timezone: str = "",
     author: str = "",
     content: str = "",
+    raw_content: str = "",
     images: list[str] | None = None,
     status: str,
     error: str = "",
@@ -571,8 +579,9 @@ def save_article(
         """
         INSERT INTO articles (
             article_id, source, url, list_title, title, publish_time, timezone,
-            author, content, images, status, error, first_seen_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            author, content, raw_content, images, status, error, first_seen_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source, url) DO UPDATE SET
             article_id = excluded.article_id,
             list_title = COALESCE(NULLIF(excluded.list_title, ''), articles.list_title),
@@ -581,6 +590,7 @@ def save_article(
             timezone = COALESCE(NULLIF(excluded.timezone, ''), articles.timezone),
             author = COALESCE(NULLIF(excluded.author, ''), articles.author),
             content = COALESCE(NULLIF(excluded.content, ''), articles.content),
+            raw_content = COALESCE(NULLIF(excluded.raw_content, ''), articles.raw_content),
             images = COALESCE(NULLIF(excluded.images, ''), articles.images),
             status = excluded.status,
             error = excluded.error,
@@ -596,6 +606,7 @@ def save_article(
             timezone,
             author,
             content,
+            raw_content,
             images_json,
             status,
             error,
@@ -699,6 +710,10 @@ def process_entry(
         )
         return "no_content"
 
+    # GNE 的 content 本身保留段落换行，clean_text 会把它们压成空格。
+    # content 继续存归一化文本（搜索/摘要/既有下游语义不变），
+    # raw_content 存原始换行版本，供正文展示与导出使用。
+    raw_content = str(result.get("content") or "").strip()
     publish_text = clean_text(result.get("publish_time"))
     publish_dt = parse_datetime(
         publish_text,
@@ -731,7 +746,8 @@ def process_entry(
             url,
             list_title=entry.get("title", ""),
             title=clean_text(result.get("title")),
-            content=clean_text(result.get("content")),
+            content=clean_text(raw_content),
+            raw_content=raw_content,
             images=normalize_images(result.get("images"), url),
             status="unknown_date",
             error="无法解析发布日期",
@@ -747,7 +763,8 @@ def process_entry(
         publish_time=publish_text,
         timezone=tz_name,
         author=clean_text(result.get("author")),
-        content=clean_text(result.get("content")),
+        content=clean_text(raw_content),
+        raw_content=raw_content,
         images=normalize_images(result.get("images"), url),
         status="ok",
     )

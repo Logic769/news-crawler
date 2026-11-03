@@ -41,13 +41,13 @@ GNE 本身只负责“从 HTML 中抽取新闻信息”，不负责发起 HTTP �
 | 配置格式 | JSON | `sources.json` / `sources.local.json` |
 | 数据存储 | SQLite（标准库 sqlite3） | 单文件数据库，默认 `/app/data/news.db`（宿主机挂载为 `./data/news.db`） |
 | 浏览器回退 | Playwright + Chrome/Chromium | 可选依赖 `[browser]`，处理 JS 渲染页面 |
-| HTTP 请求 | urllib（标准库） | 带 User-Agent、编码探测、SSL 降级 |
+| HTTP 请求 | urllib（标准库） | 带 User-Agent、编码探测；证书校验失败默认报错，仅 `NEWS_INSECURE_SSL` 显式开启时降级 |
 | 并发模型 | concurrent.futures.ThreadPoolExecutor | 站点级并发，每个站点内部串行 |
 | 时区处理 | zoneinfo | 默认 `Asia/Shanghai` |
 | 打包 | hatchling + pyproject.toml | 支持 `pip install -e ".[browser,api]"` |
 | 依赖锁定 | uv.lock | 提供给使用 uv 的开发者 |
 | HTTP API | FastAPI + Uvicorn | 可选依赖 `[api]`，提供 `/v1` 标准新闻接口与异步作业 |
-| CI | GitHub Actions | `deploy-test.yml` 执行多 Python 版本静态检查、Docker 构建、容器冒烟与实时新闻抓取验证 |
+| CI | GitHub Actions | `deploy-test.yml` 执行多 Python 版本（3.10–3.14）ruff/mypy/离线回归、Docker 构建、容器冒烟；真实新闻抓取仅在 push、夜间与手动触发时运行 |
 
 运行依赖（必装）：
 
@@ -71,6 +71,8 @@ news-crawler/
 ├── news_crawler.py                 # 多站点抓取主程序（核心）
 ├── url_extract.py                  # 单 URL 抓取 + HTTP/浏览器抓取基础设施
 ├── smoke_test.py                   # 部署后的离线冒烟测试
+├── smoke_fixture.py                # 冒烟测试共用的内置新闻页（镜像内没有 tests/ 时的回退样本）
+├── backfill_raw_content.py         # 回填历史行的 raw_content（重抓 URL，只写换行正文，不动 content）
 ├── api.py                          # FastAPI 入口（uvicorn api:app）
 ├── news_api/                       # API 应用：设置、模型、查询、作业队列
 ├── api_smoke.py                    # API 冒烟测试（本地 HTTP + 临时数据库）
@@ -219,7 +221,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | GET | `/v1/jobs`、`/v1/jobs/{id}` | 作业列表与状态 |
 | GET | `/v1/health` | 健康检查（无需鉴权） |
 
-列表参数：`status`、`source`、`published_from`、`published_to`、`q`、`page`、`page_size`、`order`、`include_content`。文章列表与作业列表返回 `{"data": [...], "meta": {...}}`；文章详情、统计、健康检查返回对应对象；`/v1/sources` 返回 `{"data": [...]}`。
+列表参数：`status`、`source`、`published_from`、`published_to`、`q`、`page`、`page_size`、`order`、`include_content`（为 `true` 时列表返回 `content`；`raw_content` 无论何时都只在详情返回）。文章列表与作业列表返回 `{"data": [...], "meta": {...}}`；文章详情、统计、健康检查返回对应对象；`/v1/sources` 返回 `{"data": [...]}`。
 
 设置 `NEWS_API_KEY` 后，除 `/v1/health` 与文档外都需 `X-API-Key` 或 `Authorization: Bearer <key>`。作业状态为 `queued`/`running`/`succeeded`/`failed`，单进程执行，避免 SQLite 并发写冲突。排队 + 运行中的作业上限为 `NEWS_MAX_PENDING_JOBS`（默认 50），超出返回 `429`；相同类型与参数的未完成作业复用同一 ID。`extract` 默认拒绝回环、内网与保留地址（`NEWS_ALLOW_PRIVATE_URLS=1` 可放开）；`fetch_html` 通过自定义 `HTTPRedirectHandler` 对每个重定向目标复用同一校验，默认还以 `allow_browser=False` 禁用浏览器回退（`NEWS_EXTRACT_ALLOW_BROWSER=1` 可放开），避免页面 JS 绕过地址限制。上述限制仍不能替代 API Key。已完成作业保留 30 天后自动清理。未设置 `NEWS_API_KEY` 时默认开放（仅提示 warning）；设置 `NEWS_REQUIRE_AUTH=1` 后行为是"未配置 key 则业务请求一律 401，已配置 key 时按 key 校验"（401 带 `WWW-Authenticate`，`/v1/health`、`/docs`、openapi 与根路径始终开放）。错误响应统一为 `{"error": {"code", "status": <HTTP 码>, "message", "details"?}}`，参数校验错误为 422 且带 `details`。`docker compose` 通过白名单透传 API 变量，需在 `.env` 或 shell 中设置后生效。
 
@@ -302,7 +304,8 @@ CREATE TABLE IF NOT EXISTS articles (
     publish_time  TEXT,            -- 统一为 YYYY-MM-DD HH:MM:SS
     timezone      TEXT,            -- 写入时的站点时区，历史行可能为空
     author        TEXT,
-    content       TEXT,            -- 正文纯文本
+    content       TEXT,            -- 正文纯文本（clean_text 归一化，段落换行被压成空格）
+    raw_content   TEXT,            -- GNE 原始正文，保留段落换行；仅展示/导出用
     images        TEXT,            -- JSON 数组字符串；空串表示本次未取到，不覆盖库中原值
     status        TEXT NOT NULL,   -- ok/old/no_content/unknown_date/error
     error         TEXT,
@@ -326,7 +329,7 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 
 索引：`source`、`status`、`publish_time`、`article_id`（唯一），以及两条查询性能覆盖索引：`(status, publish_time DESC, source, url)` 供列表分页、`(source, publish_time DESC, updated_at DESC, timezone, status)` 供 `/v1/sources` 聚合；`crawl_jobs` 的 `status`、`created_at`、`(type, payload, status)` 去重索引。
 
-旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 3`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id` 与 `timezone`，按 2000 行分批回填 `article_id` 并建唯一索引与去重索引；v3 额外补建两条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这两条，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外），迁移早退条件同时校验这两条索引是否齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
+旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 4`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、`timezone` 与 v4 的 `raw_content`（只补列，历史行不回填），按 2000 行分批回填 `article_id` 并建唯一索引与去重索引；v3 额外补建两条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这两条，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外），迁移早退条件同时校验这两条索引是否齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
 
 ### 7.2 status 语义
 
@@ -342,7 +345,7 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 
 - `publish_time` 在 `process_entry()` 中统一格式化为 `YYYY-MM-DD HH:MM:SS`；
 - 用旧版本抓取过的数据可能仍是中文日期格式，需要 `--force` 重抓或重建数据库；
-- `content` 入库前会被 `clean_text()` 压缩空白，段落换行会丢失；
+- `content` 入库前会被 `clean_text()` 压缩空白，段落换行会丢失；GNE 原始换行正文另存 `raw_content`（代价是正文体积约翻倍，仅 `ok`/`unknown_date` 写入，`old`/`error` 不写）；v4 之前入库的历史行需要 `--force` 重抓，或用 `backfill_raw_content.py` 批量回填（只 `UPDATE raw_content`，不改 `content`/`status`/`updated_at`）；
 - 同一 `(source, url)` 使用 upsert，不会产生重复记录；
 - `save_article()` 是**部分更新**：空字符串/空图片表示“这次没拿到”，不会覆盖库中已有值，因此抓取失败或重新分类时只更新 `status`/`error`，已成功入库的正文不会被清空；
 - `timezone` 随文章落库，读取时优先使用该列，旧行（NULL）才回落到当前配置推断；`published_from`/`published_to` 仍按站点本地墙钟字符串比较，混合时区时会有偏差；
@@ -397,6 +400,17 @@ docker compose run --rm crawler run --config sources.local.json --days 3
 docker compose run --rm --entrypoint python crawler -X utf8 url_extract.py "https://example.com/article.html"
 ```
 
+### 回填 raw_content（历史行）
+
+v4 之前入库的文章 `raw_content` 为空。回填脚本只重抓这些行、只写 `raw_content`，不改变 `content`、`status` 与 `updated_at`；抓取失败的行原样保留，可重复运行（已回填的行不再是候选）：
+
+```bash
+# 先看有多少条候选（不抓取）
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content.py --dry-run
+# 真正回填（默认 --delay 0.5 控制频率；--source / --limit 可缩小范围；--allow-browser 才回退 Chromium）
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content.py --limit 50
+```
+
 ### 启动 HTTP API
 
 ```bash
@@ -425,13 +439,14 @@ curl http://localhost:8000/v1/health
 
 `.github/workflows/deploy-test.yml`：
 
-- 触发：push 到 `master`，或手动 `workflow_dispatch`
-- `python-checks` job：Python 3.10–3.13 矩阵，执行 compileall、ruff 关键规则与 smoke
+- 触发：push 到 `master`、PR、夜间定时（UTC 18:00 / 北京时间 02:00）或手动 `workflow_dispatch`
+- `python-checks` job：Python 3.10–3.14 矩阵，执行 compileall、`ruff check .`、`mypy`（仅 3.12 跑一次）、smoke、api_smoke 与 62 篇样本的离线回归
 - `shell-and-yaml` job：bash 语法检查、shellcheck 与 YAML 解析校验
 - `docker-build` job：Ubuntu，`docker build` 后执行容器内 `smoke`、`api_smoke.py`、compose API 健康检查，并校验裸 `docker run ... api` 的持久化数据库路径
-- `live-news` job：PR 与 push 都运行，安装 `[browser,api]` 与 Chromium 后用宿主机 Python 执行 `verify_live_news.py --static 10 --dynamic 10 --video 10`；这是**硬性门槛**，抽取数量不足即 job 失败
-- `docker-build-full` job：默认含浏览器镜像构建 + Chromium 启动校验 + smoke + 镜像内同类实时新闻验证（10 静态 / 10 JS 渲染 / 10 视频，仅 push 或手动运行）
-- 通过标准：`python-checks`、`shell-and-yaml`、`docker-build`、`live-news`、`docker-build-full` 全部退出码为 0（前者包含 `SMOKE TEST PASSED`，两个 live job 需打印 `LIVE NEWS VERIFICATION PASSED`）
+- `live-news` job：只在 push `master`、夜间定时与手动触发时运行（`if: github.event_name != 'pull_request'`），安装 `[browser,api]` 与 Chromium 后用宿主机 Python 执行 `verify_live_news.py --static 10 --dynamic 10 --video 10`；这是**硬性门槛**，抽取数量不足即 job 失败。PR 上不跑：失败多来自站点改版/反爬而非本次改动，且 PR 已有离线回归兜底
+- `docker-build-full` job：默认含浏览器镜像构建 + Chromium 启动校验 + smoke + 镜像内同类实时新闻验证（10 静态 / 10 JS 渲染 / 10 视频）；与 `live-news` 同条件，只在非 PR 事件运行（push `master`、夜间定时、手动触发）
+- `notify-nightly-failure` job：夜间定时任务失败时自动开/更新标题为「[nightly] 夜间回归失败」的 issue（`permissions: issues: write`）
+- 通过标准：`python-checks`、`shell-and-yaml`、`docker-build` 必须为 0；`live-news`、`docker-build-full` 在非 PR 事件上必须为 0（前者包含 `SMOKE TEST PASSED`，两个 live job 需打印 `LIVE NEWS VERIFICATION PASSED`）
 - 手动触发时可用 `live_news_seed` 输入固定随机种子，便于复现某次失败的抽样
 
 ---
@@ -441,8 +456,8 @@ curl http://localhost:8000/v1/health
 ### 现有测试资产
 
 - `tests/`：约 62 个上游新闻页面 HTML 样本，覆盖 31 个站点目录；
-- `smoke_test.py`：部署自检，验证导入、日期解析、GNE 抽取、SQLite 初始化、视频页判定、图片地址补全、浏览器回退状态码白名单、性能索引是否建齐、`old` 在窗口放宽后是否重抓；
-- `api_smoke.py`：启动临时 uvicorn + 临时 SQLite，验证鉴权、查询、详情、统计、异步作业全链路，以及入库图片必须为绝对 URL；
+- `smoke_test.py`：部署自检，验证导入、日期解析、GNE 抽取、SQLite 初始化、视频页判定、图片地址补全、浏览器回退状态码白名单、性能索引是否建齐、`raw_content` 落库与「本次未传不覆盖」、`old` 在窗口放宽后是否重抓；样本缺失时回退到 `smoke_fixture.py` 的内置新闻页（与 `api_smoke.py` 共用）；
+- `api_smoke.py`：启动临时 uvicorn + 临时 SQLite，验证鉴权、查询、详情（含 `raw_content` 换行）、统计、异步作业全链路，以及入库图片必须为绝对 URL；
 - `verify_live_news.py` + `live_news_pool.json`：从 100 静态 / 50 JS 渲染 / 50 视频的页面池中随机抽取（默认 10/10/10）访问公开新闻站点，验证三条抽取路径；
 
 ### 实时新闻池维护
@@ -464,21 +479,40 @@ curl http://localhost:8000/v1/health
   注意 `GeneralNewsExtractor` 实例不可跨线程共享（并发复用会抛 `math domain error`），批量校验时每个线程各自新建；
 - 池子生成脚本与探测结果保存在本地 `backups/pool_build/`（被 Git 忽略），不属于仓库内容。
 
-### 回归基线（不在仓库内）
+### 离线回归基线（regression/）
 
-重构阶段用于对比的 248 用例回归脚本（`gne_regress.py`）与基线结果（`baseline-a45b464.json`）**没有随仓库发布**：它们原本位于维护者本机的 `backups/`（被 `.gitignore` 忽略），当前工作副本中也已不存在。因此新 clone 或换机器后无法直接复现该回归，下面的步骤也不依赖它。需要重建时：
+`tests/` 下的 62 个 HTML 样本已接入离线回归，基线随仓库发布，CI 每次运行都会比对：
 
-1. 向原维护者索取 `backups/gne_regress.py` 与对应的基线 JSON；
-2. 或按 A/B 方式自建基线：选一个明确的旧提交（重构前最后一个提交是 `a45b464`），用 `mkdir -p /tmp/gne-old && git archive a45b464 gne | tar -x -C /tmp/gne-old` 把旧版 `gne/` 解压到临时目录，避免覆盖当前工作树；然后分别以 `/tmp/gne-old` 和当前项目根目录为 `PYTHONPATH`，对同一批 `tests/**/*.html` 逐篇调用 `GeneralNewsExtractor().extract()`，记录 `title`、正文（或正文 sha1）、`publish_time`、`author`、`images` 与是否抛异常；
-3. 用同一批样本跑新版本，逐文件比对上述字段，任何差异都按回归处理（本轮重构的对照结果是 62/62 完全一致）。
+| 文件 | 作用 |
+| --- | --- |
+| `regression/baseline.json` | 基线快照，62 个样本的 title/author/publish_time/content_len/content_sha1/images/error，含 `gne_version` 与 `sample_count` |
+| `regression/baseline_utils.py` | 抽取单个样本的稳定指纹（正文取 sha1 而非全文，避免基线文件膨胀） |
+| `regression/generate_baseline.py` | 重新生成基线：`python -X utf8 -m regression.generate_baseline`（必须用 `-m`；直接跑脚本时 `sys.path` 指向 `regression/`，`from regression.baseline_utils import ...` 会失败） |
+| `regression/test_gne_regression.py` | 3 个用例：全部样本与基线一致、基线可复现、样本集合与基线匹配 |
+
+运行方式：`python -X utf8 -m unittest regression.test_gne_regression -v`（约 15 秒，无需网络）。
+
+**只在校验“抽取行为本应改变”时才更新基线**：先确认差异是预期的（例如有意调整正文算法），再跑 `python -X utf8 -m regression.generate_baseline`，并在提交信息里说明哪些样本、为什么变。不要为了“让 CI 变绿”而重建基线。
+
+历史背景：重构阶段曾用维护者本机的 `gne_regress.py`（248 用例，含旧提交 `a45b464` 的 A/B 对照，结果 62/62 完全一致），该脚本未被仓库跟踪；其中针对 `tests/` 的核心部分已固化为上面的 `regression/` 套件。
 
 ### 提交前必须执行
 
 ```bash
-docker compose run --rm --entrypoint python crawler -m py_compile news_crawler.py url_extract.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api
+docker compose run --rm --entrypoint python crawler -m compileall -q news_crawler.py url_extract.py smoke_fixture.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api
 docker compose run --rm crawler smoke
 docker compose run --rm --entrypoint python crawler -X utf8 api_smoke.py
 ```
+
+如果本机有 Python 环境（或直接跑 CI 的 `python-checks`），再补这几条——CI 会用同样的命令卡住不通过的 PR：
+
+```bash
+ruff check .
+mypy
+python -X utf8 -m unittest regression.test_gne_regression -v
+```
+
+离线回归依赖 `tests/` 与 `regression/`，两者都不进镜像（见 `.dockerignore`），所以只能在宿主机运行；容器内 `smoke`/`api_smoke.py` 用的是 `smoke_fixture.py` 的内置样本。
 
 如果改动了抓取或日期逻辑，至少再执行：
 
@@ -488,7 +522,8 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 
 ### 测试缺口（后续可补）
 
-- 目前没有 pytest 单元测试；
+- 目前没有 pytest 单元测试：`regression/` 与 `smoke_test.py` 都用标准库 `unittest`，够用但缺少夹具与参数化；
+- 离线回归只比对抽取结果指纹（标题/作者/时间/正文 sha1/图片数），不校验正文中间过程；
 - CI 的 live-news 只覆盖池内 200 个页面（且每次只抽 10/10/10），不覆盖所有站点；站点反爬/改版会导致该 job 波动；
 - `content_needs_render()` 的占位判断是启发式规则；
 - 日期解析为多正则启发式，缺少系统化用例集。
@@ -502,8 +537,8 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 1. **占位正文判断仍偏启发式**
    `content_needs_render()` 现在规则为：正文为空、或少于 100 字（`MIN_CONTENT_LENGTH`）、或少于 500 字且含加载中关键词。少于 100 字会触发一次浏览器渲染回退；渲染回退后仍少于 100 字时，`extract_article()` 记 WARNING 并照常入库（导航碎片可能因此被当成正文，例如央视的“正在阅读：&lt;标题&gt;”）。渲染回退本身失败时仍返回 `None`（记为 `no_content`，下次重试）。占位词表仍为硬编码，尚未判断占位词出现位置。
 
-2. **入库正文段落换行丢失**
-   `process_entry()` 使用 `clean_text()` 压缩所有空白，段落分隔被替换为空格。如果后续要做正文展示或导出，需要保留换行或增加原始正文列。
+2. **正文以单行存储，换行另存 `raw_content`**
+   `content` 列仍由 `clean_text()` 归一化为单行（下游检索/展示依赖这一约定，未改动）；段落换行保留在 v4 新增的 `raw_content` 列，只经由 `GET /v1/articles/{id}` 的详情返回（列表即使 `include_content=true` 也为 `null`）。代价是正文体积约翻倍，且历史行（v4 之前入库）`raw_content` 为空，需要 `--force` 重抓，或用 `backfill_raw_content.py` 批量回填（见 §8）。
 
 3. **无法显式强制使用 public 配置**
    `resolve_config_path()` 在存在 `sources.local.json` 时会优先使用它，即使显式传入 `--config sources.json`。建议增加 `--no-local-config` 或显式路径优先级。

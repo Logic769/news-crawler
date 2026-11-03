@@ -18,6 +18,8 @@ services:
     container_name: news-crawler
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      # 默认关闭：证书校验失败直接报错。仅对自签名/过期证书的站点显式开启。
+      NEWS_INSECURE_SSL: ${NEWS_INSECURE_SSL:-}
     volumes:
       # 私有站点配置：只读挂载，不进镜像；首次部署脚本会自动从模板创建
       - ./sources.local.json:/app/sources.local.json:ro
@@ -48,6 +50,7 @@ services:
       NEWS_EXTRACT_ALLOW_BROWSER: ${NEWS_EXTRACT_ALLOW_BROWSER:-}
       NEWS_MAX_PENDING_JOBS: ${NEWS_MAX_PENDING_JOBS:-50}
       NEWS_REQUIRE_AUTH: ${NEWS_REQUIRE_AUTH:-}
+      NEWS_INSECURE_SSL: ${NEWS_INSECURE_SSL:-}
     volumes:
       - ./sources.local.json:/app/sources.local.json:ro
       - ./data:/app/data

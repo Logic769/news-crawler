@@ -8,10 +8,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from gne import GeneralNewsExtractor
-
 import news_crawler
 import url_extract
+from gne import GeneralNewsExtractor
 from news_api.netguard import ensure_url_allowed
 from news_api.settings import Settings
 from url_extract import close_thread_browser, normalize_images
@@ -132,6 +131,7 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             )
             raise RuntimeError("无法抓取或抽取正文，已记录为 error，可稍后重试")
 
+        raw_content = str(result.get("content") or "").strip()
         publish_text = news_crawler.clean_text(result.get("publish_time"))
         publish_dt = news_crawler.parse_datetime(publish_text, None, settings.timezone)
         if publish_dt is not None:
@@ -146,7 +146,8 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             publish_time=publish_text,
             timezone=settings.timezone,
             author=news_crawler.clean_text(result.get("author")),
-            content=news_crawler.clean_text(result.get("content")),
+            content=news_crawler.clean_text(raw_content),
+            raw_content=raw_content,
             images=normalize_images(result.get("images"), url),
             status=status,
             error=error,
@@ -158,7 +159,7 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             "status": status,
             "title": news_crawler.clean_text(result.get("title")),
             "published_at": publish_dt.isoformat() if publish_dt else None,
-            "content_length": len(news_crawler.clean_text(result.get("content"))),
+            "content_length": len(news_crawler.clean_text(raw_content)),
             "is_video": bool(result.get("is_video")),
             "error": error or None,
         }
