@@ -1,5 +1,22 @@
 # General News Extractor Changelog
 
+## 1.1.2 (2026-11-03)
+
+### Refactor
+
+1. GNE 抽取核心重构：`gne/` 拆分为 `engine.py`（主流程）、`config.py`、`constants.py`、`exceptions.py`、`html.py`、`text.py` 与 `extractors/{content,title,time,author,meta,list}.py`；旧 `gne/extractor/` 路径保留兼容层。`extract()` 参数顺序与默认值、返回字段、正文密度算法、字段回退链均未变（62 篇样本 A/B：title / content / publish_time / author / images / status 六项 0 diff）
+2. 清理上游演示资产：`docs/`、`screenshots/`、`site/`、`test_list_page/`、`visiable_test/`、`example*.py` 等 84 个文件（-30144 行）移除，仓库只保留抽取库与抓取/API 代码
+
+### Docs
+
+1. 许可证元数据统一为 GPL-3.0-only：`LICENSE` 自 89b1de8 起就是 GPLv3，但 `pyproject.toml` 与 `AGENTS.md` 一直写 MIT；同步 classifier、`uv.lock`、README 新增的许可证章节（GPLv3 义务仅在向他人传递副本时触发，源代码按第 6 节规定的方式提供，本地运行或仅提供服务不触发）
+2. `pypi_desc.md` 说明 PyPI 上的 `gne` 只包含抽取库，完整抓取/API 需从源码或 Docker 部署；补齐 `git clone`、`playwright install chromium` 与可选依赖的安装步骤
+3. `AGENTS.md` 新增「回归基线（不在仓库内）」小节：给出用 `a45b464` 与临时目录复现 A/B 回归的步骤
+
+### Chore
+
+1. 正文标点集合 `PUNCTUATION` 冻结为 `frozenset`（只读使用，避免运行时被意外修改）
+
 ## 1.1.1 (2026-11-02)
 
 ### Bug fix

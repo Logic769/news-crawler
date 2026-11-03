@@ -33,5 +33,5 @@ __all__ = [
     "pre_parse",
     "remove_noise_node",
 ]
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 __author__ = "Kingname"
