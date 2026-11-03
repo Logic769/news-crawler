@@ -466,7 +466,7 @@ curl http://localhost:8000/v1/health
 
 ### 回归基线（不在仓库内）
 
-重构阶段用于对比的 248 用例回归脚本（`gne_regress.py`）与基线结果（`baseline-a45b464.json`）**没有随仓库发布**：它们只存在于维护者本机的 `backups/`（被 `.gitignore` 忽略，当前工作副本中也没有保留）。因此新 clone 或换机器后无法直接复现该回归，下面的步骤也不依赖它。需要重建时：
+重构阶段用于对比的 248 用例回归脚本（`gne_regress.py`）与基线结果（`baseline-a45b464.json`）**没有随仓库发布**：它们原本位于维护者本机的 `backups/`（被 `.gitignore` 忽略），当前工作副本中也已不存在。因此新 clone 或换机器后无法直接复现该回归，下面的步骤也不依赖它。需要重建时：
 
 1. 向原维护者索取 `backups/gne_regress.py` 与对应的基线 JSON；
 2. 或按 A/B 方式自建基线：用 `git archive <旧提交> gne | tar -x` 取出旧版 `gne/`，对 `tests/**/*.html` 逐篇调用 `GeneralNewsExtractor().extract()`，记录 `title`、正文（或正文 sha1）、`publish_time`、`author`、`images` 与是否抛异常；

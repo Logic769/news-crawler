@@ -13,7 +13,7 @@ from lxml.html import HtmlElement, etree
 from ..config import config
 from ..html import get_high_weight_keyword_pattern, iter_node, pad_host_for_images
 
-PUNCTUATION = {
+PUNCTUATION = frozenset({
     chr(code)
     for code in (
         0x21,
@@ -39,7 +39,7 @@ PUNCTUATION = {
         0xFF1B,
         0xFF1F,
     )
-}
+})
 
 
 class ContentExtractor:
