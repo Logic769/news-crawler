@@ -24,7 +24,7 @@ GNE 本身只负责“从 HTML 中抽取新闻信息”，不负责发起 HTTP �
 | 项目 | 内容 |
 | --- | --- |
 | 当前正式版本 | `v1.1.1` |
-| 开源协议 | MIT（继承自上游 GeneralNewsExtractor） |
+| 开源协议 | GPL-3.0（继承自上游 GeneralNewsExtractor，全文见 LICENSE） |
 | 主仓库 | https://github.com/Logic769/news-crawler |
 | 上游仓库 | https://github.com/kingname/GeneralNewsExtractor |
 | 默认分支 | `master` |
@@ -463,6 +463,14 @@ curl http://localhost:8000/v1/health
 
   注意 `GeneralNewsExtractor` 实例不可跨线程共享（并发复用会抛 `math domain error`），批量校验时每个线程各自新建；
 - 池子生成脚本与探测结果保存在本地 `backups/pool_build/`（被 Git 忽略），不属于仓库内容。
+
+### 回归基线（不在仓库内）
+
+重构阶段用于对比的 248 用例回归脚本（`gne_regress.py`）与基线结果（`baseline-a45b464.json`）**没有随仓库发布**：它们只存在于维护者本机的 `backups/`（被 `.gitignore` 忽略，当前工作副本中也没有保留）。因此新 clone 或换机器后无法直接复现该回归，下面的步骤也不依赖它。需要重建时：
+
+1. 向原维护者索取 `backups/gne_regress.py` 与对应的基线 JSON；
+2. 或按 A/B 方式自建基线：用 `git archive <旧提交> gne | tar -x` 取出旧版 `gne/`，对 `tests/**/*.html` 逐篇调用 `GeneralNewsExtractor().extract()`，记录 `title`、正文（或正文 sha1）、`publish_time`、`author`、`images` 与是否抛异常；
+3. 用同一批样本跑新版本，逐文件比对上述字段，任何差异都按回归处理（本轮重构的对照结果是 62/62 完全一致）。
 
 ### 提交前必须执行
 

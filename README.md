@@ -501,6 +501,14 @@ docker compose build
 
 ---
 
+## 许可证
+
+本项目沿袭上游 [GeneralNewsExtractor](https://github.com/kingname/GeneralNewsExtractor) 的授权方式，以 **GNU GPL v3（GPL-3.0-only）** 发布，完整文本见 [LICENSE](LICENSE)。
+
+按 GPLv3 的要求，分发本项目或其修改版时，衍生作品同样需要以 GPLv3 开源并提供对应源代码；如需闭源使用，请联系上游作者取得其它授权。
+
+---
+
 ## 相关链接
 
 - [本项目仓库](https://github.com/Logic769/news-crawler)
