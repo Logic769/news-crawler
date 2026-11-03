@@ -406,10 +406,12 @@ v4 之前入库的文章 `raw_content` 为空。回填脚本只重抓这些行�
 
 ```bash
 # 先看有多少条候选（不抓取）
-docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content.py --dry-run
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content.py --db /app/data/news.db --dry-run
 # 真正回填（默认 --delay 0.5 控制频率；--source / --limit 可缩小范围；--allow-browser 才回退 Chromium）
-docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content.py --limit 50
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content.py --db /app/data/news.db --limit 50
 ```
+
+脚本的 `--db` 默认值取自 `news_crawler.DEFAULT_DB_FILE`（相对路径 `news.db`），容器内必须显式传 `/app/data/news.db`，否则会指向 `/app/news.db`。
 
 ### 启动 HTTP API
 
@@ -499,7 +501,7 @@ curl http://localhost:8000/v1/health
 ### 提交前必须执行
 
 ```bash
-docker compose run --rm --entrypoint python crawler -m compileall -q news_crawler.py url_extract.py smoke_fixture.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api
+docker compose run --rm --entrypoint python crawler -m compileall -q news_crawler.py url_extract.py smoke_fixture.py backfill_raw_content.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api
 docker compose run --rm crawler smoke
 docker compose run --rm --entrypoint python crawler -X utf8 api_smoke.py
 ```

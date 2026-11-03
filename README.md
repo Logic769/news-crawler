@@ -255,7 +255,7 @@ curl "http://localhost:8000/v1/articles?status=all&page_size=50"
 | `published_raw` | 数据库里的原始发布时间字符串 |
 | `timezone` | 该文章写入时使用的站点时区（落库保存，站点配置变化不影响历史数据；`unknown_date` 等没有发布时间的结果不会写入该列） |
 | `content` / `content_length` | 正文与字数（已归一化为单行；列表默认不返回，详情始终返回） |
-| `raw_content` | GNE 原始正文，保留段落换行；只在 `GET /v1/articles/{id}` 详情返回，列表（含 `include_content=true`）为 `null`；v4 之前入库的历史行为空，需 `--force` 重抓，或跑 `python -X utf8 backfill_raw_content.py --db data/news.db` 批量回填 |
+| `raw_content` | GNE 原始正文，保留段落换行；只在 `GET /v1/articles/{id}` 详情返回，列表（含 `include_content=true`）为 `null`；v4 之前入库的历史行为空，需 `--force` 重抓，或用 `backfill_raw_content.py` 回填（先 `--dry-run` 看候选数，再 `--limit 50` 小批试跑；容器内必须显式传 `--db /app/data/news.db`，命令见 AGENTS.md §8） |
 | `images` | 图片 URL 数组 |
 | `status` / `error` | 抓取状态与错误信息 |
 

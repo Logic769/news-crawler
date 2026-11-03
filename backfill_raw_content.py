@@ -7,8 +7,8 @@ content 列保持 clean_text() 归一化后的单行文本不变，只写 raw_co
     python -X utf8 backfill_raw_content.py --db data/news.db --dry-run
     python -X utf8 backfill_raw_content.py --db data/news.db
 
-容器内（数据库在 /app/data/news.db）：
-    docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content.py
+容器内（数据库在 /app/data/news.db，必须显式传 --db）：
+    docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content.py --db /app/data/news.db
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 from gne import GeneralNewsExtractor
-from news_crawler import DEFAULT_DB_FILE, init_db
+from news_crawler import DEFAULT_DB_FILE, SCHEMA_VERSION, init_db
 from url_extract import close_thread_browser, extract_article
 
 # 只有 ok / unknown_date 会写入 raw_content：old 分支刻意不写（见 process_entry），
@@ -47,7 +47,7 @@ def find_candidates(
     if source:
         sql += " AND source = ?"
         params.append(source)
-    sql += " ORDER BY publish_time DESC, url"
+    sql += " ORDER BY publish_time DESC, source, url"
     if limit > 0:
         sql += " LIMIT ?"
         params.append(limit)
@@ -74,8 +74,13 @@ def backfill(
         for index, (source, url) in enumerate(candidates):
             if index and delay > 0:
                 time.sleep(delay)
-            result = extract_article(url, extractor, allow_browser=allow_browser)
-            raw_content = str((result or {}).get("content") or "").strip()
+            try:
+                result = extract_article(url, extractor, allow_browser=allow_browser)
+                raw_content = str((result or {}).get("content") or "").strip()
+            except Exception as exc:  # 单条失败不能中止整批
+                failed += 1
+                print(f"  [失败] {source} {url}：{exc}")
+                continue
             if not raw_content:
                 failed += 1
                 print(f"  [失败] {source} {url}")
@@ -99,7 +104,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--db", default=DEFAULT_DB_FILE)
     parser.add_argument("--source", default="", help="只回填指定站点（source 字段）")
-    parser.add_argument("--limit", type=int, default=0, help="最多回填多少条（0 为不限制）")
+    parser.add_argument(
+        "--limit", type=int, default=0, help="本次最多回填多少条（跨站点全局计数，0 为不限制）"
+    )
     parser.add_argument(
         "--delay", type=float, default=0.5, help="两次请求之间的等待秒数，默认 0.5"
     )
@@ -114,11 +121,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.limit < 0:
+        print("--limit 不能为负数（0 表示不限制）", file=sys.stderr)
+        return 2
     db_path = Path(args.db)
     if not db_path.is_file():
         # init_db 会建新库，写错路径就静默变成「0 条候选」，因此先拦住。
         print(f"找不到数据库：{db_path}（回填只处理已有库，不会新建）", file=sys.stderr)
         return 2
+
+    if args.dry_run:
+        # dry-run 不抓取，但 init_db 仍会把 v3 库迁移到 v4 结构，这里提前说明。
+        probe = sqlite3.connect(db_path)
+        try:
+            version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            probe.close()
+        if version != SCHEMA_VERSION:
+            print(
+                f"注意：dry-run 仍会把库结构从 v{version} 迁移到 v{SCHEMA_VERSION}"
+                "（只改表结构，不改任何正文）。"
+            )
 
     conn = init_db(str(db_path))
     try:
@@ -136,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
         conn.close()
 
     if args.dry_run:
-        print("dry-run：未抓取，未写入。")
+        print("dry-run：未抓取，未写入任何正文。")
         return 0
     print(f"完成：回填 {updated} 条，失败 {failed} 条。")
     return 0

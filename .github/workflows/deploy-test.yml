@@ -58,7 +58,7 @@ jobs:
           fi
 
       - name: Byte-compile all sources
-        run: python -m compileall -q news_crawler.py url_extract.py smoke_fixture.py backfill_raw_content.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api gne
+        run: python -m compileall -q news_crawler.py url_extract.py smoke_fixture.py backfill_raw_content.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api gne regression
 
       # 规则集与排除项在 pyproject.toml 的 [tool.ruff] 中，CI 与本地保持一致。
       - name: Ruff
