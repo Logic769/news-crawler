@@ -86,28 +86,27 @@ news-crawler/
 ├── uv.lock                         # uv 依赖锁
 ├── README.md                       # 面向用户的中文使用文档
 ├── AGENTS.md                       # 本文档，面向开发者与 Agent
-├── gne/                            # 上游 GNE 抽取库
-│   ├── __init__.py                 # GeneralNewsExtractor / ListPageExtractor
-│   ├── defaults.py                 # 时间/作者/标题等正则与默认 XPath
-│   ├── utils.py                    # HTML 预处理、噪音节点移除等
-│   ├── classfier/ArticleClassifier.py
+├── gne/                            # 新闻抽取核心库（本项目重构版）
+│   ├── __init__.py                 # 公共入口（GeneralNewsExtractor 与各字段提取器）
+│   ├── engine.py                   # 抽取主流程（预处理 → 各字段提取 → 正文）
+│   ├── config.py                   # .gne 配置加载（导入时读取一次）
+│   ├── constants.py                # 时间/作者/标题正则、默认 XPath 与噪声规则
+│   ├── exceptions.py               # NoContentException
+│   ├── html.py                     # HTML 预处理、噪声节点移除、图片 URL 补全
+│   ├── text.py                     # 最长公共子串与文本归一化
+│   ├── utils.py                    # 兼容旧 gne.utils 的 re-export
+│   ├── defaults.py                 # 兼容旧 gne.defaults 的 re-export
+│   ├── extractors/
+│   │   ├── __init__.py             # 导出各字段提取器
+│   │   ├── content.py              # 正文密度算法
+│   │   ├── title.py                # 标题提取
+│   │   ├── time.py                 # 发布时间提取
+│   │   ├── author.py               # 作者/来源提取
+│   │   ├── meta.py                 # meta 信息提取
+│   │   └── list.py                 # 列表页提取（兼容旧 ListPageExtractor）
 │   └── extractor/
-│       ├── ContentExtractor.py     # 正文密度算法
-│       ├── TitleExtractor.py       # 标题提取
-│       ├── TimeExtractor.py        # 发布时间提取
-│       ├── AuthorExtractor.py      # 作者/来源提取
-│       ├── MetaExtractor.py        # meta 信息提取
-│       └── ListExtractor.py        # 实验性列表页提取
+│       └── __init__.py             # 旧 gne.extractor 路径兼容层
 ├── tests/                          # 上游新闻页面 HTML 样本（约 62 个文件）
-├── test_list_page/                 # 上游列表页样本
-├── visiable_test/                  # 上游可见性计算样本
-├── docs/                           # 上游 Sphinx 文档与图片
-├── screenshots/                    # 上游截图
-├── site/                           # 上游演示站静态页
-├── example.py                      # 遍历 tests/ 抽取正文示例
-├── example_list.py                 # 列表页抽取示例
-├── example_visiable.py             # 可见性抽取示例
-├── nsfc_latest5.py                 # 早期演示脚本（非核心，可后续整理）
 └── .github/workflows/deploy-test.yml
 ```
 
@@ -441,13 +440,10 @@ curl http://localhost:8000/v1/health
 
 ### 现有测试资产
 
-- `tests/`：约 62 个上游新闻页面 HTML 样本，覆盖 30 个站点目录；
-- `test_list_page/`：列表页样本；
-- `visiable_test/`：可见性测试样本；
+- `tests/`：约 62 个上游新闻页面 HTML 样本，覆盖 31 个站点目录；
 - `smoke_test.py`：部署自检，验证导入、日期解析、GNE 抽取、SQLite 初始化、视频页判定、图片地址补全、浏览器回退状态码白名单、性能索引是否建齐、`old` 在窗口放宽后是否重抓；
 - `api_smoke.py`：启动临时 uvicorn + 临时 SQLite，验证鉴权、查询、详情、统计、异步作业全链路，以及入库图片必须为绝对 URL；
 - `verify_live_news.py` + `live_news_pool.json`：从 100 静态 / 50 JS 渲染 / 50 视频的页面池中随机抽取（默认 10/10/10）访问公开新闻站点，验证三条抽取路径；
-- `example.py`：遍历 `tests/**/*.html`，打印抽取结果（人工观察用）。
 
 ### 实时新闻池维护
 
@@ -544,7 +540,7 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 
 - `news_crawler.py` 是最核心、最易冲突的文件，修改前先同步最新 `master`；
 - `url_extract.py` 被 `news_crawler.py` 导入，改函数签名要同步调用方；
-- `tests/` 与 `docs/` 是上游资产，除非明确需要，不要批量改动；
+- `tests/` 是上游资产（新闻页面样本），除非明确需要，不要批量改动；
 - `sources.local.json` 是本地文件，不同 Agent 不要互相覆盖，建议各自保存副本。
 
 ### 12.4 共享接口约定
