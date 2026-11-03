@@ -38,7 +38,7 @@
 | `verify_live_news.py` | 实时新闻抓取验证（默认抽取 10 静态 / 10 JS 渲染 / 10 视频） |
 | `live_news_pool.json` | 实时验证页面池（100 静态 / 50 JS 渲染 / 50 视频） |
 | `AGENTS.md` | 多 Agent 协作与开发说明（架构、规范、发布流程） |
-| `gne/` | GNE 新闻抽取核心库 |
+| `gne/` | 新闻抽取核心库（重构版，按字段拆分于 `gne/extractors/`） |
 | `tests/` | 上游自带测试 HTML 样本 |
 
 ---

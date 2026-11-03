@@ -1,6 +1,19 @@
-from .ContentExtractor import ContentExtractor
-from .TitleExtractor import TitleExtractor
-from .TimeExtractor import TimeExtractor
-from .AuthorExtractor import AuthorExtractor
-from .MetaExtractor import MetaExtractor
-from .ListExtractor import ListExtractor
+"""Compatibility shim for the historical gne.extractor package path."""
+
+from ..extractors import (
+    AuthorExtractor,
+    ContentExtractor,
+    ListExtractor,
+    MetaExtractor,
+    TimeExtractor,
+    TitleExtractor,
+)
+
+__all__ = [
+    "AuthorExtractor",
+    "ContentExtractor",
+    "ListExtractor",
+    "MetaExtractor",
+    "TimeExtractor",
+    "TitleExtractor",
+]
