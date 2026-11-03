@@ -469,7 +469,7 @@ curl http://localhost:8000/v1/health
 重构阶段用于对比的 248 用例回归脚本（`gne_regress.py`）与基线结果（`baseline-a45b464.json`）**没有随仓库发布**：它们原本位于维护者本机的 `backups/`（被 `.gitignore` 忽略），当前工作副本中也已不存在。因此新 clone 或换机器后无法直接复现该回归，下面的步骤也不依赖它。需要重建时：
 
 1. 向原维护者索取 `backups/gne_regress.py` 与对应的基线 JSON；
-2. 或按 A/B 方式自建基线：用 `git archive <旧提交> gne | tar -x` 取出旧版 `gne/`，对 `tests/**/*.html` 逐篇调用 `GeneralNewsExtractor().extract()`，记录 `title`、正文（或正文 sha1）、`publish_time`、`author`、`images` 与是否抛异常；
+2. 或按 A/B 方式自建基线：选一个明确的旧提交（重构前最后一个提交是 `a45b464`），用 `mkdir -p /tmp/gne-old && git archive a45b464 gne | tar -x -C /tmp/gne-old` 把旧版 `gne/` 解压到临时目录，避免覆盖当前工作树；然后分别以 `/tmp/gne-old` 和当前项目根目录为 `PYTHONPATH`，对同一批 `tests/**/*.html` 逐篇调用 `GeneralNewsExtractor().extract()`，记录 `title`、正文（或正文 sha1）、`publish_time`、`author`、`images` 与是否抛异常；
 3. 用同一批样本跑新版本，逐文件比对上述字段，任何差异都按回归处理（本轮重构的对照结果是 62/62 完全一致）。
 
 ### 提交前必须执行
