@@ -115,7 +115,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="直接抓取失败时允许回退本机 Chrome 渲染（默认关闭）",
     )
-    parser.add_argument("--dry-run", action="store_true", help="只统计候选数量，不抓取")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="只统计候选数量，不抓取（v3 旧库仍会升级表结构）"
+    )
     return parser
 
 
@@ -132,15 +134,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         # dry-run 不抓取，但 init_db 仍会把 v3 库迁移到 v4 结构，这里提前说明。
-        probe = sqlite3.connect(db_path)
         try:
-            version = int(probe.execute("PRAGMA user_version").fetchone()[0])
-        finally:
-            probe.close()
+            probe = sqlite3.connect(db_path)
+            try:
+                version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+            finally:
+                probe.close()
+        except sqlite3.Error as exc:
+            print(f"无法读取数据库版本：{db_path}（{exc}）", file=sys.stderr)
+            return 2
         if version != SCHEMA_VERSION:
             print(
                 f"注意：dry-run 仍会把库结构从 v{version} 迁移到 v{SCHEMA_VERSION}"
-                "（只改表结构，不改任何正文）。"
+                "（只做库结构升级，含 article_id 回填，不改任何正文）。"
             )
 
     conn = init_db(str(db_path))

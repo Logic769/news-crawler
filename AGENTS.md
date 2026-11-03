@@ -501,7 +501,7 @@ curl http://localhost:8000/v1/health
 ### 提交前必须执行
 
 ```bash
-docker compose run --rm --entrypoint python crawler -m compileall -q news_crawler.py url_extract.py smoke_fixture.py backfill_raw_content.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api
+docker compose run --rm --entrypoint python crawler -m compileall -q news_crawler.py url_extract.py smoke_fixture.py backfill_raw_content.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api gne
 docker compose run --rm crawler smoke
 docker compose run --rm --entrypoint python crawler -X utf8 api_smoke.py
 ```
