@@ -4,7 +4,8 @@ content 列保持 clean_text() 归一化后的单行文本不变，只写 raw_co
 因此对下游检索与展示零影响；重抓失败的行原样保留，可稍后重跑。
 
 失败条目会写入失败清单（默认与 --db 同目录的 backfill_failed.txt，TSV：source / url / error），
-下次可用 --skip-file 传入该清单跳过这些死链，避免它们反复占用 --limit 名额。
+下次可用 --skip-file 传入该清单跳过这些死链，避免它们反复占用 --limit 名额。清单每次覆盖写，
+但会保留本次 --skip-file 读入的条目（标注「上次失败，本次跳过」），因此多次运行不会把死链洗掉。
 容器内数据库在 /app/data，因此默认落盘到 /app/data/backfill_failed.txt（随 ./data 挂载保留）。
 
 宿主机（数据库在 ./data/news.db）：
@@ -89,15 +90,23 @@ def load_skip_list(path: Path) -> set[tuple[str, str]]:
     return skipped
 
 
+def _clean_tsv_field(value: str) -> str:
+    """把任意文本压成单行，避免 TAB / 换行破坏 TSV 的列结构。"""
+    return " ".join(value.replace("\t", " ").splitlines())
+
+
 def _clean_error(error: str) -> str:
     """把异常文本压成单行，避免破坏 TSV 的列结构。"""
-    return " ".join(error.replace("\t", " ").splitlines())
+    return _clean_tsv_field(error)
 
 
 def write_failed_list(path: Path, failures: list[Failure]) -> None:
     """把失败明细写成 TSV，供 --skip-file 复用。"""
     lines = ["# source\turl\terror"]
-    lines.extend(f"{source}\t{url}\t{_clean_error(error)}" for source, url, error in failures)
+    lines.extend(
+        f"{_clean_tsv_field(source)}\t{_clean_tsv_field(url)}\t{_clean_error(error)}"
+        for source, url, error in failures
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -244,8 +253,19 @@ def main(argv: list[str] | None = None) -> int:
         print("dry-run：未抓取，未写入任何正文。")
         return 0
     failed_path = Path(args.failed_list) if args.failed_list else db_path.parent / "backfill_failed.txt"
-    # 每次运行都覆盖写：全部成功时留下只有表头的空清单，避免旧死链清单继续生效。
-    write_failed_list(failed_path, failures)
+    if failed_path.resolve() == db_path.resolve():
+        print("--failed-list 不能指向数据库文件本身", file=sys.stderr)
+        return 2
+    if failed_path.is_dir():
+        print(f"--failed-list 是目录：{failed_path}", file=sys.stderr)
+        return 2
+    # 每次运行覆盖写，但保留本次 --skip-file 中的条目（它们仍是已知死链，只是这次没轮到），
+    # 否则第二次运行会清空清单，第三次又把死链重新抓一遍。
+    known = {(source, url) for source, url, _ in failures}
+    preserved: list[Failure] = [
+        (source, url, "上次失败，本次跳过") for source, url in sorted(skip) if (source, url) not in known
+    ]
+    write_failed_list(failed_path, failures + preserved)
     if failures:
         print(f"失败清单已写入：{failed_path}（下次可用 --skip-file 跳过这些条目）")
     print(f"完成：回填 {updated} 条，失败 {failed} 条，跳过 {skipped} 条。")

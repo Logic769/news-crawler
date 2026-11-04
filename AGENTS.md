@@ -414,7 +414,7 @@ docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content
 ```
 
 - 抓取失败与「UPDATE 未命中」分开统计：后者通常是另一个进程已并发回填或行已被删除，计入「跳过」而不是「失败」；
-- 失败明细默认写入与 `--db` **同目录**的 `backfill_failed.txt`（TSV：source / url / error），容器内即 `/app/data/backfill_failed.txt`，随 `./data` 挂载保留；`--failed-list` 可改路径。每次运行都会覆盖该文件（全部成功时只剩表头），避免旧死链清单继续生效；
+- 失败明细默认写入与 `--db` **同目录**的 `backfill_failed.txt`（TSV：source / url / error），容器内即 `/app/data/backfill_failed.txt`，随 `./data` 挂载保留；`--failed-list` 可改路径（不能指向数据库文件或目录，否则返回 2）。每次运行都会覆盖该文件，但会保留本次 `--skip-file` 清单中的条目（第三列写「上次失败，本次跳过」），避免把仍然有效的死链记录洗掉；清单为空且全部成功时只剩表头；
 - `--skip-file` 读取该清单并把对应 `(source, url)` 从候选中排除；清单不存在时报错退出（返回 2），避免拼错路径后静默失效。
 
 脚本的 `--db` 默认值取自 `news_crawler.DEFAULT_DB_FILE`（相对路径 `news.db`），容器内必须显式传 `/app/data/news.db`，否则会指向 `/app/news.db`。

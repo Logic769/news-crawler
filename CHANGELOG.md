@@ -12,7 +12,7 @@
 2. `extract_article` 不再向 stdout 打印进度：15 处 `print` 改为标准库日志（`url_extract` logger），作为库被 API 调用时不再污染宿主进程输出；命令行入口保留 `print` 并配置了 `logging.basicConfig`
 3. `ArticleOut` 补上 `raw_content` 字段：此前 db 层已把换行正文塞进响应字典，但响应模型没有该字段，Pydantic 默认 `extra=ignore` 把它静默丢弃，导致详情接口拿不到换行正文
 4. 抓取的 `ok` 分支补写 `raw_content`：此前只有 `unknown_date` 分支传了该字段，绝大多数正常入库的文章 `raw_content` 恒为 NULL
-5. `backfill_raw_content.py` 的失败语义拆分：抓取失败与「UPDATE 未命中」（并发回填/行已删除）分别计入失败与跳过；失败清单默认写到与 `--db` 同目录的 `backfill_failed.txt`（容器内即 `/app/data/backfill_failed.txt`，随 `./data` 挂载保留，不再随 `--rm` 容器丢失），每次运行覆盖写（全部成功时只剩表头），读取兼容 UTF-8 BOM，错误列压成单行以免破坏 TSV；`--skip-file` 可在下次运行中排除这些死链，避免反复占用 `--limit` 名额
+5. `backfill_raw_content.py` 的失败语义拆分：抓取失败与「UPDATE 未命中」（并发回填/行已删除）分别计入失败与跳过；失败清单默认写到与 `--db` 同目录的 `backfill_failed.txt`（容器内即 `/app/data/backfill_failed.txt`，随 `./data` 挂载保留，不再随 `--rm` 容器丢失），每次运行覆盖写但保留本次 `--skip-file` 中的条目（标注「上次失败，本次跳过」），避免死链被洗掉后重新参与抓取；读取兼容 UTF-8 BOM，各列压成单行以免破坏 TSV，`--failed-list` 禁止指向数据库文件或目录；`--skip-file` 可在下次运行中排除这些死链，避免反复占用 `--limit` 名额
 
 ### CI
 
