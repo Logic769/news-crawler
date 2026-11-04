@@ -132,13 +132,16 @@ jobs:
         run: |
           cp sources.json sources.local.json
           mkdir -p data
+          # compose 里的镜像名是 news-crawler:local，而上面只构建了 news-crawler:ci。
+          # 先打标签，否则 compose run 会因为找不到本地镜像而触发一次隐式全量构建
+          # （默认 INSTALL_BROWSER=1，会白装一遍 Chromium）。
+          docker tag news-crawler:ci news-crawler:local
 
       - name: Compose smoke
         run: docker compose run --rm --no-deps crawler smoke
 
       - name: Compose API smoke
         run: |
-          docker tag news-crawler:ci news-crawler:local
           docker compose up -d --no-build api
           for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8000/v1/health | grep '"database":"ok"' >/dev/null; then
@@ -175,9 +178,10 @@ jobs:
     # 单个页面失效会由池子里的替补页面补上，但最终数量不足即失败。
     #
     # 但它依赖外部站点，PR 上失败通常是站点改版/反爬而非本次改动导致，
-    # 会把无关 PR 卡住。因此 PR 只跑离线回归（python-checks 里的 unittest），
-    # 真实网络验证放到 push master、夜间定时与手动触发。
-    if: github.event_name != 'pull_request'
+    # 会把无关 PR 卡住。因此 PR 只跑离线回归（python-checks 里的 unittest）。
+    # 夜间定时与手动触发已由 docker-build-full 在镜像内跑同一组 10/10/10，
+    # 宿主机这里只在 push 时跑，避免同一批页面夜间被抓两遍（约 45 分钟浪费）。
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

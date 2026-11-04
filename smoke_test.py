@@ -6,6 +6,7 @@ extract from a bundled sample page, and SQLite can be initialized.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -169,9 +170,16 @@ def main() -> None:
                     "WHERE type='index' AND tbl_name='articles'"
                 )
             }
-            required = {"idx_articles_status_published", "idx_articles_source_cover"}
+            required = {
+                "idx_articles_status_published",
+                "idx_articles_source_cover",
+                "idx_articles_status_updated",
+            }
             if not required <= indexes:
                 raise AssertionError(f"missing performance indexes: {required - indexes}")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(articles)")}
+            if "content_length" not in columns:
+                raise AssertionError(f"missing content_length column: {columns}")
         finally:
             conn.close()
 
@@ -208,7 +216,37 @@ def main() -> None:
         try:
             legacy.execute("DROP INDEX IF EXISTS idx_articles_status_published")
             legacy.execute("DROP INDEX IF EXISTS idx_articles_source_cover")
-            legacy.execute("ALTER TABLE articles DROP COLUMN raw_content")
+            # 不能用 ALTER TABLE ... DROP COLUMN 造老库：它要求 SQLite >= 3.35，
+            # 而项目只声明 Python >= 3.10。改为重建一张 v2 结构的表并搬数据，
+            # 在所有支持的 SQLite 版本上都能跑。
+            legacy.executescript(
+                """
+                ALTER TABLE articles RENAME TO articles_v4;
+                CREATE TABLE articles (
+                    source        TEXT NOT NULL,
+                    url           TEXT NOT NULL,
+                    list_title    TEXT,
+                    title         TEXT,
+                    publish_time  TEXT,
+                    author        TEXT,
+                    content       TEXT,
+                    images        TEXT,
+                    status        TEXT NOT NULL,
+                    error         TEXT,
+                    first_seen_at TEXT,
+                    updated_at    TEXT,
+                    PRIMARY KEY (source, url)
+                );
+                INSERT INTO articles (
+                    source, url, list_title, title, publish_time, author,
+                    content, images, status, error, first_seen_at, updated_at
+                )
+                SELECT source, url, list_title, title, publish_time, author,
+                       content, images, status, error, first_seen_at, updated_at
+                FROM articles_v4;
+                DROP TABLE articles_v4;
+                """
+            )
             legacy.execute("PRAGMA user_version = 2")
             legacy.commit()
         finally:
@@ -222,11 +260,19 @@ def main() -> None:
                     "WHERE type='index' AND tbl_name='articles'"
                 )
             }
-            if not {"idx_articles_status_published", "idx_articles_source_cover"} <= upgraded:
-                raise AssertionError(f"v2 -> v3 upgrade missed indexes: {upgraded}")
+            required_upgraded = {
+                "idx_articles_status_published",
+                "idx_articles_source_cover",
+                "idx_articles_status_updated",
+            }
+            if not required_upgraded <= upgraded:
+                raise AssertionError(f"v2 -> v5 upgrade missed indexes: {upgraded}")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(articles)")}
-            if "raw_content" not in columns:
-                raise AssertionError(f"v2 -> v4 upgrade missed raw_content: {columns}")
+            for required_column in ("raw_content", "content_length"):
+                if required_column not in columns:
+                    raise AssertionError(
+                        f"v2 -> v5 upgrade missed {required_column}: {columns}"
+                    )
             current = int(conn.execute("PRAGMA user_version").fetchone()[0])
             if current != SCHEMA_VERSION:
                 raise AssertionError(
@@ -249,16 +295,28 @@ def main() -> None:
                 timezone="Asia/Shanghai",
                 content="第一段 第二段",
                 raw_content="第一段\n第二段",
+                images=["https://example.com/a.jpg"],
                 status="ok",
             )
             stored = conn.execute(
-                "SELECT content, raw_content FROM articles WHERE url = ?",
+                "SELECT content, raw_content, images FROM articles WHERE url = ?",
                 (smoke_url,),
             ).fetchone()
             if stored is None or stored[1] != "第一段\n第二段":
                 raise AssertionError(f"raw_content not stored: {stored}")
             if stored[0] != "第一段 第二段":
                 raise AssertionError(f"content should stay single-line: {stored[0]!r}")
+            if json.loads(stored[2]) != ["https://example.com/a.jpg"]:
+                raise AssertionError(f"images not stored: {stored[2]!r}")
+
+            # images=[] 表示“明确无图”，必须能清空旧图片；省略 images 才保留。
+            save_article(conn, "smoke", smoke_url, images=[], status="ok")
+            cleared = conn.execute(
+                "SELECT images FROM articles WHERE url = ?", (smoke_url,)
+            ).fetchone()
+            if cleared is None or json.loads(cleared[0]) != []:
+                raise AssertionError(f"images not cleared by []: {cleared}")
+
             save_article(
                 conn,
                 "smoke",
@@ -267,11 +325,13 @@ def main() -> None:
                 error="模拟抓取失败",
             )
             kept = conn.execute(
-                "SELECT raw_content FROM articles WHERE url = ?",
+                "SELECT raw_content, images FROM articles WHERE url = ?",
                 (smoke_url,),
             ).fetchone()
             if kept is None or kept[0] != "第一段\n第二段":
                 raise AssertionError(f"raw_content lost on partial update: {kept}")
+            if json.loads(kept[1]) != []:
+                raise AssertionError(f"images changed when omitted: {kept[1]!r}")
         finally:
             conn.close()
 

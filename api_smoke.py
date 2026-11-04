@@ -45,7 +45,13 @@ class _ArticleHandler(BaseHTTPRequestHandler):
         return
 
 
-def _request(base: str, method: str, path: str, payload: dict | None = None, key: str | None = API_KEY) -> tuple[int, dict]:
+def _request(
+    base: str,
+    method: str,
+    path: str,
+    payload: dict | None = None,
+    key: str | None = API_KEY,
+) -> tuple[int, dict]:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(base + path, data=data, method=method)
     if data is not None:
@@ -61,6 +67,24 @@ def _request(base: str, method: str, path: str, payload: dict | None = None, key
             return exc.code, json.loads(raw)
         except json.JSONDecodeError:
             return exc.code, {"raw": raw}
+
+
+def _request_headers(
+    base: str, path: str, origin: str, key: str | None = API_KEY
+) -> tuple[int, dict[str, str]]:
+    req = urllib.request.Request(base + path, method="GET")
+    req.add_header("Origin", origin)
+    if key:
+        req.add_header("X-API-Key", key)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            return response.status, {
+                key.lower(): value for key, value in response.headers.items()
+            }
+    except urllib.error.HTTPError as exc:
+        return exc.code, {
+            key.lower(): value for key, value in exc.headers.items()
+        }
 
 
 def _serve(app) -> tuple[uvicorn.Server, threading.Thread, str]:
@@ -102,12 +126,26 @@ def _wait_job(base: str, job_id: str, deadline: float) -> dict:
 
 
 def main() -> None:
-    try:
-        ensure_url_allowed("http://127.0.0.1/")
-    except UnsafeUrlError:
-        pass
-    else:
-        raise AssertionError("私网 URL 未被拒绝")
+    # SSRF 校验不能只覆盖 127.0.0.1：回环、私网、链路本地（云元数据）、
+    # IPv6 回环、userinfo 与控制字符都要拒绝。
+    blocked_urls = [
+        "http://127.0.0.1/",
+        "http://127.0.0.2/",
+        "http://10.0.0.5/",
+        "http://192.168.1.1/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]/",
+        "http://localhost/",
+        "http://user:pass@example.com/",
+        "http://example.com/a\x00b",
+        "ftp://example.com/file",
+    ]
+    for blocked_url in blocked_urls:
+        try:
+            ensure_url_allowed(blocked_url)
+        except UnsafeUrlError:
+            continue
+        raise AssertionError(f"不安全 URL 未被拒绝: {blocked_url}")
     ensure_url_allowed("http://127.0.0.1/", allow_private=True)
     # 镜像内没有 tests/，与 smoke_test.py 一样回退到内置样本；
     # 内置页故意带一张 // 开头的图片，用来验证图片地址补全。
@@ -159,6 +197,7 @@ def main() -> None:
             api_key=API_KEY,
             job_workers=1,
             timezone="Asia/Shanghai",
+            cors_origins=("https://client.example",),
             allow_private_urls=True,
         )
         app = create_app(settings)
@@ -188,6 +227,20 @@ def main() -> None:
             )
             assert status == 200 and no_match["meta"]["total"] == 0, no_match
 
+            # 单字中文与空 q 都是合法查询：空 q 不过滤，单字可模糊搜索。
+            status, single_char = _request(
+                base, "GET", "/v1/articles?q=" + urllib.parse.quote("测")
+            )
+            assert status == 200 and single_char["meta"]["total"] == 1, single_char
+            status, empty_q = _request(base, "GET", "/v1/articles?q=")
+            assert status == 200 and empty_q["meta"]["total"] == 1, empty_q
+
+            # page 上限不能拒绝有效输入：超大页码返回空页而不是 422。
+            status, high_page = _request(
+                base, "GET", "/v1/articles?page=10001&page_size=1"
+            )
+            assert status == 200 and high_page["data"] == [], high_page
+
             status, detail = _request(base, "GET", f"/v1/articles/{article_id}")
             assert status == 200 and detail["content"], detail
             # raw_content 保留段落换行，只在详情返回。seed 行的 content 是人工写入的
@@ -213,22 +266,52 @@ def main() -> None:
             assert stats_body["generated_at"].endswith("+08:00"), stats_body
 
             status, underscore = _request(
-                base, "GET", "/v1/articles?q=" + urllib.parse.quote("_")
+                base, "GET", "/v1/articles?q=" + urllib.parse.quote("__")
             )
             assert status == 200 and underscore["meta"]["total"] == 0, underscore
 
             import news_api.app as app_module
 
-            original_count = app_module.count_articles
-            app_module.count_articles = lambda *_a, **_k: (_ for _ in ()).throw(
+            original_ping = app_module.ping_database
+            app_module.ping_database = lambda *_a, **_k: (_ for _ in ()).throw(
                 RuntimeError("db down")
             )
             try:
                 status, degraded = _request(base, "GET", "/v1/health", key=None)
             finally:
-                app_module.count_articles = original_count
+                app_module.ping_database = original_ping
             assert status == 503, (status, degraded)
             assert degraded["error"]["code"] == "database_unavailable", degraded
+
+            # 未捕获异常必须返回统一的 JSON 500，而不是纯文本。
+            original_stats = app_module.stats
+            app_module.stats = lambda *_a, **_k: (_ for _ in ()).throw(
+                RuntimeError("boom")
+            )
+            try:
+                status, failed = _request(base, "GET", "/v1/stats")
+            finally:
+                app_module.stats = original_stats
+            assert status == 500, (status, failed)
+            assert failed["error"]["code"] == "internal_error", failed
+
+            # 500 由最外层 ServerErrorMiddleware 产生，也必须带 CORS 头，
+            # 否则白名单内的跨域客户端读不到错误体。
+            original_stats = app_module.stats
+            app_module.stats = lambda *_a, **_k: (_ for _ in ()).throw(
+                RuntimeError("boom")
+            )
+            try:
+                cors_status, cors_headers = _request_headers(
+                    base, "/v1/stats", "https://client.example"
+                )
+            finally:
+                app_module.stats = original_stats
+            assert cors_status == 500, cors_status
+            assert (
+                cors_headers.get("access-control-allow-origin")
+                == "https://client.example"
+            ), cors_headers
 
             strict_settings = Settings(
                 db_path=db_path,

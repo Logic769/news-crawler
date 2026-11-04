@@ -7,7 +7,7 @@ from collections import deque
 
 from lxml.html import HtmlElement
 
-from ..html import html2element
+from ..html import BR_SENTINEL, html2element
 from ..text import normalize_text
 
 LOG = logging.getLogger(__name__)
@@ -49,7 +49,9 @@ class ListExtractor:
             item_list = parent.xpath(path)
             if len(item_list) > 3:
                 for item in item_list:
-                    item_info = {"title": "".join(item.xpath("text()"))}
+                    item_info = {
+                        "title": "".join(item.xpath("text()")).replace(BR_SENTINEL, "")
+                    }
                     if is_a_tag:
                         item_info["url"] = "".join(item.xpath("@href"))
                     result.append(item_info)

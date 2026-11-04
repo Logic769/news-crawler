@@ -61,7 +61,13 @@ def find_candidates(
     if source:
         sql += " AND source = ?"
         params.append(source)
-    sql += " ORDER BY publish_time DESC, source, url"
+    # 空 publish_time（unknown_date 行）在 DESC 排序里永远排最后，较小的
+    # --limit 每次都只取到有日期的行，unknown_date 反而永远轮不到。把无日期
+    # 的候选提到最前面（它们本来就缺日期，先回填更合理），其余仍按发布时间倒序。
+    sql += (
+        " ORDER BY CASE WHEN publish_time IS NULL OR publish_time = '' "
+        "THEN 0 ELSE 1 END, publish_time DESC, source, url"
+    )
     # skip 为空时把 LIMIT 下推到 SQL：让 SQLite 只做 top-N，避免为排序扫描全表；
     # skip 非空时不能下推（被排除的行会占用名额），改用游标逐行过滤，凑够 limit 立即停止，
     # 避免把全部候选行一次性读进内存。

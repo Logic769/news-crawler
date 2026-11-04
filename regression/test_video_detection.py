@@ -1,7 +1,7 @@
 """视频页判定回归：锁定 url_extract.is_video_page 的 URL 与 HTML 信号。
 
 基线里的 is_video 只覆盖 HTML 侧（og:type / JSON-LD），本文件额外锁定
-路径规则与「文章内嵌相关视频不算视频页」这一容易误判的边界。
+路径规则须有页面内证据、以及「文章内嵌相关视频不算视频页」这一易误判边界。
 """
 
 from __future__ import annotations
@@ -13,6 +13,8 @@ from url_extract import is_video_page
 
 class VideoPageDetectionTest(unittest.TestCase):
     def test_video_path_patterns(self) -> None:
+        # 路径只是提示：必须有 <video> 这类页面内证据才判为视频页。
+        html = "<html><body><video controls></video></body></html>"
         for url in (
             "https://example.com/shipin/2026/11-01/news1.html",
             "https://example.com/video/abc.html",
@@ -20,7 +22,12 @@ class VideoPageDetectionTest(unittest.TestCase):
             "https://example.com/videos/abc.html",
         ):
             with self.subTest(url=url):
-                self.assertTrue(is_video_page(url, ""))
+                self.assertTrue(is_video_page(url, html))
+
+    def test_video_path_without_evidence(self) -> None:
+        # 仅路径命中 /video/、正文却是图文稿：不应判成视频页。
+        html = "<html><body><p>视频频道里的一篇图文报道</p></body></html>"
+        self.assertFalse(is_video_page("https://example.com/video/abc.html", html))
 
     def test_og_type_video(self) -> None:
         html = '<html><head><meta property="og:type" content="video.other"></head></html>'
@@ -42,6 +49,15 @@ class VideoPageDetectionTest(unittest.TestCase):
             "</script></head></html>"
         )
         self.assertFalse(is_video_page("https://example.com/a.html", html))
+
+    def test_video_path_with_newsarticle_main_entity_is_not_video(self) -> None:
+        # 路径命中 /video/ 但主实体是 NewsArticle，页面内嵌 <video> 也不算视频页。
+        html = (
+            '<html><head><script type="application/ld+json">'
+            '{"@type": "NewsArticle", "name": "x"}'
+            "</script></head><body><video controls></video></body></html>"
+        )
+        self.assertFalse(is_video_page("https://example.com/video/abc.html", html))
 
     def test_plain_article(self) -> None:
         html = "<html><body><p>普通文章</p></body></html>"

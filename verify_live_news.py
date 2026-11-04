@@ -39,34 +39,67 @@ class ContentAssertion(AssertionError):
 
 
 # 内置兜底池：仅在 live_news_pool.json 缺失或某类为空时使用。
+# 每类至少 10 条、尽量覆盖不同来源站点，保证默认目标（10/10/10）在池文件
+# 缺失时仍可运行；否则 run_category 会因 count>len(pool) 直接退出。
 STATIC_POOL = (
-    "https://www.chinanews.com.cn/gn/2026/10-30/10723204.shtml",
-    "https://www.chinanews.com.cn/ty/2026/10-30/10723200.shtml",
-    "https://news.sina.com.cn/c/2026-10-30/doc-iniwxzqi4867819.shtml",
-    "https://news.sina.com.cn/gov/xlxw/2026-10-30/doc-iniwyfwc8363041.shtml",
-    "https://sports.sina.com.cn/l/2026-10-30/doc-iniwyncy2327952.shtml",
-    "https://www.chinanews.com.cn/cj/2026/10-30/10723232.shtml",
-    "https://www.chinanews.com.cn/sh/2026/10-30/10723221.shtml",
-    "https://www.chinanews.com.cn/gn/2026/10-30/10723215.shtml",
+    "https://theory.southcn.com/node_93e45a46ed/c22d7980cd.shtml",
+    "https://news.cri.cn/20261029/b4e3b263-f485-4a6e-903d-8e07498ea4ae.html",
+    "https://news.dahe.cn/2026/10-30/2146949.html",
+    "https://news.youth.cn/gn/202610/t20261030_16940410.htm",
+    "https://www.163.com/data/article/LAGN922R000181IU.html",
+    "https://www.sohu.com/a/1094741833_121333745",
+    "https://news.ifeng.com/c/8xeUGvcPuay",
+    "https://news.southcn.com/node_47a8059d6c/a7e1c0a6d8.shtml",
+    "https://www.thepaper.cn/newsDetail_forward_34370855",
+    "https://news.iqilu.com/china/gedi/2026/1030/5957425.shtml",
+    # 替补：池文件缺失时，任一页面失效仍有足够页面补抽。
+    "https://news.dahe.cn/2026/10-30/2146973.html",
+    "https://news.dahe.cn/2026/10-30/2146980.html",
+    "https://news.youth.cn/sz/202610/t20261030_16941540.htm",
 )
 
 DYNAMIC_POOL = (
-    "https://news.cctv.com/2026/10/30/ARTIBWOGaadLbdChpDPhblyt261030.shtml",
-    "https://news.cctv.com/2026/10/30/ARTIe0N25T5q8Q8jogffSnOc261029.shtml",
+    "https://news.dahe.cn/2026/10-30/2146949.html",
+    "https://politics.gmw.cn/2026-10/30/content_39076960.htm",
+    "http://v.china.com.cn/2026-10/16/content_118737632.html",
+    "https://news.jschina.com.cn/yw/202610/t20261030_s6ae4996de4b08f4f4fbdd096.shtml",
+    "https://news.cctv.com/2026/10/30/ARTIqDabPYgGEgNv1RkGFGzy261029.shtml",
+    "https://www.sz.gov.cn/cn/xxgk/zfxxgj/zwdt/content/post_13046708.html",
+    "https://xapp.southcn.com/app/activity.html?id=44150",
+    "https://nw.eastday.com/self/yw/20261030/bbf4e3e5c52d4bbead83903015d09fb5.html",
+    "https://zjnews.zjol.com.cn/yc/qmt/202610/t20261030_31999544.shtml",
+    # 替补：确保默认 10 页目标之外仍有可替换的健康页面；均为实测需渲染的动态页。
+    "https://news.jschina.com.cn/yw/202610/t20261030_s6ae499c5e4b09a8e24351824.shtml",
+    "https://nw.eastday.com/zq/zh/20261030/12f7b5f4b6c457f779f1c95c20fa419d.html",
+    "https://nw.eastday.com/self/yw/20261030/8f8ceccb47d64c2a8ea05967f73b721f.html",
     "https://news.cctv.com/2026/10/30/ARTIZpZEh3a2ocOsZYX3GKsb261029.shtml",
 )
 
 VIDEO_POOL = (
-    "https://www.chinanews.com.cn/sh/shipin/2026/10-30/news1073348.shtml",
-    "https://www.chinanews.com.cn/sh/shipin/2026/10-30/news1073347.shtml",
-    "https://www.chinanews.com.cn/sh/shipin/cns/2026/10-30/news1073350.shtml",
-    "https://www.chinanews.com.cn/cj/shipin/2026/10-30/news1073346.shtml",
+    "http://www.news.cn/video/20261022/3445a3e5c0e64a3e829899c9d72d4867/c.html",
+    "https://www.kankanews.com/detail/M8Q807kp8QL",
+    "https://k.sina.com.cn/article_1887790981_m7085678503301e71w.html?from=news",
+    "https://www.yntv.cn/video/20261030/1793369472827831.html",
+    "https://www.thepaper.cn/newsDetail_forward_34369814",
+    "https://www.163.com/v/video/VG9UI7R4F.html",
+    "https://www.northnews.cn/video/2026/1103/2531840.html",
+    "http://www.ahwang.cn/video/2026/1103/3072063.html",
+    "https://www.chinanews.com.cn/sh/shipin/cns/2026/11-03/news1073659.shtml",
+    "http://www.cnwest.com/shipin/a/2025/12/09/23253101.html",
+    # 替补：视频页失效时仍能补足默认 10 页目标。
+    "https://www.kankanews.com/detail/7Y2zDo315Qo",
+    "http://www.news.cn/video/20261022/906f6edca3284901ae914ac4a6a1ed06/c.html",
+    "https://www.yntv.cn/video/20261030/1793369809827832.html",
 )
 
 
 def load_pool() -> dict[str, tuple[str, ...]]:
     """优先读取 live_news_pool.json，缺失时回退内置池。"""
-    pools = {"static": STATIC_POOL, "dynamic": DYNAMIC_POOL, "video": VIDEO_POOL}
+    pools: dict[str, tuple[str, ...]] = {
+        "static": STATIC_POOL,
+        "dynamic": DYNAMIC_POOL,
+        "video": VIDEO_POOL,
+    }
     if not POOL_FILE.is_file():
         print(f"[INFO] 未找到 {POOL_FILE.name}，使用内置池")
         return pools
@@ -214,10 +247,14 @@ def run_category(
     """随机抽取 count 个页面并逐个校验；失败时从剩余池补抽。"""
     if count < 0:
         raise SystemExit(f"{category} count must be non-negative")
+    if not pool:
+        raise SystemExit(f"{category}: 页面池为空，无法验证；请补充 live_news_pool.json")
     if count > len(pool):
+        # 池不足时必须失败：静默把 10/10/10 降到更少会让 CI 的硬性门槛
+        # 被悄悄放宽。内置兜底池每类已保证 >=10 条，正常情况下不会触发。
         raise SystemExit(
-            f"{category} count {count} exceeds pool size {len(pool)}; "
-            "add more URLs to the pool first"
+            f"{category}: 目标 {count} 页超过可用池 {len(pool)}，"
+            "请补充 live_news_pool.json 或降低 --static/--dynamic/--video"
         )
     queue = list(pool)
     rng.shuffle(queue)

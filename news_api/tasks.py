@@ -13,7 +13,7 @@ import url_extract
 from gne import GeneralNewsExtractor
 from news_api.netguard import ensure_url_allowed
 from news_api.settings import Settings
-from url_extract import close_thread_browser, normalize_images
+from url_extract import close_thread_browser, normalize_images_for_update
 
 LOG = logging.getLogger("news_api.tasks")
 
@@ -24,6 +24,21 @@ def execute_job(job_type: str, payload: dict[str, Any], settings: Settings) -> d
     if job_type == "extract":
         return execute_extract(payload, settings)
     raise ValueError(f"未知任务类型: {job_type}")
+
+
+def _configured_source_names(settings: Settings) -> set[str]:
+    """已配置的站点名集合；配置损坏时返回空集（宁可拒绝自定义 source）。"""
+    try:
+        config = news_crawler.load_config(
+            news_crawler.resolve_config_path(settings.config_path)
+        )
+    except Exception:
+        return set()
+    return {
+        str(item.get("name")).strip()
+        for item in config.get("sources", [])
+        if str(item.get("name") or "").strip()
+    }
 
 
 def _init_db(settings: Settings) -> None:
@@ -104,7 +119,19 @@ def execute_crawl(payload: dict[str, Any], settings: Settings) -> dict[str, Any]
 
 def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, Any]:
     url = str(payload["url"])
-    source = str(payload.get("source") or "on_demand")
+    requested_source = str(payload.get("source") or "").strip()
+    if requested_source:
+        # 只允许写入真实存在的站点，否则任意调用方都能把任意 URL 记成别的
+        # 站点，污染 /v1/sources 与 /v1/stats 的统计。
+        allowed = _configured_source_names(settings)
+        if requested_source not in allowed:
+            raise ValueError(
+                f"source={requested_source!r} 不是已配置的站点；"
+                f"留空表示 on_demand。已配置：{sorted(allowed)}"
+            )
+        source = requested_source
+    else:
+        source = "on_demand"
     ensure_url_allowed(url, allow_private=settings.allow_private_urls)
     validator = (
         None
@@ -135,7 +162,9 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
         publish_text = news_crawler.clean_text(result.get("publish_time"))
         publish_dt = news_crawler.parse_datetime(publish_text, None, settings.timezone)
         if publish_dt is not None:
-            publish_text = publish_dt.strftime("%Y-%m-%d %H:%M:%S")
+            publish_text = news_crawler.format_publish_time(
+                publish_dt, settings.timezone
+            )
         status = "ok" if publish_dt is not None else "unknown_date"
         error = "" if publish_dt is not None else "无法解析发布日期"
         article_id = news_crawler.save_article(
@@ -148,7 +177,7 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             author=news_crawler.clean_text(result.get("author")),
             content=news_crawler.clean_text(raw_content),
             raw_content=raw_content,
-            images=normalize_images(result.get("images"), url),
+            images=normalize_images_for_update(result.get("images"), url),
             status=status,
             error=error,
         )

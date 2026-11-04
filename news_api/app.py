@@ -5,6 +5,8 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import secrets
+import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,7 @@ from news_api.db import (
     get_article,
     list_sources,
     load_timezones,
+    ping_database,
     query_articles,
     stats,
 )
@@ -43,6 +46,28 @@ from news_api.settings import Settings
 from news_api.timeutil import normalize_db_bound, resolve_timezone
 
 LOG = logging.getLogger("news_api")
+
+# health 的 COUNT(*) 缓存需要锁：多个请求同时发现缓存过期时，只允许一个真正
+# 执行全表计数，其余复用刚写回的结果。
+_HEALTH_COUNT_LOCK = threading.Lock()
+
+
+def _cors_headers_for(request: Request) -> dict[str, str] | None:
+    """Return CORS headers for responses produced outside CORSMiddleware.
+
+    Starlette calls the generic Exception handler from ServerErrorMiddleware,
+    which sits outside user middleware, so a 500 response would otherwise miss
+    the CORS headers that normal responses get. Keep the same origin allow-list.
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return None
+    allowed = request.app.state.settings.cors_origins
+    if "*" in allowed:
+        return {"Access-Control-Allow-Origin": "*"}
+    if origin in allowed:
+        return {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+    return None
 
 
 def require_api_key(request: Request) -> None:
@@ -149,6 +174,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers=getattr(exc, "headers", None),
         )
 
+    @app.exception_handler(Exception)
+    async def _unhandled_error(request: Request, exc: Exception) -> JSONResponse:
+        # 兜底：未捕获异常也必须返回统一的 JSON 错误体，而不是 Starlette
+        # 默认的纯文本 "Internal Server Error"（下游无法按 code 处理）。
+        LOG.exception("未处理异常: %s %s", request.method, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": "internal_error",
+                    "status": 500,
+                    "message": "服务器内部错误",
+                }
+            },
+            headers=_cors_headers_for(request),
+        )
+
     @app.exception_handler(RequestValidationError)
     async def _validation_error(
         _request: Request, exc: RequestValidationError
@@ -180,9 +222,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/health", response_model=HealthOut)
     def health(request: Request) -> Any:
         runtime: Settings = request.app.state.settings
+        state = request.app.state
         try:
-            total = count_articles(runtime.db_path)
+            # 先做 O(1) 的存活探测：数据库不可用时立刻 503，不受计数缓存影响。
+            ping_database(runtime.db_path)
             database = "ok"
+            # COUNT(*) 是全表扫描，健康检查又无需鉴权，任何客户端都能靠高频
+            # 轮询把数据库打满。这里只缓存计数结果 30s，存活状态仍然每次实测。
+            cached = getattr(state, "health_count_cache", None)
+            now = time.monotonic()
+            if cached is None or now - cached[0] >= 30:
+                with _HEALTH_COUNT_LOCK:
+                    # 锁内二次检查：并发请求同时看到过期时，只让第一个计数。
+                    cached = getattr(state, "health_count_cache", None)
+                    now = time.monotonic()
+                    if cached is None or now - cached[0] >= 30:
+                        total = count_articles(runtime.db_path)
+                        state.health_count_cache = (now, total)
+                    else:
+                        total = cached[1]
+            else:
+                total = cached[1]
         except Exception as exc:  # noqa: BLE001 - health reports degradation
             LOG.warning("健康检查读取数据库失败: %s", exc)
             total = 0

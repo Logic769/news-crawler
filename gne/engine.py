@@ -13,15 +13,19 @@ from .extractors import (
     TimeExtractor,
     TitleExtractor,
 )
-from .html import fix_html, html2element, pre_parse, remove_noise_node
+from .html import BR_SENTINEL, fix_html, html2element, pre_parse, remove_noise_node
 from .text import normalize_text
 
 
 class GeneralNewsExtractor:
-    """Extract title, author, publish time, body text and images from HTML."""
+    """Extract title, author, publish time, body text and images from HTML.
+
+    extract() 不依赖实例级可变状态：每次调用都新建 ContentExtractor（正文密度
+    算法内部有 node_info/element_text_cache 两个可变缓存），因此同一个
+    GeneralNewsExtractor 实例可以跨线程复用。
+    """
 
     def __init__(self) -> None:
-        self._content_extractor = ContentExtractor()
         self._title_extractor = TitleExtractor()
         self._time_extractor = TimeExtractor()
         self._author_extractor = AuthorExtractor()
@@ -52,14 +56,20 @@ class GeneralNewsExtractor:
         element = html2element(normal_html)
 
         meta_content = self._meta_extractor.extract(element)
-        title = self._title_extractor.extract(element, title_xpath=title_xpath)
-        publish_time = self._time_extractor.extract(element, publish_time_xpath=publish_time_xpath)
-        author = self._author_extractor.extract(element, author_xpath=author_xpath)
+        title = self._title_extractor.extract(
+            element, title_xpath=title_xpath
+        ).replace(BR_SENTINEL, "\n").strip()
+        publish_time = self._time_extractor.extract(
+            element, publish_time_xpath=publish_time_xpath
+        ).replace(BR_SENTINEL, "\n").strip()
+        author = self._author_extractor.extract(
+            element, author_xpath=author_xpath
+        ).replace(BR_SENTINEL, "\n").strip()
 
         remove_noise_node(element, noise_node_list)
         element = pre_parse(element)
 
-        content = self._content_extractor.extract(
+        content = ContentExtractor().extract(
             element,
             host=host,
             with_body_html=with_body_html,

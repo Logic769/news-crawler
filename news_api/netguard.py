@@ -43,12 +43,21 @@ def _host_is_public(host: str) -> bool:
 def ensure_url_allowed(url: str, *, allow_private: bool = False) -> None:
     """Validate an extract URL; reject loopback/private/link-local/reserved hosts.
 
-    DNS is checked once before fetching. Redirects are still followed by urllib,
-    so this is a hardening measure, not a replacement for API-key access control.
+    这里只做「请求前」的快速拒绝。真正的 DNS rebinding 防护在
+    url_extract._validated_create_connection 里：每次连接都以「解析出的真实 IP」
+    再过一遍本函数（IP 字面量 URL），解析与连接之间不留重新解析的窗口。
+    该函数是加固手段，不能替代 API Key 访问控制。
     """
-    parts = urlsplit(url)
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
+        raise UnsafeUrlError("URL 不允许包含控制字符")
+    try:
+        parts = urlsplit(url)
+    except ValueError as exc:
+        raise UnsafeUrlError(f"URL 格式不合法: {exc}") from exc
     if parts.scheme not in {"http", "https"}:
         raise UnsafeUrlError("只允许 http:// 或 https:// 地址")
+    if parts.username is not None or parts.password is not None:
+        raise UnsafeUrlError("URL 不允许包含用户信息(user:pass@)")
     host = parts.hostname
     if not host:
         raise UnsafeUrlError("URL 缺少主机名")

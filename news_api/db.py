@@ -17,7 +17,12 @@ from news_api.timeutil import (
     resolve_timezone,
     utc_iso_or_none,
 )
-from news_crawler import article_id_for, load_config, resolve_config_path
+from news_crawler import (
+    DB_BUSY_TIMEOUT_MS,
+    article_id_for,
+    load_config,
+    resolve_config_path,
+)
 from url_extract import normalize_images
 
 
@@ -29,11 +34,13 @@ def connect(db_path: str, *, read_only: bool = True) -> sqlite3.Connection:
         # Windows 盘符路径的反斜杠会被当成转义序列，统一转成 POSIX 形式再编码。
         posix_path = Path(db_path).as_posix()
         target = f"file:{quote(posix_path, safe='/:')}?mode=ro"
-        conn = sqlite3.connect(target, timeout=30, uri=True)
+        conn = sqlite3.connect(
+            target, timeout=DB_BUSY_TIMEOUT_MS / 1000, uri=True
+        )
     else:
-        conn = sqlite3.connect(db_path, timeout=30)
+        conn = sqlite3.connect(db_path, timeout=DB_BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     return conn
 
 
@@ -99,9 +106,8 @@ def row_to_article(
     stored_tz = str(row["timezone"] or "").strip() if "timezone" in keys else ""
     tz_name = stored_tz or _source_timezone(source, timezones, default_tz)
     content = (row["content"] or "") if "content" in keys else ""
-    content_length = (
-        int(row["content_length"] or 0) if "content_length" in keys else len(content)
-    )
+    stored_length = row["content_length"] if "content_length" in keys else None
+    content_length = int(stored_length) if stored_length is not None else len(content)
     article_id = row["article_id"] or article_id_for(source, url)
     return {
         "id": article_id,
@@ -145,6 +151,8 @@ def query_articles(
     timezones: dict[str, str],
     default_tz: str,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    page = max(1, int(page))
+    page_size = max(1, int(page_size))
     where: list[str] = []
     params: list[Any] = []
     if status and status != "all":
@@ -187,20 +195,24 @@ def query_articles(
         if include_content:
             columns = (
                 "article_id, source, url, list_title, title, publish_time, timezone, "
-                "author, content, length(content) AS content_length, images, status, "
-                "error, first_seen_at, updated_at"
+                "author, content, COALESCE(content_length, length(content)) AS content_length, "
+                "images, status, error, first_seen_at, updated_at"
             )
         else:
             columns = (
                 "article_id, source, url, list_title, title, publish_time, timezone, "
-                "author, length(content) AS content_length, images, status, error, "
-                "first_seen_at, updated_at"
+                "author, COALESCE(content_length, length(content)) AS content_length, "
+                "images, status, error, first_seen_at, updated_at"
             )
-        rows = conn.execute(
-            f"SELECT {columns} FROM articles{where_sql} "
-            f"ORDER BY {order_sql} LIMIT ? OFFSET ?",
-            [*params, page_size, offset],
-        ).fetchall()
+        # OFFSET 无界会被 ?page=999999999 放大成整表单扫；total 已知时越界直接返回空页。
+        if offset >= total:
+            rows = []
+        else:
+            rows = conn.execute(
+                f"SELECT {columns} FROM articles{where_sql} "
+                f"ORDER BY {order_sql} LIMIT ? OFFSET ?",
+                [*params, page_size, offset],
+            ).fetchall()
         conn.commit()
 
     data = [
@@ -232,7 +244,11 @@ def get_article(
 ) -> dict[str, Any] | None:
     with read_connection(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM articles WHERE article_id = ?", (article_id,)
+            "SELECT article_id, source, url, list_title, title, publish_time, "
+            "timezone, author, content, content_length, raw_content, images, "
+            "status, error, first_seen_at, updated_at "
+            "FROM articles WHERE article_id = ?",
+            (article_id,),
         ).fetchone()
     if row is None:
         return None
@@ -250,8 +266,12 @@ def list_sources(
             SELECT source,
                    COUNT(*) AS total,
                    SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok,
-                   MAX(publish_time) AS latest_publish,
-                   -- 取最新那条记录写入的时区，保证与 /v1/articles 的口径一致
+                   -- 与 latest_tz 用同一排序取同一条记录，避免 MAX(publish_time)
+                   -- 与子查询挑中不同行（并列/时区不同）导致时间被按错误时区解释。
+                   (SELECT a2.publish_time FROM articles a2
+                     WHERE a2.source = a.source
+                     ORDER BY a2.publish_time DESC, a2.updated_at DESC
+                     LIMIT 1) AS latest_publish,
                    (SELECT a2.timezone FROM articles a2
                      WHERE a2.source = a.source
                      ORDER BY a2.publish_time DESC, a2.updated_at DESC
@@ -288,23 +308,37 @@ def stats(db_path: str, *, default_tz: str) -> dict[str, Any]:
         status_rows = conn.execute(
             "SELECT status, COUNT(*) AS n FROM articles GROUP BY status ORDER BY status"
         ).fetchall()
-        latest = conn.execute(
-            "SELECT MAX(publish_time) AS latest FROM articles"
-        ).fetchone()["latest"]
+        # 与 /v1/sources 口径一致：取“最新那条记录”的 publish_time，并用该行
+        # 落库的时区来解释，而不是全局套用 default_tz（否则跨时区站点会偏移）。
+        latest_row = conn.execute(
+            "SELECT publish_time, timezone FROM articles "
+            "ORDER BY publish_time DESC, updated_at DESC LIMIT 1"
+        ).fetchone()
         sources = int(
             conn.execute("SELECT COUNT(DISTINCT source) AS n FROM articles")
             .fetchone()["n"]
         )
         conn.commit()
+    latest_publish = latest_row["publish_time"] if latest_row else None
+    latest_tz = str((latest_row["timezone"] if latest_row else "") or "").strip() or default_tz
     return {
         "total": total,
         "by_status": {row["status"]: int(row["n"]) for row in status_rows},
         "sources": sources,
-        "latest_published_at": iso_or_none(latest, default_tz),
+        "latest_published_at": iso_or_none(latest_publish, latest_tz),
         "generated_at": dt.datetime.now(resolve_timezone(default_tz))
         .replace(microsecond=0)
         .isoformat(),
     }
+
+
+def ping_database(db_path: str) -> None:
+    """Cheap liveness probe for /v1/health (no full-table COUNT).
+
+    Raises if the database cannot be opened or read.
+    """
+    with read_connection(db_path) as conn:
+        conn.execute("SELECT 1 FROM articles LIMIT 1").fetchone()
 
 
 def count_articles(db_path: str) -> int:

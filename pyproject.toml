@@ -57,11 +57,10 @@ target-version = "py310"
 extend-exclude = ["backups", "data", "dist", ".tmp_smoke"]
 
 [tool.ruff.lint]
-# 在原来的 E9/F63/F7/F82 之上扩到整套 pyflakes/pycodestyle（去掉行长）+
+# 在原来的 E9/F63/F7/F82 之上扩到整套 pyflakes/pycodestyle（含行长）+
 # import 排序 + pyupgrade + bugbear，避免“静态检查偏保守”。
+# line-length=120 与 E501 一起生效：不再用 ignore 把行长检查架空。
 select = ["E", "F", "W", "I", "UP", "B"]
-# 行长不阻塞 CI：项目历史行宽不统一，格式化留给编辑器。
-ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.10"

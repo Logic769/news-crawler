@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -40,8 +41,18 @@ class JobCreate(BaseModel):
         if value is None:
             return None
         value = value.strip()
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+            raise ValueError("url 不允许包含控制字符")
         if not re.match(r"^https?://", value, re.IGNORECASE):
             raise ValueError("url 必须是 http:// 或 https:// 开头")
+        try:
+            parts = urlsplit(value)
+        except ValueError as exc:
+            raise ValueError(f"url 格式不合法: {exc}") from exc
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("url 不允许包含用户信息(user:pass@)")
+        if not parts.hostname:
+            raise ValueError("url 缺少主机名")
         return value
 
     @model_validator(mode="after")

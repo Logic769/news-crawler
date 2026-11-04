@@ -11,7 +11,12 @@ from typing import Any
 from lxml.html import HtmlElement, etree
 
 from ..config import config
-from ..html import get_high_weight_keyword_pattern, iter_node, pad_host_for_images
+from ..html import (
+    BR_SENTINEL,
+    get_high_weight_keyword_pattern,
+    iter_node,
+    pad_host_for_images,
+)
 
 PUNCTUATION = frozenset({
     chr(code)
@@ -106,7 +111,7 @@ class ContentExtractor:
                 "ltgi": density_info["ltgi"],
                 "node": node,
                 "density": density_info["density"],
-                "text": ti_text,
+                "text": self.get_display_text_of_element(node),
                 "images": images_list,
                 "text_tag_count": self.count_text_tag(node, tag="p"),
                 "sbdi": sbdi,
@@ -117,7 +122,7 @@ class ContentExtractor:
             if include_body_html:
                 node_info["body_html"] = unescape(
                     etree.tostring(node, encoding="utf-8").decode()
-                )
+                ).replace(BR_SENTINEL, "\n")
             self.node_info[hash(node)] = node_info
 
         self.calc_new_score()
@@ -146,10 +151,32 @@ class ContentExtractor:
                     if not text:
                         continue
                     clear_text = re.sub(" +", " ", text, flags=re.S)
-                    element_text_list.append(clear_text.replace("\n", ""))
+                    clear_text = clear_text.replace("\n", "").replace(
+                        BR_SENTINEL, ""
+                    )
+                    if not clear_text:
+                        continue
+                    element_text_list.append(clear_text)
                 self.element_text_cache[element_flag] = element_text_list
                 text_list.extend(element_text_list)
         return text_list
+
+    def get_display_text_of_element(self, element: HtmlElement) -> str:
+        """Return body text with real <br> markers restored as newlines."""
+        fragments: list[str] = []
+        for text in element.xpath(".//text()"):
+            text = text.strip()
+            if not text:
+                continue
+            clear_text = (
+                re.sub(" +", " ", text, flags=re.S)
+                .replace("\n", "")
+                .replace(BR_SENTINEL, "\n")
+                .strip("\n")
+            )
+            if clear_text:
+                fragments.append(clear_text)
+        return "\n".join(fragments)
 
     def need_skip_ltgi(self, ti: int, lti: int) -> bool:
         """Return whether link text is too sparse to exclude from the density."""
