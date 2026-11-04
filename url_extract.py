@@ -1,10 +1,11 @@
 """Fetch a news article URL and extract title/content with GNE."""
 
-import gzip
+import http.client
 import json
 import logging
 import os
 import re
+import socket
 import ssl
 import sys
 import threading
@@ -14,7 +15,7 @@ import zlib
 from collections.abc import Callable
 from html import unescape
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from gne import GeneralNewsExtractor, NoContentException
 
@@ -95,6 +96,15 @@ def normalize_images(images, base_url: str) -> list[str]:
     return resolved
 
 
+def normalize_images_for_update(images, base_url: str) -> list[str] | None:
+    """归一化图片列表，空结果返回 None 表示"本次未提供"。
+
+    GNE 抽不到图片不等于页面确实没有图片，调用方不应把空结果当成"明确
+    无图"去清空历史值；save_article 只把显式的 [] 视为清空。
+    """
+    return normalize_images(images, base_url) or None
+
+
 class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Re-check every redirect target before urllib follows it."""
 
@@ -105,6 +115,119 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
         self._validator(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _ip_literal_url(ip: str) -> str:
+    host = f"[{ip}]" if ":" in ip else ip
+    return f"https://{host}/"
+
+
+def _validated_create_connection(
+    host: str,
+    port: int,
+    timeout: float | None,
+    url_validator: Callable[[str], None],
+    *,
+    ssl_context: ssl.SSLContext | None = None,
+    server_hostname: str | None = None,
+):
+    """解析一次主机并在连接前校验「即将连接的那个 IP」。
+
+    与「抓取前 getaddrinfo 校验一次」不同，这里是「解析 → 校验 → 用同一 sockaddr
+    连接」原子完成，中间没有重新解析，从而消除 DNS rebinding（TOCTOU）绕过面。
+    """
+    try:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    except OSError as exc:
+        raise urllib.error.URLError(f"无法解析主机 {host}: {exc}") from exc
+    last_error: Exception | None = None
+    for family, socktype, proto, _canon, sockaddr in infos:
+        ip = str(sockaddr[0]).split("%", 1)[0]
+        # 用 IP 字面量 URL 复用同一套地址策略校验该 IP 是否为公网地址。
+        url_validator(_ip_literal_url(ip))
+        sock = socket.socket(family, socktype, proto)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(sockaddr)
+        except OSError as exc:
+            last_error = exc
+            try:
+                sock.close()
+            except OSError:
+                pass
+            continue
+        if ssl_context is not None:
+            try:
+                sock = ssl_context.wrap_socket(sock, server_hostname=server_hostname or host)
+            except BaseException:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                raise
+        return sock
+    raise last_error or OSError(f"无法连接到 {host}")
+
+
+# 注意：pinned 连接通过覆盖 connect() 直接连“DNS 解析后的真实 IP”，因此不再
+# 经过 urllib 的 ProxyHandler。配置 HTTP(S)_PROXY 时，API extract 路径会直连而
+# 不经过代理；这是防 DNS rebinding 的有意取舍（走代理时只能看到代理 IP，无法
+# 用真实目标地址做校验）。crawler 不传 url_validator，不受此限制。
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host: str, *, url_validator: Callable[[str], None], **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self._url_validator = url_validator
+
+    def connect(self) -> None:
+        self.sock = _validated_create_connection(
+            self.host, self.port, self.timeout, self._url_validator
+        )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, *, url_validator: Callable[[str], None], **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self._url_validator = url_validator
+
+    def connect(self) -> None:
+        context = getattr(self, "_context", None)
+        self.sock = _validated_create_connection(
+            self.host,
+            self.port,
+            self.timeout,
+            self._url_validator,
+            ssl_context=context,
+            server_hostname=self.host,
+        )
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, url_validator: Callable[[str], None]) -> None:
+        super().__init__()
+        self._url_validator = url_validator
+
+    def http_open(self, req):  # noqa: ANN001
+        return self.do_open(
+            lambda host, **kw: _PinnedHTTPConnection(
+                host, url_validator=self._url_validator, **kw
+            ),
+            req,
+        )
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, url_validator: Callable[[str], None], context: ssl.SSLContext) -> None:
+        super().__init__(context=context)
+        self._url_validator = url_validator
+
+    def https_open(self, req):  # noqa: ANN001
+        return self.do_open(
+            lambda host, **kw: _PinnedHTTPSConnection(
+                host, url_validator=self._url_validator, **kw
+            ),
+            req,
+            context=self._context,
+        )
 
 
 def content_is_too_short(content: str | None) -> bool:
@@ -179,39 +302,60 @@ def _json_ld_type_sets(html_text: str) -> tuple[set[str], set[str]]:
 
 
 def is_video_page(url: str, html_text: str) -> bool:
-    """明确的视频页信号才返回 True，避免把内嵌播放器的普通文章误判为视频页。"""
+    """明确的视频页信号才返回 True；URL 路径只作提示，需配合页面内视频标记。"""
     from urllib.parse import urlparse
 
     path = urlparse(url or "").path or ""
-    if _VIDEO_PATH_RE.search(path):
-        return True
-
     head = (html_text or "")[:60000]
-    for match in re.finditer(r"(?is)<meta\b[^>]*>", head):
+    has_video_meta = False
+    for match in _META_TAG_RE.finditer(head):
         tag = match.group(0)
-        if re.search(r'(?is)(?:property|name)\s*=\s*["\']og:type["\']', tag) and re.search(
-            r'(?is)content\s*=\s*["\']video', tag
-        ):
-            return True
+        km = _META_KEY_RE.search(tag)
+        cm = _META_CONTENT_RE.search(tag)
+        if km and cm:
+            key = (km.group(1) or km.group(2) or "").strip().lower()
+            value = cm.group(1) if cm.group(1) is not None else cm.group(2)
+            value = (value or "").strip()
+            if key == "og:type" and value.lower().startswith("video"):
+                return True
+            if key in {"og:video", "og:video:url", "og:video:secure_url"} and value:
+                has_video_meta = True
     main_types, all_types = _json_ld_type_sets(html_text)
     if {"VideoObject", "Video"} & main_types:
         return True
     # 普通文章的 @graph 可能内嵌相关视频；有 Article 类型时不以视频页处理
     if ({"VideoObject", "Video"} & all_types) and not ({"Article", "NewsArticle"} & all_types):
         return True
+    # 路径命中 /video|shipin|vod/ 不再直接判为视频页，必须有 <video> 或 og:video
+    # 这类页面内证据，否则 /video/ 下的图文稿件会被误判。
+    has_video_tag = bool(re.search(r"(?is)<video(?=[ />])", head))
+    if _VIDEO_PATH_RE.search(path) and (has_video_tag or has_video_meta):
+        return True
     return False
+
+
+_META_TAG_RE = re.compile(
+    r'''(?is)<meta(?=[ />])(?:[^>"']|"[^"]*"|'[^']*')*>'''
+)
+_META_KEY_RE = re.compile(
+    r'''(?is)(?:property|name)[ ]*=[ ]*(?:"([^"]+)"|'([^']+)')'''
+)
+_META_CONTENT_RE = re.compile(
+    r'''(?is)content[ ]*=[ ]*(?:"([^"]*)"|'([^']*)')'''
+)
 
 
 def _meta_map(html_text: str) -> dict:
     metas = {}
-    for match in re.finditer(r"(?is)<meta\b[^>]*>", html_text or ""):
+    for match in _META_TAG_RE.finditer(html_text or ""):
         tag = match.group(0)
-        km = re.search(r'(?is)\b(?:property|name)\s*=\s*["\']([^"\']+)["\']', tag)
-        cm = re.search(r'(?is)\bcontent\s*=\s*["\'](.*?)["\']', tag)
+        km = _META_KEY_RE.search(tag)
+        cm = _META_CONTENT_RE.search(tag)
         if km and cm:
-            key = km.group(1).strip().lower()
-            if key not in metas:
-                metas[key] = unescape(cm.group(1)).strip()
+            key = (km.group(1) or km.group(2) or "").strip().lower()
+            value = cm.group(1) if cm.group(1) is not None else cm.group(2)
+            if key and key not in metas:
+                metas[key] = unescape(value or "").strip()
     return metas
 
 
@@ -289,7 +433,10 @@ def extract_video_meta(html_text: str, url: str) -> dict | None:
 # 页面已就绪时立即返回。sync_playwright 不可跨线程共享，因此按线程隔离。
 _RENDER_LOCAL = threading.local()
 RENDER_SETTLE_TIMEOUT_MS = 1500
-RENDER_NAV_TIMEOUT_MS = 60000
+# 每次导航（先 networkidle，失败再 domcontentloaded）最多 15s。旧值 60s 会让
+# 单页最坏等满两次共 ~120s，一个坏站点就能把整轮抓取拖住；15s + 1.5s 收尾
+# 把单页上限压到 ~31.5s，同时保留二次尝试的机会。
+RENDER_NAV_TIMEOUT_MS = 15000
 
 
 def _thread_browser() -> tuple[Any, Any]:
@@ -352,7 +499,9 @@ def close_thread_browser() -> None:
             pass
 
 
-def fetch_html_with_browser(url: str) -> str | None:
+def fetch_html_with_browser(
+    url: str, *, url_validator: Callable[[str], None] | None = None
+) -> str | None:
     """Render a page with headless Chrome (Playwright) as a fallback.
 
     每个页面使用独立的 BrowserContext：context 之间 cookie/localStorage 相互
@@ -365,6 +514,13 @@ def fetch_html_with_browser(url: str) -> str | None:
         LOG.warning("未安装 Playwright，无法使用浏览器回退。可运行: pip install playwright")
         return None
 
+    if url_validator is not None:
+        try:
+            url_validator(url)
+        except Exception as exc:
+            LOG.warning("浏览器回退目标被拒绝：%s", exc)
+            return None
+
     page = None
     context = None
     try:
@@ -374,6 +530,44 @@ def fetch_html_with_browser(url: str) -> str | None:
             locale="zh-CN",
         )
         page = context.new_page()
+        if url_validator is not None:
+            # 浏览器自行导航、跟随重定向，绕过 fetch_html 的校验；在请求级别
+            # 再校验所有 http(s) 请求（含图片/XHR/fetch），拦截 3xx/JS 跳转或
+            # 页面子资源指向内网/云元数据地址造成的 SSRF。按 host 缓存校验结果，
+            # 避免同一页面的大量子资源重复做 DNS 解析。
+            _host_ok: dict[str, bool] = {}
+
+            def _guard(route):  # noqa: ANN001
+                request = route.request
+                try:
+                    parts = urlsplit(request.url)
+                except ValueError:
+                    route.abort()
+                    return
+                if parts.scheme not in ("http", "https"):
+                    # data:/blob:/about: 等本地资源不会发起网络请求，直接放行。
+                    route.continue_()
+                    return
+                host = (parts.hostname or "").lower()
+                if not host:
+                    route.abort()
+                    return
+                if host not in _host_ok:
+                    try:
+                        url_validator(request.url)
+                    except Exception as exc:
+                        LOG.warning(
+                            "浏览器请求目标被拒绝（%s）：%s", exc, request.url
+                        )
+                        _host_ok[host] = False
+                    else:
+                        _host_ok[host] = True
+                if not _host_ok[host]:
+                    route.abort()
+                    return
+                route.continue_()
+
+            page.route("**/*", _guard)
         try:
             page.goto(url, wait_until="networkidle", timeout=RENDER_NAV_TIMEOUT_MS)
         except Exception:
@@ -424,26 +618,56 @@ def _check_size(data: bytes) -> bytes:
     return data
 
 
-def _bounded_decompress(raw: bytes, coding: str) -> bytes:
-    """按 coding 解压并限制输出大小；超限或数据损坏抛 UnsupportedContentEncoding。
+def _decompress_stage(raw: bytes, wbits: int) -> bytes:
+    """用 decompressobj 分块解压，边解边比对上限，超限立刻抛错。
 
-    用 decompressobj 逐块解压而不是一次性 decompress，才能在超限时提前停下，
-    否则压缩炸弹会先把内存吃满再判断大小。
+    zlib.decompressobj.decompress(data, max_length) 单次最多输出 max_length 字节，
+    剩余输入留在 unconsumed_tail，因此可以在解出超过上限的第一时间停下，不会像
+    一次性 decompress 那样先把整颗压缩炸弹解进内存再判断大小。
     """
-    try:
-        if coding == "gzip":
-            return _check_size(gzip.decompress(raw))
-        # deflate：RFC 只要求 zlib 包装，但部分服务端发裸流（wbits=-15）。
-        for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
-            try:
-                return _check_size(zlib.decompress(raw, wbits))
-            except zlib.error:
-                continue
-        raise zlib.error("not a valid deflate stream")
-    except (OSError, EOFError, zlib.error) as exc:
+    obj = zlib.decompressobj(wbits)
+    out = bytearray()
+    buf = raw
+    while True:
+        out += obj.decompress(buf, MAX_DECODED_BYTES + 1 - len(out))
+        if len(out) > MAX_DECODED_BYTES:
+            raise UnsupportedContentEncoding(
+                f"解压后超过 {MAX_DECODED_BYTES} 字节上限，拒绝该响应（疑似压缩炸弹）"
+            )
+        buf = obj.unconsumed_tail
+        if not buf:
+            break
+    out += obj.flush()
+    if len(out) > MAX_DECODED_BYTES:
         raise UnsupportedContentEncoding(
-            f"{coding} 解压失败（响应可能被截断）: {exc}"
-        ) from exc
+            f"解压后超过 {MAX_DECODED_BYTES} 字节上限，拒绝该响应（疑似压缩炸弹）"
+        )
+    if not obj.eof:
+        # 流未正常结束（如尾部 CRC/长度缺失），按“响应被截断”显式失败，
+        # 不能把残缺解压结果当正文静默放行。
+        raise UnsupportedContentEncoding("解压流不完整（响应可能被截断）")
+    return bytes(out)
+
+
+def _bounded_decompress(raw: bytes, coding: str) -> bytes:
+    """按 coding 解压并限制输出大小；超限或数据损坏抛 UnsupportedContentEncoding。"""
+    if coding == "gzip":
+        wbits_options: tuple[int, ...] = (zlib.MAX_WBITS | 16,)
+    else:
+        # deflate：RFC 只要求 zlib 包装，但部分服务端发裸流（wbits=-15）。
+        wbits_options = (zlib.MAX_WBITS, -zlib.MAX_WBITS)
+    last_error: Exception | None = None
+    for wbits in wbits_options:
+        try:
+            return _decompress_stage(raw, wbits)
+        except UnsupportedContentEncoding:
+            raise
+        except (zlib.error, EOFError) as exc:
+            last_error = exc
+            continue
+    raise UnsupportedContentEncoding(
+        f"{coding} 解压失败（响应可能被截断）: {last_error}"
+    ) from last_error
 
 
 def _decompress(raw: bytes, encoding: str | None) -> bytes:
@@ -455,7 +679,7 @@ def _decompress(raw: bytes, encoding: str | None) -> bytes:
     """
     normalized = (encoding or "").strip().lower()
     if not normalized or normalized == "identity":
-        return raw
+        return _check_size(raw)
 
     # Content-Encoding 可以叠加（"gzip, gzip"），解码顺序与编码顺序相反。
     codings = [part.strip() for part in normalized.split(",") if part.strip()]
@@ -483,12 +707,24 @@ def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) 
     def _fetch(context: ssl.SSLContext) -> tuple[bytes, str | None]:
         handlers: list[urllib.request.BaseHandler] = []
         if url_validator is not None:
+            # 重定向目标先按 URL 策略校验（域名层），连接时再按真实解析出的
+            # IP 校验（防 DNS rebinding）；两层都通过才建立连接。
             handlers.append(_ValidatingRedirectHandler(url_validator))
-        handlers.append(urllib.request.HTTPSHandler(context=context))
+            handlers.append(_PinnedHTTPSHandler(url_validator, context))
+            handlers.append(_PinnedHTTPHandler(url_validator))
+        else:
+            handlers.append(urllib.request.HTTPSHandler(context=context))
         opener = urllib.request.build_opener(*handlers)
         req = urllib.request.Request(url, headers=HEADERS)
         with opener.open(req, timeout=25) as resp:
-            raw = _decompress(resp.read(), resp.headers.get("Content-Encoding"))
+            # 先按上限 +1 读取原始响应体：未压缩但超大的响应不能无限读入内存；
+            # 压缩流本身一般远小于解压结果，真正的解压上限由 _decompress 兜底。
+            compressed = resp.read(MAX_DECODED_BYTES + 1)
+            if len(compressed) > MAX_DECODED_BYTES:
+                raise UnsupportedContentEncoding(
+                    f"响应体超过 {MAX_DECODED_BYTES} 字节上限，拒绝该响应"
+                )
+            raw = _decompress(compressed, resp.headers.get("Content-Encoding"))
             return raw, resp.headers.get_content_charset()
 
     try:
@@ -531,33 +767,20 @@ def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) 
     return raw.decode("utf-8", "ignore")
 
 
-def extract_article(
+def extract_from_html(
+    html: str,
     url: str,
     extractor: GeneralNewsExtractor,
     *,
     allow_browser: bool = True,
     url_validator: Callable[[str], None] | None = None,
 ) -> dict | None:
-    LOG.info("正在抓取: %s", url)
-    try:
-        html = fetch_html(url, url_validator=url_validator)
-    except urllib.error.HTTPError as exc:
-        if exc.code not in BROWSER_FALLBACK_HTTP_CODES:
-            LOG.warning("抓取失败（HTTP %s）。", exc.code)
-            return None
-        if not allow_browser:
-            LOG.info("直接抓取被拒绝(HTTP %s)，且浏览器回退已禁用。", exc.code)
-            return None
-        LOG.info("直接抓取被拒绝(HTTP %s)，正在用本机 Chrome 无头模式渲染...", exc.code)
-        rendered = fetch_html_with_browser(url)
-        if rendered is None:
-            LOG.warning("浏览器回退失败。")
-            return None
-        html = rendered
-    except (urllib.error.URLError, ValueError, TimeoutError, ConnectionError) as exc:
-        LOG.warning("抓取失败（网络错误或网址无效）：%s", exc)
-        return None
+    """Extract one article already-fetched HTML (shared by CLI and crawler).
 
+    Handles video-page adaptation, GNE extraction, optional browser render
+    fallback and image normalization, so both entry points keep identical
+    semantics instead of maintaining two diverged copies.
+    """
     if is_video_page(url, html):
         video = extract_video_meta(html, url)
         if video is not None:
@@ -574,7 +797,7 @@ def extract_article(
             LOG.info("直接抓取未提取到正文，且浏览器回退已禁用。")
             return None
         LOG.info("直接抓取未提取到正文，正在用本机 Chrome 无头模式渲染...")
-        rendered = fetch_html_with_browser(url)
+        rendered = fetch_html_with_browser(url, url_validator=url_validator)
         if rendered is None:
             LOG.info("无法提取正文。可能是列表页，或不是新闻文章页。")
             return None
@@ -595,6 +818,42 @@ def extract_article(
     # 按文章 URL 补全，避免下游拿到无法直接使用的地址。
     result["images"] = normalize_images(result.get("images"), url)
     return result
+
+
+def extract_article(
+    url: str,
+    extractor: GeneralNewsExtractor,
+    *,
+    allow_browser: bool = True,
+    url_validator: Callable[[str], None] | None = None,
+) -> dict | None:
+    LOG.info("正在抓取: %s", url)
+    try:
+        html = fetch_html(url, url_validator=url_validator)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in BROWSER_FALLBACK_HTTP_CODES:
+            LOG.warning("抓取失败（HTTP %s）。", exc.code)
+            return None
+        if not allow_browser:
+            LOG.info("直接抓取被拒绝(HTTP %s)，且浏览器回退已禁用。", exc.code)
+            return None
+        LOG.info("直接抓取被拒绝(HTTP %s)，正在用本机 Chrome 无头模式渲染...", exc.code)
+        rendered = fetch_html_with_browser(url, url_validator=url_validator)
+        if rendered is None:
+            LOG.warning("浏览器回退失败。")
+            return None
+        html = rendered
+    except (urllib.error.URLError, ValueError, TimeoutError, ConnectionError) as exc:
+        LOG.warning("抓取失败（网络错误或网址无效）：%s", exc)
+        return None
+
+    return extract_from_html(
+        html,
+        url,
+        extractor,
+        allow_browser=allow_browser,
+        url_validator=url_validator,
+    )
 
 
 def main() -> None:

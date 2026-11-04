@@ -306,7 +306,7 @@ CREATE TABLE IF NOT EXISTS articles (
     author        TEXT,
     content       TEXT,            -- 正文纯文本（clean_text 归一化，段落换行被压成空格）
     raw_content   TEXT,            -- GNE 原始正文，保留段落换行；仅展示/导出用
-    images        TEXT,            -- JSON 数组字符串；空串表示本次未取到，不覆盖库中原值
+    images        TEXT,            -- JSON 数组字符串；NULL 表示本次未提供（保留旧值），[] 表示明确无图（清空）
     status        TEXT NOT NULL,   -- ok/old/no_content/unknown_date/error
     error         TEXT,
     first_seen_at TEXT,
@@ -329,7 +329,7 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 
 索引：`source`、`status`、`publish_time`、`article_id`（唯一），以及两条查询性能覆盖索引：`(status, publish_time DESC, source, url)` 供列表分页、`(source, publish_time DESC, updated_at DESC, timezone, status)` 供 `/v1/sources` 聚合；`crawl_jobs` 的 `status`、`created_at`、`(type, payload, status)` 去重索引。
 
-旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 4`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、`timezone` 与 v4 的 `raw_content`（只补列，历史行不回填），按 2000 行分批回填 `article_id` 并建唯一索引与去重索引；v3 额外补建两条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这两条，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外），迁移早退条件同时校验这两条索引是否齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
+旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 5`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、`timezone`、v4 的 `raw_content` 与 v5 的 `content_length`（只补列，历史行不回填），按 rowid 键集分页（每批 2000 行）回填 `article_id`，不边读游标边 UPDATE 同表；再补建唯一索引、去重索引与三条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这三条，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外）。迁移早退条件校验四列齐全且 `required_indexes`（三条性能索引 + `idx_articles_article_id` + `idx_crawl_jobs_dedupe`）齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
 
 ### 7.2 status 语义
 
@@ -347,10 +347,10 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 - 用旧版本抓取过的数据可能仍是中文日期格式，需要 `--force` 重抓或重建数据库；
 - `content` 入库前会被 `clean_text()` 压缩空白，段落换行会丢失；GNE 原始换行正文另存 `raw_content`（代价是正文体积约翻倍，仅 `ok`/`unknown_date` 写入，`old`/`error` 不写）；v4 之前入库的历史行需要 `--force` 重抓，或用 `backfill_raw_content.py` 批量回填（只 `UPDATE raw_content`，不改 `content`/`status`/`updated_at`）；
 - 同一 `(source, url)` 使用 upsert，不会产生重复记录；
-- `save_article()` 是**部分更新**：空字符串/空图片表示“这次没拿到”，不会覆盖库中已有值，因此抓取失败或重新分类时只更新 `status`/`error`，已成功入库的正文不会被清空；
+- `save_article()` 是**部分更新**：空字符串表示“这次没拿到”，不会覆盖库中已有值，因此抓取失败或重新分类时只更新 `status`/`error`，已成功入库的正文不会被清空；`images` 例外地区分三态：`None` 保留旧值、`[]` 明确清空、非空列表覆盖；抓取流程用 `normalize_images_for_update` 把"抽取不到图"归一为 `None`（保留旧值），只有显式传 `[]` 才清空，避免成功重抓因抽取失败抹掉历史图片；
 - `timezone` 随文章落库，读取时优先使用该列，旧行（NULL）才回落到当前配置推断；`published_from`/`published_to` 仍按站点本地墙钟字符串比较，混合时区时会有偏差；
 - `article_id` 由 `sha256(source + \x1f + url)` 派生，不随数据库重建变化，可安全作为下游引用；
-- SQLite 启用 WAL 与 `busy_timeout=5000`，API 作业默认单 worker 写入；只读查询使用 `file:...?mode=ro` URI（路径会转义），WAL 库仍要求目录可写（需要 -shm/-wal）。
+- SQLite 启用 WAL 与 `busy_timeout=30000`（`DB_BUSY_TIMEOUT_MS`，与连接 timeout 一致，不用 5s 覆盖 30s 连接超时），API 作业默认单 worker 写入；只读查询使用 `file:...?mode=ro` URI（路径会转义），WAL 库仍要求目录可写（需要 -shm/-wal）。
 
 ---
 
@@ -451,7 +451,7 @@ curl http://localhost:8000/v1/health
 - `python-checks` job：Python 3.10–3.14 矩阵，执行 compileall、`ruff check .`、`mypy`（仅 3.12 跑一次）、smoke、api_smoke 与 62 篇样本的离线回归
 - `shell-and-yaml` job：bash 语法检查、shellcheck 与 YAML 解析校验
 - `docker-build` job：Ubuntu，`docker build` 后执行容器内 `smoke`、`api_smoke.py`、compose API 健康检查，并校验裸 `docker run ... api` 的持久化数据库路径
-- `live-news` job：只在 push `master`、夜间定时与手动触发时运行（`if: github.event_name != 'pull_request'`），安装 `[browser,api]` 与 Chromium 后用宿主机 Python 执行 `verify_live_news.py --static 10 --dynamic 10 --video 10`；这是**硬性门槛**，抽取数量不足即 job 失败。PR 上不跑：失败多来自站点改版/反爬而非本次改动，且 PR 已有离线回归兜底
+- `live-news` job：只在 push `master` 时运行（`if: github.event_name == 'push'`），安装 `[browser,api]` 与 Chromium 后用宿主机 Python 执行 `verify_live_news.py --static 10 --dynamic 10 --video 10`；这是**硬性门槛**，抽取数量不足即 job 失败。PR 上不跑：失败多来自站点改版/反爬而非本次改动，且 PR 已有离线回归兜底；夜间定时与手动触发改由 `docker-build-full` 在镜像内跑同一组 10/10/10，避免重复抓取
 - `docker-build-full` job：默认含浏览器镜像构建 + Chromium 启动校验 + smoke + 镜像内同类实时新闻验证（10 静态 / 10 JS 渲染 / 10 视频）；只在夜间定时与手动触发时运行（`if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'`），避免与 push 时的宿主机 `live-news` 重复抓取同一组页面
 - `concurrency` 按「工作流 + 分支 + 事件类型」分组：夜间任务不会被 push 取消（`cancel-in-progress` 仅对非 schedule 为 true），保证站点改版的夜间信号不被白天的提交覆盖
 - `notify-nightly-failure` job：夜间定时任务失败时自动开/更新标题为「[nightly] 夜间回归失败」的 issue（`permissions: issues: write`）
@@ -486,7 +486,7 @@ curl http://localhost:8000/v1/health
   print(v.check_static('https://example.com/a.html', GeneralNewsExtractor()))"
   ```
 
-  注意 `GeneralNewsExtractor` 实例不可跨线程共享（并发复用会抛 `math domain error`），批量校验时每个线程各自新建；
+  `GeneralNewsExtractor` 实例可跨线程共享：`extract()` 每次调用内部新建 `ContentExtractor`，不使用实例级可变缓存；批量校验可复用同一个实例；
 - 池子生成脚本与探测结果保存在本地 `backups/pool_build/`（被 Git 忽略），不属于仓库内容。
 
 ### 离线回归基线（regression/）
@@ -512,7 +512,7 @@ curl http://localhost:8000/v1/health
 ### 提交前必须执行
 
 ```bash
-docker compose run --rm --entrypoint python crawler -m compileall -q news_crawler.py url_extract.py smoke_fixture.py backfill_raw_content.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api gne
+docker compose run --rm --entrypoint python crawler -m compileall -q news_crawler.py url_extract.py smoke_fixture.py backfill_raw_content.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api gne regression
 docker compose run --rm crawler smoke
 docker compose run --rm --entrypoint python crawler -X utf8 api_smoke.py
 ```
@@ -603,6 +603,7 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 
 - `fetch_html(url, *, url_validator: Callable[[str], None] | None = None) -> str`：失败时抛出异常；请求带 `Accept-Encoding: gzip` 并解压，遇到 br 等无法解码的编码抛 `UnsupportedContentEncoding`；传入 `url_validator` 后每次 HTTP 重定向都会先用新 URL 调用它，抛异常即中断重定向；
 - `normalize_images(images, base_url) -> list[str]`：把 `//cdn/x.jpg` 等相对图片地址补全为绝对 URL，去重去空，并只保留 `http/https`（过滤 `data:`/`javascript:`/`ftp:`）；`/v1` 读取侧同样调用，历史行也会被归一化；
+- `normalize_images_for_update(images, base_url) -> list[str] | None`：同上，但空结果返回 `None`，供写入侧按"本次未提供"保留旧图，避免把抽取失败误判为明确无图；
 - `MAX_DECODED_BYTES = 32 * 1024 * 1024`：解压后响应体上限，超限抛 `UnsupportedContentEncoding`，用于抵御压缩炸弹；
 - `close_thread_browser() -> None`：释放当前线程复用的 Playwright 浏览器；`run_source` / `cmd_test` / `extract_article` 的 CLI 入口都会调用；
 - `BROWSER_FALLBACK_HTTP_CODES = frozenset({401, 403, 406, 429})`：只有这些状态才回退浏览器，404/410/500 渲染后仍是同样错误；
@@ -611,7 +612,7 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 - `content_needs_render(content: str) -> bool`：True 表示需要浏览器渲染（空、短于 100 字、或含加载占位词）；
 - `content_is_too_short(content: str) -> bool`：True 表示正文短于 `MIN_CONTENT_LENGTH`（100 字）；
 - `extract_article(url, extractor, *, allow_browser: bool = True, url_validator=None) -> dict | None`：单 URL 完整流程；`allow_browser=False` 时禁用浏览器渲染回退（API 的 extract 默认如此）；
-- `GeneralNewsExtractor.extract(html, **kwargs) -> dict`：正文抽取入口；
+- `GeneralNewsExtractor.extract(html, **kwargs) -> dict`：正文抽取入口；实例无跨调用可变状态，可跨线程复用（每次 extract 内部新建 ContentExtractor）；
 - `create_app(settings=None) -> FastAPI`：API 应用工厂，测试可注入独立设置；
 - `article_id_for(source, url) -> str`：稳定文章 ID，改动会破坏下游引用；
 - `POST /v1/jobs` 的 `crawl`/`extract` schema 属于对外契约，新增字段必须保持向后兼容；

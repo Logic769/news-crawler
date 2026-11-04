@@ -94,6 +94,27 @@ class BackfillUnitTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_unknown_date_candidates_are_not_starved_by_limit(self) -> None:
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.executemany(
+                "INSERT INTO articles (source, url, publish_time, content, raw_content, status) "
+                "VALUES ('site', ?, ?, '正文', NULL, ?)",
+                [
+                    ("https://example.com/new.html", "2026-10-03 10:00:00", "ok"),
+                    ("https://example.com/old2.html", "2026-10-02 10:00:00", "ok"),
+                    ("https://example.com/unknown.html", "", "unknown_date"),
+                ],
+            )
+            conn.commit()
+            # limit=1 时若按 publish_time DESC，空日期的 unknown 行永远取不到。
+            self.assertEqual(
+                bf.find_candidates(conn, "", 1),
+                [("site", "https://example.com/unknown.html")],
+            )
+        finally:
+            conn.close()
+
     def test_write_failed_list_cleans_all_columns(self) -> None:
         path = self.root / "failed.txt"
         bf.write_failed_list(path, [("si\tte", "https://x/\n", "第一行\t含tab\r\n第二行")])

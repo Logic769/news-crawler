@@ -18,10 +18,14 @@ from .text import normalize_text
 
 
 class GeneralNewsExtractor:
-    """Extract title, author, publish time, body text and images from HTML."""
+    """Extract title, author, publish time, body text and images from HTML.
+
+    extract() 不依赖实例级可变状态：每次调用都新建 ContentExtractor（正文密度
+    算法内部有 node_info/element_text_cache 两个可变缓存），因此同一个
+    GeneralNewsExtractor 实例可以跨线程复用。
+    """
 
     def __init__(self) -> None:
-        self._content_extractor = ContentExtractor()
         self._title_extractor = TitleExtractor()
         self._time_extractor = TimeExtractor()
         self._author_extractor = AuthorExtractor()
@@ -59,7 +63,7 @@ class GeneralNewsExtractor:
         remove_noise_node(element, noise_node_list)
         element = pre_parse(element)
 
-        content = self._content_extractor.extract(
+        content = ContentExtractor().extract(
             element,
             host=host,
             with_body_html=with_body_html,

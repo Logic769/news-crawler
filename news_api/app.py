@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import secrets
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from news_api.db import (
     get_article,
     list_sources,
     load_timezones,
+    ping_database,
     query_articles,
     stats,
 )
@@ -149,6 +151,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers=getattr(exc, "headers", None),
         )
 
+    @app.exception_handler(Exception)
+    async def _unhandled_error(request: Request, exc: Exception) -> JSONResponse:
+        # 兜底：未捕获异常也必须返回统一的 JSON 错误体，而不是 Starlette
+        # 默认的纯文本 "Internal Server Error"（下游无法按 code 处理）。
+        LOG.exception("未处理异常: %s %s", request.method, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": "internal_error",
+                    "status": 500,
+                    "message": "服务器内部错误",
+                }
+            },
+        )
+
     @app.exception_handler(RequestValidationError)
     async def _validation_error(
         _request: Request, exc: RequestValidationError
@@ -180,9 +198,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/health", response_model=HealthOut)
     def health(request: Request) -> Any:
         runtime: Settings = request.app.state.settings
+        state = request.app.state
         try:
-            total = count_articles(runtime.db_path)
+            # 先做 O(1) 的存活探测：数据库不可用时立刻 503，不受计数缓存影响。
+            ping_database(runtime.db_path)
             database = "ok"
+            # COUNT(*) 是全表扫描，健康检查又无需鉴权，任何客户端都能靠高频
+            # 轮询把数据库打满。这里只缓存计数结果 30s，存活状态仍然每次实测。
+            cached = getattr(state, "health_count_cache", None)
+            now = time.monotonic()
+            if cached is None or now - cached[0] >= 30:
+                total = count_articles(runtime.db_path)
+                state.health_count_cache = (now, total)
+            else:
+                total = cached[1]
         except Exception as exc:  # noqa: BLE001 - health reports degradation
             LOG.warning("健康检查读取数据库失败: %s", exc)
             total = 0
@@ -222,8 +251,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         source: str | None = Query(None, max_length=100),
         published_from: str | None = Query(None, max_length=40),
         published_to: str | None = Query(None, max_length=40),
-        q: str | None = Query(None, max_length=200),
-        page: int = Query(1, ge=1),
+        q: str | None = Query(None, min_length=2, max_length=200),
+        page: int = Query(1, ge=1, le=10000),
         page_size: int = Query(20, ge=1, le=100),
         order: str = Query(
             "published_desc",

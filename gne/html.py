@@ -15,7 +15,8 @@ from .constants import (
     USELESS_TAG,
 )
 
-_BR_RE = re.compile(r"</?br.*?>")
+# 只匹配真正的 <br>/<br/>：\b 防止误伤 <brand> 这类以 br 开头的标签。
+_BR_RE = re.compile(r"</?br\b[^>]*>", re.I)
 HIGH_WEIGHT_KEYWORD_RE = re.compile("|".join(HIGH_WEIGHT_ATTR_KEYWORD), flags=re.I)
 
 
@@ -72,8 +73,12 @@ def normalize_node(element: HtmlElement) -> None:
 
 
 def html2element(html: str) -> HtmlElement:
-    """Parse an HTML fragment after dropping ``br`` tags, as before."""
-    return fromstring(_BR_RE.sub("", html))
+    """Parse an HTML fragment, turning ``br`` tags into line breaks.
+
+    以前直接删除 ``<br>`` 会让相邻文本粘连（"foo<br>bar" → "foobar"），
+    这里替换为换行，保留断行语义；后续文本归一化会把多余空白压平。
+    """
+    return fromstring(_BR_RE.sub("\n", html))
 
 
 def pre_parse(element: HtmlElement) -> HtmlElement:

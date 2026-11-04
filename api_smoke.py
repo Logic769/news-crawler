@@ -45,7 +45,13 @@ class _ArticleHandler(BaseHTTPRequestHandler):
         return
 
 
-def _request(base: str, method: str, path: str, payload: dict | None = None, key: str | None = API_KEY) -> tuple[int, dict]:
+def _request(
+    base: str,
+    method: str,
+    path: str,
+    payload: dict | None = None,
+    key: str | None = API_KEY,
+) -> tuple[int, dict]:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(base + path, data=data, method=method)
     if data is not None:
@@ -102,12 +108,26 @@ def _wait_job(base: str, job_id: str, deadline: float) -> dict:
 
 
 def main() -> None:
-    try:
-        ensure_url_allowed("http://127.0.0.1/")
-    except UnsafeUrlError:
-        pass
-    else:
-        raise AssertionError("私网 URL 未被拒绝")
+    # SSRF 校验不能只覆盖 127.0.0.1：回环、私网、链路本地（云元数据）、
+    # IPv6 回环、userinfo 与控制字符都要拒绝。
+    blocked_urls = [
+        "http://127.0.0.1/",
+        "http://127.0.0.2/",
+        "http://10.0.0.5/",
+        "http://192.168.1.1/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]/",
+        "http://localhost/",
+        "http://user:pass@example.com/",
+        "http://example.com/a\x00b",
+        "ftp://example.com/file",
+    ]
+    for blocked_url in blocked_urls:
+        try:
+            ensure_url_allowed(blocked_url)
+        except UnsafeUrlError:
+            continue
+        raise AssertionError(f"不安全 URL 未被拒绝: {blocked_url}")
     ensure_url_allowed("http://127.0.0.1/", allow_private=True)
     # 镜像内没有 tests/，与 smoke_test.py 一样回退到内置样本；
     # 内置页故意带一张 // 开头的图片，用来验证图片地址补全。
@@ -213,22 +233,34 @@ def main() -> None:
             assert stats_body["generated_at"].endswith("+08:00"), stats_body
 
             status, underscore = _request(
-                base, "GET", "/v1/articles?q=" + urllib.parse.quote("_")
+                base, "GET", "/v1/articles?q=" + urllib.parse.quote("__")
             )
             assert status == 200 and underscore["meta"]["total"] == 0, underscore
 
             import news_api.app as app_module
 
-            original_count = app_module.count_articles
-            app_module.count_articles = lambda *_a, **_k: (_ for _ in ()).throw(
+            original_ping = app_module.ping_database
+            app_module.ping_database = lambda *_a, **_k: (_ for _ in ()).throw(
                 RuntimeError("db down")
             )
             try:
                 status, degraded = _request(base, "GET", "/v1/health", key=None)
             finally:
-                app_module.count_articles = original_count
+                app_module.ping_database = original_ping
             assert status == 503, (status, degraded)
             assert degraded["error"]["code"] == "database_unavailable", degraded
+
+            # 未捕获异常必须返回统一的 JSON 500，而不是纯文本。
+            original_stats = app_module.stats
+            app_module.stats = lambda *_a, **_k: (_ for _ in ()).throw(
+                RuntimeError("boom")
+            )
+            try:
+                status, failed = _request(base, "GET", "/v1/stats")
+            finally:
+                app_module.stats = original_stats
+            assert status == 500, (status, failed)
+            assert failed["error"]["code"] == "internal_error", failed
 
             strict_settings = Settings(
                 db_path=db_path,

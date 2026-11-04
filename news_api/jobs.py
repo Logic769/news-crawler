@@ -8,6 +8,7 @@ import json
 import logging
 import sqlite3
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -22,6 +23,9 @@ LOG = logging.getLogger("news_api.jobs")
 
 # 已完成作业保留 30 天，避免 crawl_jobs 无界增长；查询去重索引见 SCHEMA_SQL。
 JOB_RETENTION_DAYS = 30
+# 长期运行的 API 进程不能只在启动时清理一次，否则 crawl_jobs 会无界增长；
+# 在 create() 路径上按时间间隔触发，最多每小时清理一次。
+JOB_CLEANUP_INTERVAL_SECONDS = 3600
 
 
 class JobQueueFull(RuntimeError):
@@ -61,6 +65,7 @@ class JobManager:
         self._lock = threading.Lock()
         self._futures: dict[str, Any] = {}
         self._closed = False
+        self._last_cleanup = 0.0
 
     def _connect(self) -> sqlite3.Connection:
         return connect(self._settings.db_path, read_only=False)
@@ -73,6 +78,28 @@ class JobManager:
         finally:
             conn.close()
 
+    def _cleanup_finished(self) -> None:
+        """Delete finished jobs older than the retention window."""
+        cutoff = (
+            dt.datetime.now().astimezone() - dt.timedelta(days=JOB_RETENTION_DAYS)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        with self._connection() as conn:
+            removed = conn.execute(
+                "DELETE FROM crawl_jobs WHERE status IN (?, ?) AND finished_at < ?",
+                ("succeeded", "failed", cutoff),
+            ).rowcount
+            conn.commit()
+        if removed:
+            LOG.info("清理 %s 条超过 %s 天的已完成作业", removed, JOB_RETENTION_DAYS)
+
+    def _maybe_cleanup(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_cleanup < JOB_CLEANUP_INTERVAL_SECONDS:
+                return
+            self._last_cleanup = now
+        self._cleanup_finished()
+
     def start(self) -> None:
         """Mark interrupted jobs and resume the queued ones."""
         with self._connection() as conn:
@@ -81,20 +108,13 @@ class JobManager:
                 "WHERE status = ?",
                 ("failed", "服务重启，任务已中断", now_iso(), "running"),
             )
-            cutoff = (
-                dt.datetime.now().astimezone() - dt.timedelta(days=JOB_RETENTION_DAYS)
-            ).strftime("%Y-%m-%d %H:%M:%S")
-            removed = conn.execute(
-                "DELETE FROM crawl_jobs WHERE status IN (?, ?) AND finished_at < ?",
-                ("succeeded", "failed", cutoff),
-            ).rowcount
-            if removed:
-                LOG.info("清理 %s 条超过 %s 天的已完成作业", removed, JOB_RETENTION_DAYS)
             rows = conn.execute(
                 "SELECT id FROM crawl_jobs WHERE status = ? ORDER BY created_at",
                 ("queued",),
             ).fetchall()
             conn.commit()
+        self._last_cleanup = time.monotonic()
+        self._cleanup_finished()
         for row in rows:
             self.submit(str(row["id"]))
 
@@ -130,6 +150,7 @@ class JobManager:
                 (job_id, job_type, "queued", payload_json, now_iso()),
             )
             conn.commit()
+        self._maybe_cleanup()
         self.submit(job_id)
         job = self.get(job_id)
         if job is None:

@@ -29,25 +29,24 @@ from zoneinfo import ZoneInfo
 
 import lxml.html
 
-from gne import GeneralNewsExtractor, NoContentException
+from gne import GeneralNewsExtractor
 from url_extract import (
     BROWSER_FALLBACK_HTTP_CODES,
-    MIN_CONTENT_LENGTH,
     close_thread_browser,
-    content_is_too_short,
-    content_needs_render,
-    extract_video_meta,
+    extract_from_html,
     fetch_html,
     fetch_html_with_browser,
-    is_video_page,
-    normalize_images,
+    normalize_images_for_update,
 )
 
 LOG = logging.getLogger("news_crawler")
 
 DEFAULT_SOURCES_FILE = "sources.json"
 DEFAULT_DB_FILE = "news.db"
-SCHEMA_VERSION = 4
+# 锁等待时长与 sqlite3.connect(timeout=...) 保持一致，避免 PRAGMA 把
+# 30s 的连接超时悄悄压成 5s（并发写时更早报 database is locked）。
+DB_BUSY_TIMEOUT_MS = 30000
+SCHEMA_VERSION = 5
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS articles (
@@ -60,6 +59,7 @@ CREATE TABLE IF NOT EXISTS articles (
     timezone     TEXT,
     author       TEXT,
     content      TEXT,
+    content_length INTEGER,
     raw_content  TEXT,
     images       TEXT,
     status       TEXT NOT NULL,
@@ -113,6 +113,10 @@ _PERFORMANCE_INDEX_SQL = (
     "ON articles(status, publish_time DESC, source, url)",
     "CREATE INDEX IF NOT EXISTS idx_articles_source_cover "
     "ON articles(source, publish_time DESC, updated_at DESC, timezone, status)",
+    # order=updated_desc 的列表分页：没有它时 SQLite 取全部 status='ok' 行再
+    # TEMP B-TREE 全表排序；有它之后索引本身即最终顺序。
+    "CREATE INDEX IF NOT EXISTS idx_articles_status_updated "
+    "ON articles(status, updated_at DESC, source, url)",
 )
 
 
@@ -153,6 +157,43 @@ def parse_datetime(
 
     tz = get_timezone(timezone_name)
     now = dt.datetime.now(tz)
+
+    # ISO8601 带显式时区（Z / +08:00 / +0800）必须先处理：下面的通用日期正则
+    # 会先命中日期时间部分并把尾部的时区偏移丢掉，再套用站点时区，导致
+    # “2026-08-26T10:30:00+08:00”被当作本地墙钟时间而偏移被吞。这里解析出
+    # 真正的偏移量并返回带正确 tzinfo 的时间，避免把绝对时刻算错。
+    iso_tz = re.search(
+        r"(?P<y>20\d{2})-(?P<mo>\d{1,2})-(?P<d>\d{1,2})"
+        r"[T ](?P<h>\d{1,2}):(?P<mi>\d{1,2})"
+        r"(?::(?P<s>\d{1,2})(?:\.(?P<frac>\d{1,6}))?)?"
+        r"(?P<tz>Z|z|[+-]\d{2}:?\d{2})\b",
+        text,
+    )
+    if iso_tz:
+        offset = iso_tz.group("tz")
+        if offset in ("Z", "z"):
+            parsed_tz: dt.tzinfo = dt.timezone.utc
+        else:
+            sign = 1 if offset[0] == "+" else -1
+            digits = offset[1:].replace(":", "")
+            parsed_tz = dt.timezone(
+                sign * dt.timedelta(hours=int(digits[:2]), minutes=int(digits[2:4]))
+            )
+        frac = iso_tz.group("frac") or ""
+        micro = int(frac.ljust(6, "0")) if frac else 0
+        try:
+            return dt.datetime(
+                int(iso_tz.group("y")),
+                int(iso_tz.group("mo")),
+                int(iso_tz.group("d")),
+                int(iso_tz.group("h")),
+                int(iso_tz.group("mi")),
+                int(iso_tz.group("s") or 0),
+                micro,
+                tzinfo=parsed_tz,
+            )
+        except ValueError:
+            pass
 
     if "刚刚" in text or text.lower() == "now":
         return now
@@ -262,18 +303,19 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(articles)")}
     indexes = {
         row[0]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='articles'"
-        )
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
     }
     # 只有“版本号到位、列齐全、性能索引齐全”才跳过迁移：手工改库、降级、
     # 中途异常都可能让 user_version 已置位而结构缺失，此时早退会让后续
     # INSERT/SELECT 报错或让查询退化成全表排序。
     required_indexes = {sql.split("INDEX IF NOT EXISTS ")[1].split(" ")[0]
                         for sql in _PERFORMANCE_INDEX_SQL}
+    # article_id 唯一索引与 crawl_jobs 去重索引同样是结构的一部分：缺了它们
+    # 早退会让 article_id 失去唯一约束、作业去重失效，因此一并校验。
+    required_indexes |= {"idx_articles_article_id", "idx_crawl_jobs_dedupe"}
     if (
         version >= SCHEMA_VERSION
-        and {"article_id", "timezone", "raw_content"} <= columns
+        and {"article_id", "timezone", "raw_content", "content_length"} <= columns
         and required_indexes <= indexes
     ):
         return
@@ -285,21 +327,34 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     # raw_content 存 GNE 原始版本；老库只补列，不自动回填（原文已不可得）。
     if "raw_content" not in columns:
         conn.execute("ALTER TABLE articles ADD COLUMN raw_content TEXT")
+    # v5：列表接口用 content_length 列避免读整段正文 blob；老库补列后回填。
+    if "content_length" not in columns:
+        conn.execute("ALTER TABLE articles ADD COLUMN content_length INTEGER")
 
     # 分批回填，避免大库一次性 fetchall 占满内存；仍在同一事务内，保证
-    # article_id 全部回填后才会置位 user_version。
-    cursor = conn.execute(
-        "SELECT source, url FROM articles "
-        "WHERE article_id IS NULL OR article_id = ''"
-    )
+    # article_id 全部回填后才会置位 user_version。用 rowid 键集分页而不是
+    # 边读游标边改同一张表：后者会让游标在 UPDATE 过程中看到被改动的行，
+    # 在不同 SQLite 计划下可能漏读或重复扫描。
+    last_rowid = -1
     while True:
-        batch = cursor.fetchmany(2000)
+        batch = conn.execute(
+            "SELECT rowid, source, url FROM articles "
+            "WHERE (article_id IS NULL OR article_id = '') AND rowid > ? "
+            "ORDER BY rowid LIMIT 2000",
+            (last_rowid,),
+        ).fetchall()
         if not batch:
             break
         conn.executemany(
-            "UPDATE articles SET article_id = ? WHERE source = ? AND url = ?",
-            [(article_id_for(source, url), source, url) for source, url in batch],
+            "UPDATE articles SET article_id = ? WHERE rowid = ?",
+            [(article_id_for(source, url), rowid) for rowid, source, url in batch],
         )
+        last_rowid = batch[-1][0]
+    # 回填 content_length（只在列为 NULL 时算一次；正文为 NULL 的行保持 NULL）。
+    conn.execute(
+        "UPDATE articles SET content_length = length(content) "
+        "WHERE content_length IS NULL AND content IS NOT NULL"
+    )
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_article_id "
         "ON articles(article_id)"
@@ -348,8 +403,8 @@ def _ensure_wal(conn: sqlite3.Connection) -> None:
 
 
 def init_db(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn = sqlite3.connect(db_path, timeout=DB_BUSY_TIMEOUT_MS / 1000)
+    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     _ensure_wal(conn)
     conn.executescript(SCHEMA_SQL)
     # 迁移必须串行执行：API 可能同时运行多个 extract 作业，
@@ -516,38 +571,14 @@ def fetch_article_html(url: str) -> str | None:
 
 
 def extract_article(html: str, url: str) -> dict | None:
-    if is_video_page(url, html):
-        video = extract_video_meta(html, url)
-        if video is not None:
-            LOG.info("识别为视频页，使用 meta 适配抽取 %s", url)
-            return video
+    """用已抓取的 HTML 抽取一篇文章（与 url_extract.extract_article 共用实现）。
+
+    历史原因这里曾维护一份独立的抽取/渲染回退逻辑，与 url_extract.py 的版本
+    逐渐分叉（阈值、图片补全、视频判定不一致）。现在统一委托给
+    url_extract.extract_from_html，避免两处行为漂移。
+    """
     extractor = GeneralNewsExtractor()
-    try:
-        result = extractor.extract(html)
-    except NoContentException:
-        result = None
-    from_render = False
-    if result is None or content_needs_render(result.get("content")):
-        LOG.info("正文为空或过短，尝试 Chrome 渲染 %s", url)
-        rendered = fetch_html_with_browser(url)
-        if rendered:
-            from_render = True
-            try:
-                result = extractor.extract(rendered)
-            except NoContentException:
-                result = None
-    if result is None:
-        return None
-    if content_needs_render(result.get("content")):
-        if not from_render or not content_is_too_short(result.get("content")):
-            return None
-        LOG.warning(
-            "渲染回退后正文仍不足 %d 字（实际 %d 字），仍入库 %s",
-            MIN_CONTENT_LENGTH,
-            len(clean_text(result.get("content"))),
-            url,
-        )
-    return result
+    return extract_from_html(html, url, extractor, allow_browser=True)
 
 
 def save_article(
@@ -571,17 +602,24 @@ def save_article(
     空值表示"这次没有拿到该字段"，不会覆盖库中已有内容：重新抓取失败、
     文章被判过期或正文抽取失败时只更新 status/error，已经成功抓到的
     正文、标题、发布时间不会被清空。状态始终按本次结果覆盖。
+
+    images 单独区分三态：None=本次未提供（保留旧值）；[]=明确无图（清空）；
+    非空列表=覆盖。旧实现把 [] 也当成"未提供"，导致图片一旦入库就无法清空。
+    抓取流程用 normalize_images_for_update 把"抽取不到图"归一为 None，
+    只有调用方显式传 [] 才清空，避免成功重抓因抽取失败抹掉历史图片。
     """
     article_id = article_id_for(source, url)
-    images_json = json.dumps(images, ensure_ascii=False) if images else ""
+    images_json = (
+        json.dumps(images, ensure_ascii=False) if images is not None else None
+    )
     stamp = now_iso()
     conn.execute(
         """
         INSERT INTO articles (
             article_id, source, url, list_title, title, publish_time, timezone,
-            author, content, raw_content, images, status, error, first_seen_at,
-            updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            author, content, content_length, raw_content, images, status, error,
+            first_seen_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source, url) DO UPDATE SET
             article_id = excluded.article_id,
             list_title = COALESCE(NULLIF(excluded.list_title, ''), articles.list_title),
@@ -590,8 +628,11 @@ def save_article(
             timezone = COALESCE(NULLIF(excluded.timezone, ''), articles.timezone),
             author = COALESCE(NULLIF(excluded.author, ''), articles.author),
             content = COALESCE(NULLIF(excluded.content, ''), articles.content),
+            content_length = CASE WHEN excluded.content <> ''
+                THEN length(excluded.content) ELSE articles.content_length END,
             raw_content = COALESCE(NULLIF(excluded.raw_content, ''), articles.raw_content),
-            images = COALESCE(NULLIF(excluded.images, ''), articles.images),
+            images = CASE WHEN excluded.images IS NULL
+                THEN articles.images ELSE excluded.images END,
             status = excluded.status,
             error = excluded.error,
             updated_at = excluded.updated_at
@@ -606,6 +647,7 @@ def save_article(
             timezone,
             author,
             content,
+            len(content),
             raw_content,
             images_json,
             status,
@@ -748,7 +790,7 @@ def process_entry(
             title=clean_text(result.get("title")),
             content=clean_text(raw_content),
             raw_content=raw_content,
-            images=normalize_images(result.get("images"), url),
+            images=normalize_images_for_update(result.get("images"), url),
             status="unknown_date",
             error="无法解析发布日期",
         )
@@ -765,7 +807,7 @@ def process_entry(
         author=clean_text(result.get("author")),
         content=clean_text(raw_content),
         raw_content=raw_content,
-        images=normalize_images(result.get("images"), url),
+        images=normalize_images_for_update(result.get("images"), url),
         status="ok",
     )
     return "ok"
@@ -790,8 +832,8 @@ def run_source(
         "error": 0,
         "list_empty": 0,
     }
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn = sqlite3.connect(db_path, timeout=DB_BUSY_TIMEOUT_MS / 1000)
+    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     try:
         entries = collect_list_entries(source)
         if not entries:
