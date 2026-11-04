@@ -227,12 +227,17 @@ def main(argv: list[str] | None = None) -> int:
     # 输出路径的防呆必须在抓取之前：否则整批网络请求做完才发现清单路径无效，白跑一趟。
     # 用 samefile() 比较文件身份：resolve() 只能消除符号链接与路径差异，
     # 认不出指向数据库的硬链接，会把数据库原地截断；WAL/SHM 侧车文件同样不能覆盖。
+    # sidecar 可能尚未创建（如首次 WAL 初始化前），此时退回规范化路径比较。
     db_sidecars = (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm"))
-    if failed_path.exists() and any(
-        sidecar.exists() and failed_path.samefile(sidecar) for sidecar in db_sidecars
-    ):
-        print("--failed-list 不能指向数据库文件或其 WAL/SHM 侧车文件", file=sys.stderr)
-        return 2
+    failed_resolved = failed_path.resolve()
+    for sidecar in db_sidecars:
+        if failed_path.exists() and sidecar.exists():
+            same = failed_path.samefile(sidecar)
+        else:
+            same = failed_resolved == sidecar.resolve()
+        if same:
+            print("--failed-list 不能指向数据库文件或其 WAL/SHM 侧车文件", file=sys.stderr)
+            return 2
     if failed_path.is_dir():
         print(f"--failed-list 是目录：{failed_path}", file=sys.stderr)
         return 2

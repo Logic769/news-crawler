@@ -168,6 +168,16 @@ class BackfillUnitTest(unittest.TestCase):
         self.assertIn("LIMIT ?", conn.sql)
         self.assertEqual(conn.params, ["ok", "unknown_date", 3])
 
+    def test_find_candidates_limit_without_skip_real_sqlite(self) -> None:
+        for index in range(5):
+            self.insert(f"https://example.com/{index}.html")
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(len(bf.find_candidates(conn, "", 2)), 2)
+            self.assertEqual(len(bf.find_candidates(conn, "", 0)), 5)
+        finally:
+            conn.close()
+
     def test_find_candidates_does_not_push_limit_when_skip_present(self) -> None:
         skip = {("site", "https://example.com/a.html")}
         conn = _FakeConnection(
@@ -194,15 +204,15 @@ class BackfillUnitTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(bf.main(["--db", str(self.db), "--failed-list", str(link_path)]), 2)
 
-    def test_main_rejects_wal_sidecar_as_failed_list(self) -> None:
+    def test_main_rejects_uncreated_wal_and_shm_sidecar_paths(self) -> None:
         self.insert("https://127.0.0.1:1/unreachable.html")
-        sidecar = Path(f"{self.db}-wal")
-        sidecar.write_bytes(b"")
-        try:
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self.db}{suffix}")
+            # 防呆必须在 sidecar 尚不存在时也生效，否则 write_text 会创建伪 sidecar
+            self.assertFalse(sidecar.exists())
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(bf.main(["--db", str(self.db), "--failed-list", str(sidecar)]), 2)
-        finally:
-            sidecar.unlink(missing_ok=True)
+            self.assertFalse(sidecar.exists())
 
     def test_main_accepts_existing_failed_list_file(self) -> None:
         failed = self.root / "failed.txt"
