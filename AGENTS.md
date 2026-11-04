@@ -468,7 +468,7 @@ curl http://localhost:8000/v1/health
 - `smoke_test.py`：部署自检，验证导入、日期解析、GNE 抽取、SQLite 初始化、视频页判定、图片地址补全、浏览器回退状态码白名单、性能索引是否建齐、`raw_content` 落库与「本次未传不覆盖」、`old` 在窗口放宽后是否重抓；样本缺失时回退到 `smoke_fixture.py` 的内置新闻页（与 `api_smoke.py` 共用）；
 - `api_smoke.py`：启动临时 uvicorn + 临时 SQLite，验证鉴权、查询、详情（含 `raw_content` 换行）、统计、异步作业全链路，以及入库图片必须为绝对 URL；
 - `verify_live_news.py` + `live_news_pool.json`：从 100 静态 / 50 JS 渲染 / 50 视频的页面池中随机抽取（默认 10/10/10）访问公开新闻站点，验证三条抽取路径；视频池要求覆盖 ≥10 个来源站点；
-- `regression/`：62 篇样本的离线抽取基线（含 `meta_keys`/`meta_sha1`/`is_video`），外加列表页解析与视频页判定两组独立用例；
+- `regression/`：62 篇样本的离线抽取基线（含 `meta_keys`/`meta_sha1`/`is_video`），外加列表页解析、视频页判定与回填脚本三组独立用例；
 
 ### 实时新闻池维护
 
@@ -501,6 +501,7 @@ curl http://localhost:8000/v1/health
 | `regression/test_gne_regression.py` | 3 个用例：全部样本与基线一致、基线可复现、样本集合与基线匹配 |
 | `regression/test_list_page.py` | 3 个用例：列表页解析的条目定位、feature 缺失、少于 4 条时不回退 |
 | `regression/test_video_detection.py` | 5 个用例：路径规则、`og:type`、JSON-LD `VideoObject`、文章内嵌视频不误判 |
+| `regression/test_backfill.py` | 5 个用例：候选 skip/limit、失败清单列清洗、BOM 跳过清单、`--skip-file` 条目在下次失败清单中保留、`--failed-list` 指向数据库/目录时抓取前返回 2 |
 
 运行方式：`python -X utf8 -m unittest discover -s regression -t . -p "test_*.py" -v`（约 15 秒，无需网络）。
 

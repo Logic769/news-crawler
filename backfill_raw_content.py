@@ -215,6 +215,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         skip = load_skip_list(skip_path)
 
+    failed_path = Path(args.failed_list) if args.failed_list else db_path.parent / "backfill_failed.txt"
+    # 输出路径的防呆必须在抓取之前：否则整批网络请求做完才发现清单路径无效，白跑一趟。
+    if failed_path.resolve() == db_path.resolve():
+        print("--failed-list 不能指向数据库文件本身", file=sys.stderr)
+        return 2
+    if failed_path.is_dir():
+        print(f"--failed-list 是目录：{failed_path}", file=sys.stderr)
+        return 2
+
     if args.dry_run:
         # dry-run 不抓取，但 init_db 仍会把 v3 库迁移到 v4 结构，这里提前说明。
         try:
@@ -252,13 +261,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print("dry-run：未抓取，未写入任何正文。")
         return 0
-    failed_path = Path(args.failed_list) if args.failed_list else db_path.parent / "backfill_failed.txt"
-    if failed_path.resolve() == db_path.resolve():
-        print("--failed-list 不能指向数据库文件本身", file=sys.stderr)
-        return 2
-    if failed_path.is_dir():
-        print(f"--failed-list 是目录：{failed_path}", file=sys.stderr)
-        return 2
     # 每次运行覆盖写，但保留本次 --skip-file 中的条目（它们仍是已知死链，只是这次没轮到），
     # 否则第二次运行会清空清单，第三次又把死链重新抓一遍。
     known = {(source, url) for source, url, _ in failures}
@@ -266,8 +268,11 @@ def main(argv: list[str] | None = None) -> int:
         (source, url, "上次失败，本次跳过") for source, url in sorted(skip) if (source, url) not in known
     ]
     write_failed_list(failed_path, failures + preserved)
-    if failures:
-        print(f"失败清单已写入：{failed_path}（下次可用 --skip-file 跳过这些条目）")
+    if failures or preserved:
+        print(
+            f"失败清单已写入：{failed_path}"
+            f"（本次失败 {len(failures)} 条，保留上次失败 {len(preserved)} 条；下次可用 --skip-file 跳过这些条目）"
+        )
     print(f"完成：回填 {updated} 条，失败 {failed} 条，跳过 {skipped} 条。")
     return 0
 
