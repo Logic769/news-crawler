@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from gne import GeneralNewsExtractor
 from gne.extractors.author import AuthorExtractor
-from gne.html import html2element
+from gne.html import BR_SENTINEL, html2element
 
 ARTICLE_HTML = (
     "<html><head><title>测试标题</title></head><body><article>"
@@ -25,25 +26,35 @@ class GneHtmlTest(unittest.TestCase):
 
     def test_br_sentinel_does_not_leak_into_metadata_fields(self) -> None:
         html = (
-            "<html><head><title>甲<br>乙</title></head><body><article>"
-            "<h1>甲<br>乙</h1><div class='author'>作者甲<br>作者乙</div>"
+            "<html><head><title>测试标题</title></head><body><article>"
+            "<div class='author'>作者甲<br>作者乙</div>"
             "<div class='content'><p>"
             + ("正文内容，" * 40)
             + "</p></div></article></body></html>"
         )
-        result = GeneralNewsExtractor().extract(html)
-        self.assertIn("甲\n乙", result["title"])
+        # <title> 在不同 lxml 版本下的 br 解析不同，这里直接模拟提取器返回
+        # 含哨兵的标题，专门验证 engine 的元数据归一化契约。
+        with patch(
+            "gne.engine.TitleExtractor.extract",
+            return_value=f"甲{BR_SENTINEL}乙",
+        ):
+            result = GeneralNewsExtractor().extract(html)
+        self.assertEqual(result["title"], "甲\n乙")
         self.assertEqual(result["author"], "作者甲\n作者乙")
         for field in ("title", "author", "publish_time", "content"):
             self.assertNotIn("\ue000", str(result[field]), field)
 
     def test_metadata_br_edges_are_stripped(self) -> None:
         html = (
-            "<html><head><title><br>甲<br></title></head><body><article><p>"
+            "<html><head><title>测试标题</title></head><body><article><p>"
             + ("正文内容，" * 40)
             + "</p></article></body></html>"
         )
-        result = GeneralNewsExtractor().extract(html)
+        with patch(
+            "gne.engine.TitleExtractor.extract",
+            return_value=f"{BR_SENTINEL}甲{BR_SENTINEL}",
+        ):
+            result = GeneralNewsExtractor().extract(html)
         self.assertEqual(result["title"], "甲")
 
     def test_json_ld_with_br_is_not_rewritten(self) -> None:
