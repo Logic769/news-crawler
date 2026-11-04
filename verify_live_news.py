@@ -52,6 +52,10 @@ STATIC_POOL = (
     "https://news.southcn.com/node_47a8059d6c/a7e1c0a6d8.shtml",
     "https://www.thepaper.cn/newsDetail_forward_34370855",
     "https://news.iqilu.com/china/gedi/2026/1030/5957425.shtml",
+    # 替补：池文件缺失时，任一页面失效仍有足够页面补抽。
+    "https://news.dahe.cn/2026/10-30/2146973.html",
+    "https://news.dahe.cn/2026/10-30/2146980.html",
+    "https://news.youth.cn/sz/202610/t20261030_16941540.htm",
 )
 
 DYNAMIC_POOL = (
@@ -63,8 +67,12 @@ DYNAMIC_POOL = (
     "https://www.sz.gov.cn/cn/xxgk/zfxxgj/zwdt/content/post_13046708.html",
     "https://xapp.southcn.com/app/activity.html?id=44150",
     "https://nw.eastday.com/self/yw/20261030/bbf4e3e5c52d4bbead83903015d09fb5.html",
-    "http://www.people.com.cn/n/2013/1227/c373005-23961344.html",
     "https://zjnews.zjol.com.cn/yc/qmt/202610/t20261030_31999544.shtml",
+    # 替补：确保默认 10 页目标之外仍有可替换的健康页面；均为实测需渲染的动态页。
+    "https://news.jschina.com.cn/yw/202610/t20261030_s6ae499c5e4b09a8e24351824.shtml",
+    "https://nw.eastday.com/zq/zh/20261030/12f7b5f4b6c457f779f1c95c20fa419d.html",
+    "https://nw.eastday.com/self/yw/20261030/8f8ceccb47d64c2a8ea05967f73b721f.html",
+    "https://news.cctv.com/2026/10/30/ARTIZpZEh3a2ocOsZYX3GKsb261029.shtml",
 )
 
 VIDEO_POOL = (
@@ -78,6 +86,10 @@ VIDEO_POOL = (
     "http://www.ahwang.cn/video/2026/1103/3072063.html",
     "https://www.chinanews.com.cn/sh/shipin/cns/2026/11-03/news1073659.shtml",
     "http://www.cnwest.com/shipin/a/2025/12/09/23253101.html",
+    # 替补：视频页失效时仍能补足默认 10 页目标。
+    "https://www.kankanews.com/detail/7Y2zDo315Qo",
+    "http://www.news.cn/video/20261022/906f6edca3284901ae914ac4a6a1ed06/c.html",
+    "https://www.yntv.cn/video/20261030/1793369809827832.html",
 )
 
 

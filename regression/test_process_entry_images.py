@@ -44,7 +44,9 @@ class ProcessEntryImagesTest(unittest.TestCase):
                     "images": [],
                 }
                 with mock.patch.object(
-                    news_crawler, "fetch_article_html", return_value="<html></html>"
+                    news_crawler,
+                    "fetch_article_html",
+                    return_value=("<html></html>", False),
                 ), mock.patch.object(
                     news_crawler, "extract_article", return_value=result
                 ):

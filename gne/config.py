@@ -24,7 +24,7 @@ def read_config(path: str | os.PathLike[str] = CONFIG_FILENAME) -> dict[str, Any
             return {}
         with config_path.open(encoding="utf-8") as config_file:
             data = yaml.safe_load(config_file)
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
         LOG.warning("读取 GNE 配置失败，已忽略 %s：%s", config_path, exc)
         return {}
     return data if isinstance(data, dict) else {}

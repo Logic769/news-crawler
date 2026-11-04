@@ -162,7 +162,9 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
         publish_text = news_crawler.clean_text(result.get("publish_time"))
         publish_dt = news_crawler.parse_datetime(publish_text, None, settings.timezone)
         if publish_dt is not None:
-            publish_text = publish_dt.strftime("%Y-%m-%d %H:%M:%S")
+            publish_text = news_crawler.format_publish_time(
+                publish_dt, settings.timezone
+            )
         status = "ok" if publish_dt is not None else "unknown_date"
         error = "" if publish_dt is not None else "无法解析发布日期"
         article_id = news_crawler.save_article(

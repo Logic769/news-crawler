@@ -98,7 +98,14 @@ class JobManager:
             if now - self._last_cleanup < JOB_CLEANUP_INTERVAL_SECONDS:
                 return
             self._last_cleanup = now
-        self._cleanup_finished()
+        try:
+            self._cleanup_finished()
+        except Exception:  # noqa: BLE001 - 清理失败不能堵住新作业提交
+            # 清理是维护动作：DELETE 遇到写锁等异常时，记录已提交的作业仍然
+            # 必须 submit；同时把 last_cleanup 归零，下一次 create 会重试清理。
+            with self._lock:
+                self._last_cleanup = 0.0
+            LOG.exception("清理过期作业失败，已跳过本次清理")
 
     def start(self) -> None:
         """Mark interrupted jobs and resume the queued ones."""
@@ -114,7 +121,12 @@ class JobManager:
             ).fetchall()
             conn.commit()
         self._last_cleanup = time.monotonic()
-        self._cleanup_finished()
+        try:
+            self._cleanup_finished()
+        except Exception:  # noqa: BLE001 - 清理失败不能阻断 API 启动
+            with self._lock:
+                self._last_cleanup = 0.0
+            LOG.exception("启动时清理过期作业失败，已跳过本次清理")
         for row in rows:
             self.submit(str(row["id"]))
 

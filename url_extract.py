@@ -329,7 +329,13 @@ def is_video_page(url: str, html_text: str) -> bool:
     # 路径命中 /video|shipin|vod/ 不再直接判为视频页，必须有 <video> 或 og:video
     # 这类页面内证据，否则 /video/ 下的图文稿件会被误判。
     has_video_tag = bool(re.search(r"(?is)<video(?=[ />])", head))
-    if _VIDEO_PATH_RE.search(path) and (has_video_tag or has_video_meta):
+    # /video/ 路径只是提示；主实体是 NewsArticle 时，内嵌 <video> 不代表
+    # 整页是视频页（与上面的 @graph 分支保持同一判断）。
+    if (
+        _VIDEO_PATH_RE.search(path)
+        and (has_video_tag or has_video_meta)
+        and not ({"Article", "NewsArticle"} & main_types)
+    ):
         return True
     return False
 
@@ -567,7 +573,9 @@ def fetch_html_with_browser(
                     return
                 route.continue_()
 
-            page.route("**/*", _guard)
+            # 用 context 而不是 page 注册：window.open 新开标签页的首个请求
+            # 也必须经过同一套 URL/IP 校验，page.route 拦截不到弹窗页面。
+            context.route("**/*", _guard)
         try:
             page.goto(url, wait_until="networkidle", timeout=RENDER_NAV_TIMEOUT_MS)
         except Exception:
@@ -709,6 +717,11 @@ def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) 
         if url_validator is not None:
             # 重定向目标先按 URL 策略校验（域名层），连接时再按真实解析出的
             # IP 校验（防 DNS rebinding）；两层都通过才建立连接。
+            # build_opener 会自动补一个读取 HTTP(S)_PROXY 的 ProxyHandler；
+            # API extract 的 url_validator 路径要求直连并校验真实解析 IP，
+            # 否则会改连代理（校验代理地址或把 TLS 直接发给代理）。显式传空
+            # 字典禁用环境代理；不带 validator 的爬虫路径保持原有代理行为。
+            handlers.append(urllib.request.ProxyHandler({}))
             handlers.append(_ValidatingRedirectHandler(url_validator))
             handlers.append(_PinnedHTTPSHandler(url_validator, context))
             handlers.append(_PinnedHTTPHandler(url_validator))
@@ -774,6 +787,7 @@ def extract_from_html(
     *,
     allow_browser: bool = True,
     url_validator: Callable[[str], None] | None = None,
+    already_rendered: bool = False,
 ) -> dict | None:
     """Extract one article already-fetched HTML (shared by CLI and crawler).
 
@@ -793,27 +807,39 @@ def extract_from_html(
         result = None
 
     if result is None or content_needs_render(result.get("content")):
-        if not allow_browser:
-            LOG.info("直接抓取未提取到正文，且浏览器回退已禁用。")
-            return None
-        LOG.info("直接抓取未提取到正文，正在用本机 Chrome 无头模式渲染...")
-        rendered = fetch_html_with_browser(url, url_validator=url_validator)
-        if rendered is None:
-            LOG.info("无法提取正文。可能是列表页，或不是新闻文章页。")
-            return None
-        html = rendered
-        try:
-            result = extractor.extract(html)
-        except NoContentException:
-            result = None
-        if result is None:
-            LOG.info("浏览器渲染后仍无法提取正文。可能是列表页，或不是新闻文章页。")
-            return None
-        if content_needs_render(result.get("content")):
-            if not content_is_too_short(result.get("content")):
+        if already_rendered:
+            # HTML 已经过 Chromium 渲染，再启动一次只会重复等一轮；仍为空
+            # 就按失败返回，正文过短则沿用下面的最短长度兜底策略。
+            if result is None:
                 LOG.info("浏览器渲染后仍无法提取正文。可能是列表页，或不是新闻文章页。")
                 return None
-            LOG.warning("渲染回退后正文仍不足 %d 字，仍按原文返回。", MIN_CONTENT_LENGTH)
+            if content_needs_render(result.get("content")):
+                if not content_is_too_short(result.get("content")):
+                    LOG.info("浏览器渲染后仍无法提取正文。可能是列表页，或不是新闻文章页。")
+                    return None
+                LOG.warning("渲染回退后正文仍不足 %d 字，仍按原文返回。", MIN_CONTENT_LENGTH)
+        elif not allow_browser:
+            LOG.info("直接抓取未提取到正文，且浏览器回退已禁用。")
+            return None
+        else:
+            LOG.info("直接抓取未提取到正文，正在用本机 Chrome 无头模式渲染...")
+            rendered = fetch_html_with_browser(url, url_validator=url_validator)
+            if rendered is None:
+                LOG.info("无法提取正文。可能是列表页，或不是新闻文章页。")
+                return None
+            html = rendered
+            try:
+                result = extractor.extract(html)
+            except NoContentException:
+                result = None
+            if result is None:
+                LOG.info("浏览器渲染后仍无法提取正文。可能是列表页，或不是新闻文章页。")
+                return None
+            if content_needs_render(result.get("content")):
+                if not content_is_too_short(result.get("content")):
+                    LOG.info("浏览器渲染后仍无法提取正文。可能是列表页，或不是新闻文章页。")
+                    return None
+                LOG.warning("渲染回退后正文仍不足 %d 字，仍按原文返回。", MIN_CONTENT_LENGTH)
     # 抽取出的图片可能是 //cdn.example.com/x.jpg 这类协议相对地址，
     # 按文章 URL 补全，避免下游拿到无法直接使用的地址。
     result["images"] = normalize_images(result.get("images"), url)
@@ -828,6 +854,7 @@ def extract_article(
     url_validator: Callable[[str], None] | None = None,
 ) -> dict | None:
     LOG.info("正在抓取: %s", url)
+    already_rendered = False
     try:
         html = fetch_html(url, url_validator=url_validator)
     except urllib.error.HTTPError as exc:
@@ -843,6 +870,7 @@ def extract_article(
             LOG.warning("浏览器回退失败。")
             return None
         html = rendered
+        already_rendered = True
     except (urllib.error.URLError, ValueError, TimeoutError, ConnectionError) as exc:
         LOG.warning("抓取失败（网络错误或网址无效）：%s", exc)
         return None
@@ -853,6 +881,7 @@ def extract_article(
         extractor,
         allow_browser=allow_browser,
         url_validator=url_validator,
+        already_rendered=already_rendered,
     )
 
 

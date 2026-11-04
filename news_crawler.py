@@ -166,22 +166,23 @@ def parse_datetime(
         r"(?P<y>20\d{2})-(?P<mo>\d{1,2})-(?P<d>\d{1,2})"
         r"[T ](?P<h>\d{1,2}):(?P<mi>\d{1,2})"
         r"(?::(?P<s>\d{1,2})(?:\.(?P<frac>\d{1,6}))?)?"
-        r"(?P<tz>Z|z|[+-]\d{2}:?\d{2})\b",
+        r"(?P<tz>Z|z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)\b",
         text,
     )
     if iso_tz:
         offset = iso_tz.group("tz")
-        if offset in ("Z", "z"):
-            parsed_tz: dt.tzinfo = dt.timezone.utc
-        else:
-            sign = 1 if offset[0] == "+" else -1
-            digits = offset[1:].replace(":", "")
-            parsed_tz = dt.timezone(
-                sign * dt.timedelta(hours=int(digits[:2]), minutes=int(digits[2:4]))
-            )
         frac = iso_tz.group("frac") or ""
         micro = int(frac.ljust(6, "0")) if frac else 0
         try:
+            if offset in ("Z", "z"):
+                parsed_tz: dt.tzinfo = dt.timezone.utc
+            else:
+                sign = 1 if offset[0] == "+" else -1
+                digits = offset[1:].replace(":", "")
+                parsed_tz = dt.timezone(
+                    sign
+                    * dt.timedelta(hours=int(digits[:2]), minutes=int(digits[2:4]))
+                )
             return dt.datetime(
                 int(iso_tz.group("y")),
                 int(iso_tz.group("mo")),
@@ -295,6 +296,14 @@ def parse_datetime(
         return dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def format_publish_time(value: dt.datetime, timezone_name: str) -> str:
+    """Format an aware datetime as the site local wall clock."""
+    tz = get_timezone(timezone_name)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=tz)
+    return value.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
@@ -554,9 +563,15 @@ def collect_list_entries(source: dict) -> list[dict]:
     return all_items
 
 
-def fetch_article_html(url: str) -> str | None:
+def fetch_article_html(url: str) -> tuple[str, bool] | None:
+    """Fetch an article, returning (html, already_rendered).
+
+    already_rendered tells extract_article whether the HTML came from the
+    browser fallback, so it must not launch Chromium a second time just because
+    GNE still considers the content short or empty.
+    """
     try:
-        return fetch_html(url)
+        return fetch_html(url), False
     except urllib.error.HTTPError as exc:
         # 404/410/500 之类渲染后仍然是同样的错误，回退只会白等一次浏览器
         # 启动（实测单条 1.84s）；只有“被拒绝”的错误才值得换浏览器再试。
@@ -564,21 +579,28 @@ def fetch_article_html(url: str) -> str | None:
             LOG.warning("直接抓取文章失败 %s (HTTP %s)，不回退浏览器。", url, exc.code)
             return None
         LOG.warning("直接抓取文章被拒绝 %s (HTTP %s)，尝试浏览器。", url, exc.code)
-        return fetch_html_with_browser(url)
+        rendered = fetch_html_with_browser(url)
+        return (rendered, True) if rendered else None
     except Exception as exc:
         LOG.warning("直接抓取文章失败 %s (%s)，尝试浏览器。", url, exc)
-        return fetch_html_with_browser(url)
+        rendered = fetch_html_with_browser(url)
+        return (rendered, True) if rendered else None
 
 
-def extract_article(html: str, url: str) -> dict | None:
+def extract_article(
+    html: str, url: str, *, already_rendered: bool = False
+) -> dict | None:
     """用已抓取的 HTML 抽取一篇文章（与 url_extract.extract_article 共用实现）。
 
     历史原因这里曾维护一份独立的抽取/渲染回退逻辑，与 url_extract.py 的版本
     逐渐分叉（阈值、图片补全、视频判定不一致）。现在统一委托给
-    url_extract.extract_from_html，避免两处行为漂移。
+    url_extract.extract_from_html，避免两处行为漂移。already_rendered=True
+    表示 HTML 已由浏览器渲染过，抽取层不得再次启动 Chromium。
     """
     extractor = GeneralNewsExtractor()
-    return extract_from_html(html, url, extractor, allow_browser=True)
+    return extract_from_html(
+        html, url, extractor, allow_browser=True, already_rendered=already_rendered
+    )
 
 
 def save_article(
@@ -718,7 +740,7 @@ def process_entry(
             source_name,
             url,
             list_title=entry.get("title", ""),
-            publish_time=list_date.strftime("%Y-%m-%d %H:%M:%S"),
+            publish_time=format_publish_time(list_date, tz_name),
             timezone=tz_name,
             status="old",
         )
@@ -728,8 +750,8 @@ def process_entry(
     # 实测 3 篇文章之间的间隔只有 0.13s（配置 0.5s 未生效）。
     if delay > 0:
         time.sleep(delay)
-    html = fetch_article_html(url)
-    if not html:
+    fetched = fetch_article_html(url)
+    if not fetched:
         save_article(
             conn,
             source_name,
@@ -739,8 +761,9 @@ def process_entry(
             error="抓取 HTML 失败（直接抓取和浏览器回退均失败）",
         )
         return "error"
+    html, already_rendered = fetched
 
-    result = extract_article(html, url)
+    result = extract_article(html, url, already_rendered=already_rendered)
     if result is None:
         save_article(
             conn,
@@ -765,7 +788,7 @@ def process_entry(
     if publish_dt is None:
         publish_dt = list_date
     if publish_dt is not None:
-        publish_text = publish_dt.strftime("%Y-%m-%d %H:%M:%S")
+        publish_text = format_publish_time(publish_dt, tz_name)
 
     if publish_dt and publish_dt < cutoff:
         save_article(

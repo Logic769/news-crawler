@@ -759,8 +759,8 @@
     },
     "tests/other/1.html": {
       "author": "马娟",
-      "content_len": 282,
-      "content_sha1": "21303bfedf6605404b76be6c90ee6d9edb9f69c9",
+      "content_len": 284,
+      "content_sha1": "d678dce3ae8cfda0cd3ed1abeac5dd5ee0761c5d",
       "images": [],
       "is_video": false,
       "meta_keys": [
@@ -1168,8 +1168,8 @@
     },
     "tests/thepaper/1.html": {
       "author": "张珺",
-      "content_len": 2670,
-      "content_sha1": "055d2a8d8457fff50f671b7d772487513dbc5afd",
+      "content_len": 2697,
+      "content_sha1": "fde8e1ef511bcc61e757607d3a7733b5df7b857a",
       "images": [
         "http://image.thepaper.cn/www/image/31/646/420.jpg"
       ],
@@ -1187,8 +1187,8 @@
     },
     "tests/thepaper/2.html": {
       "author": "澎湃新闻",
-      "content_len": 1441,
-      "content_sha1": "02f3c3c7031ac6c0e2acfb5148ae17093996d0d7",
+      "content_len": 1495,
+      "content_sha1": "dc640aa66d0fba1c8ff4174edf96af361c7a8142",
       "images": [
         "http://image.thepaper.cn/www/image/27/132/233.gif",
         "http://image.thepaper.cn/www/image/27/132/238.gif",
@@ -1222,8 +1222,8 @@
     },
     "tests/thepaper/3.html": {
       "author": "柴敏懿",
-      "content_len": 2964,
-      "content_sha1": "9321c6fa7b47cf9d4438f51a94ed30274613e0f1",
+      "content_len": 2991,
+      "content_sha1": "e359d68752002498b438b22d522514160ffb01c7",
       "images": [],
       "is_video": false,
       "meta_keys": [
@@ -1239,8 +1239,8 @@
     },
     "tests/thepaper/4.html": {
       "author": "不要误读潜伏期中最小最大值",
-      "content_len": 1441,
-      "content_sha1": "02f3c3c7031ac6c0e2acfb5148ae17093996d0d7",
+      "content_len": 1495,
+      "content_sha1": "dc640aa66d0fba1c8ff4174edf96af361c7a8142",
       "images": [
         "http://image.thepaper.cn/www/image/27/132/233.gif",
         "http://image.thepaper.cn/www/image/27/132/238.gif",
@@ -1274,8 +1274,8 @@
     },
     "tests/thepaper/5.html": {
       "author": "澎湃新闻",
-      "content_len": 1838,
-      "content_sha1": "6968b3f162a531b230a64f0a2b25bce6c1c67106",
+      "content_len": 1848,
+      "content_sha1": "5735c8d9ba49d94427120f154e64c22a9e141746",
       "images": [
         "https://imagecloud.thepaper.cn/thepaper/image/71/276/154.jpg"
       ],
@@ -1367,8 +1367,8 @@
     },
     "tests/toutiao/5.html": {
       "author": "搜索",
-      "content_len": 3577,
-      "content_sha1": "65a78822d7f7b94f24761a0208d4999f81063336",
+      "content_len": 3578,
+      "content_sha1": "1edb5021392bc5a2f5172dfd01a1612577001bb6",
       "images": [
         "http://p1.pstatp.com/large/pgc-image/da8ce7e46cb44da08bf0019ba5a01a4c",
         "http://p1.pstatp.com/large/pgc-image/d5f6dd7d9fe84bf2aaa6403432dd91d9",
@@ -1468,8 +1468,8 @@
     },
     "tests/wechat/2.html": {
       "author": "kingname",
-      "content_len": 1941,
-      "content_sha1": "a14e4bbc52ede50bf3992d124f84d87e07165efa",
+      "content_len": 1967,
+      "content_sha1": "8dd0d98787911e771d54b105b0afa71fd406cd25",
       "images": [
         "https://mmbiz.qpic.cn/mmbiz_png/ohoo1dCmvqcPMa1q8sNSLfLoAd7t12EnJicRib027D6DeKgicLUZrG63X3slpKGtoKdzNprCFCmCvSpVyZWaYnrTg/640?wx_fmt=png&tp=webp&wxfrom=5&wx_lazy=1&wx_co=1",
         "data:image/gif;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQImWNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==",
@@ -1505,8 +1505,8 @@
     },
     "tests/xds/1.html": {
       "author": "天天基金网",
-      "content_len": 1572,
-      "content_sha1": "49392643c130e29ff8df611b8b0f4c5d946d57cc",
+      "content_len": 1628,
+      "content_sha1": "470a39bb524529dc5861f253c0aeeb1ee6441651",
       "images": [],
       "is_video": false,
       "meta_keys": [

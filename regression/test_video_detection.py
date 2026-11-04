@@ -50,6 +50,15 @@ class VideoPageDetectionTest(unittest.TestCase):
         )
         self.assertFalse(is_video_page("https://example.com/a.html", html))
 
+    def test_video_path_with_newsarticle_main_entity_is_not_video(self) -> None:
+        # 路径命中 /video/ 但主实体是 NewsArticle，页面内嵌 <video> 也不算视频页。
+        html = (
+            '<html><head><script type="application/ld+json">'
+            '{"@type": "NewsArticle", "name": "x"}'
+            "</script></head><body><video controls></video></body></html>"
+        )
+        self.assertFalse(is_video_page("https://example.com/video/abc.html", html))
+
     def test_plain_article(self) -> None:
         html = "<html><body><p>普通文章</p></body></html>"
         self.assertFalse(is_video_page("https://example.com/a.html", html))

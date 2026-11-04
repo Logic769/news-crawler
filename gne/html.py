@@ -15,9 +15,11 @@ from .constants import (
     USELESS_TAG,
 )
 
-# 只匹配真正的 <br>/<br/>：\b 防止误伤 <brand> 这类以 br 开头的标签。
-_BR_RE = re.compile(r"</?br\b[^>]*>", re.I)
 HIGH_WEIGHT_KEYWORD_RE = re.compile("|".join(HIGH_WEIGHT_ATTR_KEYWORD), flags=re.I)
+
+# 用私有区字符暂存 <br>：解析后只替换真实 br 元素，既保留断行又不改写
+# JSON-LD 脚本里的转义文本；评分阶段再把它当作不存在（见 content.py）。
+BR_SENTINEL = "\ue000"
 
 
 def _is_useless_node(class_name: str, id_name: str) -> bool:
@@ -72,13 +74,34 @@ def normalize_node(element: HtmlElement) -> None:
         remove_node(node)
 
 
-def html2element(html: str) -> HtmlElement:
-    """Parse an HTML fragment, turning ``br`` tags into line breaks.
+def _replace_br_elements(root: HtmlElement) -> HtmlElement:
+    """Replace real ``<br>`` elements with a sentinel text character.
 
-    以前直接删除 ``<br>`` 会让相邻文本粘连（"foo<br>bar" → "foobar"），
-    这里替换为换行，保留断行语义；后续文本归一化会把多余空白压平。
+    Only parsed DOM elements are touched, so ``<br>`` appearing inside a
+    JSON-LD script string is left intact for ``json.loads``.
     """
-    return fromstring(_BR_RE.sub("\n", html))
+    for br in list(root.iter("br")):
+        parent = br.getparent()
+        if parent is None:
+            continue
+        previous = br.getprevious()
+        tail = br.tail or ""
+        if previous is not None:
+            previous.tail = f"{previous.tail or ''}{BR_SENTINEL}{tail}"
+        else:
+            parent.text = f"{parent.text or ''}{BR_SENTINEL}{tail}"
+        parent.remove(br)
+    return root
+
+
+def html2element(html: str) -> HtmlElement:
+    """Parse an HTML fragment and mark real line breaks for later restoration.
+
+    Rewriting raw ``<br>`` markup would also corrupt escaped ``<br>`` inside
+    JSON-LD strings and make ``json.loads`` fail, so only parsed br elements
+    are converted.
+    """
+    return _replace_br_elements(fromstring(html))
 
 
 def pre_parse(element: HtmlElement) -> HtmlElement:

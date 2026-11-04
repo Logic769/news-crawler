@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import secrets
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -45,6 +46,28 @@ from news_api.settings import Settings
 from news_api.timeutil import normalize_db_bound, resolve_timezone
 
 LOG = logging.getLogger("news_api")
+
+# health 的 COUNT(*) 缓存需要锁：多个请求同时发现缓存过期时，只允许一个真正
+# 执行全表计数，其余复用刚写回的结果。
+_HEALTH_COUNT_LOCK = threading.Lock()
+
+
+def _cors_headers_for(request: Request) -> dict[str, str] | None:
+    """Return CORS headers for responses produced outside CORSMiddleware.
+
+    Starlette calls the generic Exception handler from ServerErrorMiddleware,
+    which sits outside user middleware, so a 500 response would otherwise miss
+    the CORS headers that normal responses get. Keep the same origin allow-list.
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return None
+    allowed = request.app.state.settings.cors_origins
+    if "*" in allowed:
+        return {"Access-Control-Allow-Origin": "*"}
+    if origin in allowed:
+        return {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+    return None
 
 
 def require_api_key(request: Request) -> None:
@@ -165,6 +188,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "message": "服务器内部错误",
                 }
             },
+            headers=_cors_headers_for(request),
         )
 
     @app.exception_handler(RequestValidationError)
@@ -208,8 +232,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             cached = getattr(state, "health_count_cache", None)
             now = time.monotonic()
             if cached is None or now - cached[0] >= 30:
-                total = count_articles(runtime.db_path)
-                state.health_count_cache = (now, total)
+                with _HEALTH_COUNT_LOCK:
+                    # 锁内二次检查：并发请求同时看到过期时，只让第一个计数。
+                    cached = getattr(state, "health_count_cache", None)
+                    now = time.monotonic()
+                    if cached is None or now - cached[0] >= 30:
+                        total = count_articles(runtime.db_path)
+                        state.health_count_cache = (now, total)
+                    else:
+                        total = cached[1]
             else:
                 total = cached[1]
         except Exception as exc:  # noqa: BLE001 - health reports degradation
@@ -251,8 +282,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         source: str | None = Query(None, max_length=100),
         published_from: str | None = Query(None, max_length=40),
         published_to: str | None = Query(None, max_length=40),
-        q: str | None = Query(None, min_length=2, max_length=200),
-        page: int = Query(1, ge=1, le=10000),
+        q: str | None = Query(None, max_length=200),
+        page: int = Query(1, ge=1),
         page_size: int = Query(20, ge=1, le=100),
         order: str = Query(
             "published_desc",

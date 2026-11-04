@@ -69,6 +69,24 @@ def _request(
             return exc.code, {"raw": raw}
 
 
+def _request_headers(
+    base: str, path: str, origin: str, key: str | None = API_KEY
+) -> tuple[int, dict[str, str]]:
+    req = urllib.request.Request(base + path, method="GET")
+    req.add_header("Origin", origin)
+    if key:
+        req.add_header("X-API-Key", key)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            return response.status, {
+                key.lower(): value for key, value in response.headers.items()
+            }
+    except urllib.error.HTTPError as exc:
+        return exc.code, {
+            key.lower(): value for key, value in exc.headers.items()
+        }
+
+
 def _serve(app) -> tuple[uvicorn.Server, threading.Thread, str]:
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
@@ -179,6 +197,7 @@ def main() -> None:
             api_key=API_KEY,
             job_workers=1,
             timezone="Asia/Shanghai",
+            cors_origins=("https://client.example",),
             allow_private_urls=True,
         )
         app = create_app(settings)
@@ -207,6 +226,20 @@ def main() -> None:
                 base, "GET", "/v1/articles?q=" + urllib.parse.quote("100%")
             )
             assert status == 200 and no_match["meta"]["total"] == 0, no_match
+
+            # 单字中文与空 q 都是合法查询：空 q 不过滤，单字可模糊搜索。
+            status, single_char = _request(
+                base, "GET", "/v1/articles?q=" + urllib.parse.quote("测")
+            )
+            assert status == 200 and single_char["meta"]["total"] == 1, single_char
+            status, empty_q = _request(base, "GET", "/v1/articles?q=")
+            assert status == 200 and empty_q["meta"]["total"] == 1, empty_q
+
+            # page 上限不能拒绝有效输入：超大页码返回空页而不是 422。
+            status, high_page = _request(
+                base, "GET", "/v1/articles?page=10001&page_size=1"
+            )
+            assert status == 200 and high_page["data"] == [], high_page
 
             status, detail = _request(base, "GET", f"/v1/articles/{article_id}")
             assert status == 200 and detail["content"], detail
@@ -261,6 +294,24 @@ def main() -> None:
                 app_module.stats = original_stats
             assert status == 500, (status, failed)
             assert failed["error"]["code"] == "internal_error", failed
+
+            # 500 由最外层 ServerErrorMiddleware 产生，也必须带 CORS 头，
+            # 否则白名单内的跨域客户端读不到错误体。
+            original_stats = app_module.stats
+            app_module.stats = lambda *_a, **_k: (_ for _ in ()).throw(
+                RuntimeError("boom")
+            )
+            try:
+                cors_status, cors_headers = _request_headers(
+                    base, "/v1/stats", "https://client.example"
+                )
+            finally:
+                app_module.stats = original_stats
+            assert cors_status == 500, cors_status
+            assert (
+                cors_headers.get("access-control-allow-origin")
+                == "https://client.example"
+            ), cors_headers
 
             strict_settings = Settings(
                 db_path=db_path,

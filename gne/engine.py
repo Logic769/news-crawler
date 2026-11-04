@@ -13,7 +13,7 @@ from .extractors import (
     TimeExtractor,
     TitleExtractor,
 )
-from .html import fix_html, html2element, pre_parse, remove_noise_node
+from .html import BR_SENTINEL, fix_html, html2element, pre_parse, remove_noise_node
 from .text import normalize_text
 
 
@@ -56,9 +56,15 @@ class GeneralNewsExtractor:
         element = html2element(normal_html)
 
         meta_content = self._meta_extractor.extract(element)
-        title = self._title_extractor.extract(element, title_xpath=title_xpath)
-        publish_time = self._time_extractor.extract(element, publish_time_xpath=publish_time_xpath)
-        author = self._author_extractor.extract(element, author_xpath=author_xpath)
+        title = self._title_extractor.extract(
+            element, title_xpath=title_xpath
+        ).replace(BR_SENTINEL, "\n").strip()
+        publish_time = self._time_extractor.extract(
+            element, publish_time_xpath=publish_time_xpath
+        ).replace(BR_SENTINEL, "\n").strip()
+        author = self._author_extractor.extract(
+            element, author_xpath=author_xpath
+        ).replace(BR_SENTINEL, "\n").strip()
 
         remove_noise_node(element, noise_node_list)
         element = pre_parse(element)
