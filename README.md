@@ -50,6 +50,11 @@
 - Docker（含 Docker Compose **v2**，Docker Desktop 或 Docker Engine 均可）
 - 能访问 Docker Hub / PyPI 的网络
 
+**本地 Python 环境（可选，主要用于开发）：**
+
+- Python 3.10+，`pip install -e ".[browser,api]"`；
+- ⚠️ 本项目发行包名同样是 `gne`（与 PyPI 上游 GeneralNewsExtractor 相同）。本仓库不向 PyPI 发布，但 `pip install -e .` 生成的 `gne-1.1.2.dist-info` 与已安装的上游 `gne` 在同一环境会互相覆盖，请使用独立虚拟环境，不要与 PyPI 的 `gne` 混装。
+
 ---
 
 ## 使用 Docker 部署

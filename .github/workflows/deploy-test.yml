@@ -20,8 +20,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # 夜间定时任务用独立 group 且不取消进行中的运行：一次 push 不能把夜间验证吞掉，
+  # 否则站点改版的早期信号会被白天的提交覆盖。
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
   python-checks:
@@ -74,7 +76,7 @@ jobs:
       # 62 个上游 HTML 样本的离线回归，基线随仓库提交（regression/baseline.json）。
       # 这替代了此前"基线只存在于维护者本机"的空缺，也让 PR 无需访问真实站点就有抽取回归保护。
       - name: Offline GNE regression
-        run: python -X utf8 -m unittest regression.test_gne_regression -v
+        run: python -X utf8 -m unittest discover -s regression -t . -p "test_*.py" -v
 
       - name: API smoke test
         run: python -X utf8 api_smoke.py
@@ -204,8 +206,9 @@ jobs:
     name: docker build (default, with browser) + smoke + live news
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # 仅 push / 手动运行，避免每个 PR 都下载 Chromium 并访问真实新闻站点
-    if: github.event_name != 'pull_request'
+    # 只在夜间与手动运行：push 时 live-news 已在宿主机跑过同一组 10/10/10，
+    # 镜像内再跑一遍只会重复消耗 45 分钟；PR 更不需要下载 Chromium。
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
         uses: actions/checkout@v4

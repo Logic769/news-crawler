@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 
 from lxml.html import HtmlElement
 
 from ..html import html2element
 from ..text import normalize_text
+
+LOG = logging.getLogger(__name__)
 
 
 class ListExtractor:
@@ -27,7 +30,7 @@ class ListExtractor:
             feature_element = element.xpath(f'//*[contains(text(), "{feature}")]')
 
         if not feature_element:
-            print("找不到 feature！")
+            LOG.warning("找不到 feature：%s", feature)
             return result
 
         parent = feature_element[0]

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from gne import GeneralNewsExtractor, NoContentException
+from url_extract import is_video_page
 
 ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_DIR = ROOT / "tests"
@@ -34,6 +35,7 @@ def extract_case(html: str, extractor: GeneralNewsExtractor) -> dict[str, Any]:
     except NoContentException:
         return {"error": "NoContentException"}
     content = result.get("content") or ""
+    meta = result.get("meta") or {}
     return {
         "title": (result.get("title") or "").strip(),
         "author": (result.get("author") or "").strip(),
@@ -41,6 +43,15 @@ def extract_case(html: str, extractor: GeneralNewsExtractor) -> dict[str, Any]:
         "content_len": len(content),
         "content_sha1": hashlib.sha1(content.encode("utf-8")).hexdigest(),
         "images": list(result.get("images") or []),
+        # meta 是 {name: content} 映射，整体入库会把样本内容复制进基线；
+        # 用键列表 + 排序后 JSON 的 sha1 锁定，既覆盖变化又能定位到具体键。
+        "meta_keys": sorted(str(key) for key in meta),
+        "meta_sha1": hashlib.sha1(
+            json.dumps(meta, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+        # 只按 HTML 信号判定（URL 传空），覆盖 og:type 与 JSON-LD 两条规则；
+        # 路径规则由 regression/test_video_detection.py 单独覆盖。
+        "is_video": is_video_page("", html),
     }
 
 
