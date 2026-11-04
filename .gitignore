@@ -113,5 +113,8 @@ sources.example.json
 # Docker 持久化数据（数据库等运行产物）
 /data/
 
+# 回填脚本默认失败清单（与数据库同目录；库在仓库根时落在根目录）
+/backfill_failed.txt
+
 # 本地备份（改动前备份，不提交）
 /backups/

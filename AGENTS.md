@@ -409,7 +409,13 @@ v4 之前入库的文章 `raw_content` 为空。回填脚本只重抓这些行�
 docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content.py --db /app/data/news.db --dry-run
 # 真正回填（默认 --delay 0.5 控制频率；--source / --limit 可缩小范围；--allow-browser 才回退 Chromium）
 docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content.py --db /app/data/news.db --limit 50
+# 第二次运行：读上一次的失败清单，跳过死链，避免它们反复占用 --limit 名额
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content.py --db /app/data/news.db --limit 50 --skip-file /app/data/backfill_failed.txt
 ```
+
+- 抓取失败与「UPDATE 未命中」分开统计：后者通常是另一个进程已并发回填或行已被删除，计入「跳过」而不是「失败」；
+- 失败明细默认写入与 `--db` **同目录**的 `backfill_failed.txt`（TSV：source / url / error），容器内即 `/app/data/backfill_failed.txt`，随 `./data` 挂载保留；`--failed-list` 可改路径（不能指向数据库文件或目录，否则返回 2）。每次运行都会覆盖该文件，但会保留本次 `--skip-file` 清单中的条目（第三列写「上次失败，本次跳过」），避免把仍然有效的死链记录洗掉；清单为空且全部成功时只剩表头；
+- `--skip-file` 读取该清单并把对应 `(source, url)` 从候选中排除；清单不存在时报错退出（返回 2），避免拼错路径后静默失效。
 
 脚本的 `--db` 默认值取自 `news_crawler.DEFAULT_DB_FILE`（相对路径 `news.db`），容器内必须显式传 `/app/data/news.db`，否则会指向 `/app/news.db`。
 
@@ -446,9 +452,10 @@ curl http://localhost:8000/v1/health
 - `shell-and-yaml` job：bash 语法检查、shellcheck 与 YAML 解析校验
 - `docker-build` job：Ubuntu，`docker build` 后执行容器内 `smoke`、`api_smoke.py`、compose API 健康检查，并校验裸 `docker run ... api` 的持久化数据库路径
 - `live-news` job：只在 push `master`、夜间定时与手动触发时运行（`if: github.event_name != 'pull_request'`），安装 `[browser,api]` 与 Chromium 后用宿主机 Python 执行 `verify_live_news.py --static 10 --dynamic 10 --video 10`；这是**硬性门槛**，抽取数量不足即 job 失败。PR 上不跑：失败多来自站点改版/反爬而非本次改动，且 PR 已有离线回归兜底
-- `docker-build-full` job：默认含浏览器镜像构建 + Chromium 启动校验 + smoke + 镜像内同类实时新闻验证（10 静态 / 10 JS 渲染 / 10 视频）；与 `live-news` 同条件，只在非 PR 事件运行（push `master`、夜间定时、手动触发）
+- `docker-build-full` job：默认含浏览器镜像构建 + Chromium 启动校验 + smoke + 镜像内同类实时新闻验证（10 静态 / 10 JS 渲染 / 10 视频）；只在夜间定时与手动触发时运行（`if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'`），避免与 push 时的宿主机 `live-news` 重复抓取同一组页面
+- `concurrency` 按「工作流 + 分支 + 事件类型」分组：夜间任务不会被 push 取消（`cancel-in-progress` 仅对非 schedule 为 true），保证站点改版的夜间信号不被白天的提交覆盖
 - `notify-nightly-failure` job：夜间定时任务失败时自动开/更新标题为「[nightly] 夜间回归失败」的 issue（`permissions: issues: write`）
-- 通过标准：`python-checks`、`shell-and-yaml`、`docker-build` 必须为 0；`live-news`、`docker-build-full` 在非 PR 事件上必须为 0（前者包含 `SMOKE TEST PASSED`，两个 live job 需打印 `LIVE NEWS VERIFICATION PASSED`）
+- 通过标准：`python-checks`、`shell-and-yaml`、`docker-build` 必须为 0；`live-news` 在非 PR 事件上必须为 0；`docker-build-full` 在夜间定时与手动触发时必须为 0（两者分别需打印 `SMOKE TEST PASSED` / `LIVE NEWS VERIFICATION PASSED`）
 - 手动触发时可用 `live_news_seed` 输入固定随机种子，便于复现某次失败的抽样
 
 ---
@@ -460,7 +467,8 @@ curl http://localhost:8000/v1/health
 - `tests/`：约 62 个上游新闻页面 HTML 样本，覆盖 31 个站点目录；
 - `smoke_test.py`：部署自检，验证导入、日期解析、GNE 抽取、SQLite 初始化、视频页判定、图片地址补全、浏览器回退状态码白名单、性能索引是否建齐、`raw_content` 落库与「本次未传不覆盖」、`old` 在窗口放宽后是否重抓；样本缺失时回退到 `smoke_fixture.py` 的内置新闻页（与 `api_smoke.py` 共用）；
 - `api_smoke.py`：启动临时 uvicorn + 临时 SQLite，验证鉴权、查询、详情（含 `raw_content` 换行）、统计、异步作业全链路，以及入库图片必须为绝对 URL；
-- `verify_live_news.py` + `live_news_pool.json`：从 100 静态 / 50 JS 渲染 / 50 视频的页面池中随机抽取（默认 10/10/10）访问公开新闻站点，验证三条抽取路径；
+- `verify_live_news.py` + `live_news_pool.json`：从 100 静态 / 50 JS 渲染 / 50 视频的页面池中随机抽取（默认 10/10/10）访问公开新闻站点，验证三条抽取路径；视频池要求覆盖 ≥10 个来源站点；
+- `regression/`：62 篇样本的离线抽取基线（含 `meta_keys`/`meta_sha1`/`is_video`），外加列表页解析、视频页判定与回填脚本三组独立用例；
 
 ### 实时新闻池维护
 
@@ -487,12 +495,15 @@ curl http://localhost:8000/v1/health
 
 | 文件 | 作用 |
 | --- | --- |
-| `regression/baseline.json` | 基线快照，62 个样本的 title/author/publish_time/content_len/content_sha1/images/error，含 `gne_version` 与 `sample_count` |
-| `regression/baseline_utils.py` | 抽取单个样本的稳定指纹（正文取 sha1 而非全文，避免基线文件膨胀） |
+| `regression/baseline.json` | 基线快照，62 个样本的 title/author/publish_time/content_len/content_sha1/images/meta_keys/meta_sha1/is_video/error，含 `gne_version` 与 `sample_count` |
+| `regression/baseline_utils.py` | 抽取单个样本的稳定指纹（正文取 sha1 而非全文；meta 存键列表 + 排序后 JSON 的 sha1，避免基线文件膨胀） |
 | `regression/generate_baseline.py` | 重新生成基线：`python -X utf8 -m regression.generate_baseline`（必须用 `-m`；直接跑脚本时 `sys.path` 指向 `regression/`，`from regression.baseline_utils import ...` 会失败） |
 | `regression/test_gne_regression.py` | 3 个用例：全部样本与基线一致、基线可复现、样本集合与基线匹配 |
+| `regression/test_list_page.py` | 3 个用例：列表页解析的条目定位、feature 缺失、少于 4 条时不回退 |
+| `regression/test_video_detection.py` | 5 个用例：路径规则、`og:type`、JSON-LD `VideoObject`、文章内嵌视频不误判 |
+| `regression/test_backfill.py` | 5 个用例：候选 skip/limit、失败清单列清洗、BOM 跳过清单、`--skip-file` 条目在下次失败清单中保留、`--failed-list` 指向数据库/目录时抓取前返回 2 |
 
-运行方式：`python -X utf8 -m unittest regression.test_gne_regression -v`（约 15 秒，无需网络）。
+运行方式：`python -X utf8 -m unittest discover -s regression -t . -p "test_*.py" -v`（约 15 秒，无需网络）。
 
 **只在校验“抽取行为本应改变”时才更新基线**：先确认差异是预期的（例如有意调整正文算法），再跑 `python -X utf8 -m regression.generate_baseline`，并在提交信息里说明哪些样本、为什么变。不要为了“让 CI 变绿”而重建基线。
 
@@ -511,7 +522,7 @@ docker compose run --rm --entrypoint python crawler -X utf8 api_smoke.py
 ```bash
 ruff check .
 mypy
-python -X utf8 -m unittest regression.test_gne_regression -v
+python -X utf8 -m unittest discover -s regression -t . -p "test_*.py" -v
 ```
 
 离线回归依赖 `tests/` 与 `regression/`，两者都不进镜像（见 `.dockerignore`），所以只能在宿主机运行；容器内 `smoke`/`api_smoke.py` 用的是 `smoke_fixture.py` 的内置样本。
@@ -525,7 +536,7 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 ### 测试缺口（后续可补）
 
 - 目前没有 pytest 单元测试：`regression/` 与 `smoke_test.py` 都用标准库 `unittest`，够用但缺少夹具与参数化；
-- 离线回归只比对抽取结果指纹（标题/作者/时间/正文 sha1/图片数），不校验正文中间过程；
+- 离线回归只比对抽取结果指纹（标题/作者/时间/正文 sha1/图片数/meta 指纹/是否视频页），不校验正文中间过程；
 - CI 的 live-news 只覆盖池内 200 个页面（且每次只抽 10/10/10），不覆盖所有站点；站点反爬/改版会导致该 job 波动；
 - `content_needs_render()` 的占位判断是启发式规则；
 - 日期解析为多正则启发式，缺少系统化用例集。
@@ -549,7 +560,7 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
    不同网站的日期格式可能互相干扰，优先通过站点 `date_xpath` + `date_format` 精确配置；新增格式时必须补充单元测试。
 
 5. **CI 真实抓取覆盖有限**
-   `live-news` job 已用 100/50/50 的页面池随机抽样验证静态、JS 渲染与视频三类真实页面（10/10/10 硬门槛），但网络抓取受站点改版/反爬影响大，仍需补充 mock HTML 单测来覆盖解析逻辑。视频类池子只有 5 个来源站点（新华社、看看新闻、新浪视频、云南广电、澎湃），是最薄弱的一环。
+   `live-news` job 已用 100/50/50 的页面池随机抽样验证静态、JS 渲染与视频三类真实页面（10/10/10 硬门槛），但网络抓取受站点改版/反爬影响大，仍需补充 mock HTML 单测来覆盖解析逻辑。视频类池子现在覆盖 10 个来源站点（新华社、看看新闻、新浪视频、云南广电、澎湃、网易、正北方网、安徽网、中新网、西部网），但除新华社/看看新闻外多数站点只贡献 1 条样本，仍是最薄弱的一环。
 
 6. **MySQL 迁移未实现**
    当前只支持 SQLite；如需 MySQL，需要先抽象存储层，并处理 `ON CONFLICT` → `ON DUPLICATE KEY UPDATE`、URL 唯一索引长度、`DATETIME` 类型等差异。

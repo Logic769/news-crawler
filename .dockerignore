@@ -26,6 +26,7 @@ regression
 # 运行时/本地私有数据（绝不进镜像）
 news.db
 data
+backfill_failed.txt
 sources.local.json
 sources.example.json
 backups

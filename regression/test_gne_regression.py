@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from typing import Any, ClassVar
 
 from gne import GeneralNewsExtractor
 from regression.baseline_utils import (
@@ -26,6 +28,9 @@ from regression.baseline_utils import (
 
 class GneSampleRegressionTest(unittest.TestCase):
     maxDiff = None
+    baseline: ClassVar[dict[str, Any]]
+    extractor: ClassVar[GeneralNewsExtractor]
+    samples: ClassVar[list[Path]]
 
     @classmethod
     def setUpClass(cls) -> None:

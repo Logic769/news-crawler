@@ -77,4 +77,5 @@ files = [
     "api_smoke.py",
     "news_api",
     "gne",
+    "regression",
 ]

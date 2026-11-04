@@ -12,6 +12,7 @@
 2. `extract_article` 不再向 stdout 打印进度：15 处 `print` 改为标准库日志（`url_extract` logger），作为库被 API 调用时不再污染宿主进程输出；命令行入口保留 `print` 并配置了 `logging.basicConfig`
 3. `ArticleOut` 补上 `raw_content` 字段：此前 db 层已把换行正文塞进响应字典，但响应模型没有该字段，Pydantic 默认 `extra=ignore` 把它静默丢弃，导致详情接口拿不到换行正文
 4. 抓取的 `ok` 分支补写 `raw_content`：此前只有 `unknown_date` 分支传了该字段，绝大多数正常入库的文章 `raw_content` 恒为 NULL
+5. `backfill_raw_content.py` 的失败语义拆分：抓取失败与「UPDATE 未命中」（并发回填/行已删除）分别计入失败与跳过；失败清单默认写到与 `--db` 同目录的 `backfill_failed.txt`（容器内即 `/app/data/backfill_failed.txt`，随 `./data` 挂载保留，不再随 `--rm` 容器丢失），每次运行覆盖写但保留本次 `--skip-file` 中的条目（标注「上次失败，本次跳过」），避免死链被洗掉后重新参与抓取；读取兼容 UTF-8 BOM，各列压成单行以免破坏 TSV，`--failed-list` 禁止指向数据库文件或目录；`--skip-file` 可在下次运行中排除这些死链，避免反复占用 `--limit` 名额；新增 `regression/test_backfill.py`（5 个离线用例）覆盖候选 skip/limit、清单列清洗与 BOM、skip 条目保留、输出路径防呆
 
 ### CI
 
@@ -20,16 +21,24 @@
 3. `python-checks` 矩阵补到 Python 3.14（与 classifier 一致），并新增 `ruff check .`、`mypy` 与 `regression` 离线回归
 4. 62 篇上游 HTML 样本的抽取基线随仓库提交（`regression/baseline.json`），PR 用离线回归替代真实网络验证
 5. 固定 `ruff==0.17.3` 与 `mypy==2.4.1`：规则集较宽，跟随上游最新版会让无关 PR 因新增规则变红；基线比对同时排除 `gne_version`，发版 bump 版本号不再要求重建基线
+6. `concurrency` 按「工作流 + 分支 + 事件类型」分组，夜间定时任务不再被 push 取消（`cancel-in-progress` 仅对非 schedule 为 true），避免站点改版的夜间信号被白天的提交吞掉
+7. `docker-build-full`（含浏览器镜像 + 镜像内实时抓取）只在夜间与手动触发时运行：push 时 `live-news` 已在宿主机跑同一组 10/10/10，不再重复消耗约 45 分钟
 
 ### Refactor
 
 1. `pyproject.toml` 补齐 `[tool.ruff]` 与 `[tool.mypy]` 配置，规则集从 4 条扩到 `E,F,W,I,UP,B`，CI 与本地共用同一份配置
 2. `.dockerignore` 排除 `tests/` 与 `regression/`，镜像不再打包 62 个样本
+3. 离线回归基线补 `meta_keys`/`meta_sha1` 与 `is_video` 字段：此前只比对 6 个字段，meta 抽取或视频页判定变化时回归仍是绿的
+4. 新增 `regression/test_list_page.py`（列表页解析，3 个用例）与 `regression/test_video_detection.py`（视频页判定，5 个用例）：`tests/` 样本都是文章详情页，这两块此前完全没有回归覆盖
+5. `[tool.mypy] files` 纳入 `regression/`，新增的回归套件与主代码同一套类型检查
+6. `gne/extractors/list.py` 的 `print("找不到 feature！")` 改为 `logging.warning`：库函数不再向 stdout 输出
+7. `live_news_pool.json` 的视频池从 5 个来源站点扩到 10 个（新增网易、正北方网、安徽网、中新网、西部网，各 1 条经 `check_video` 验证的页面；同时从新华社 26 条中删掉 5 条，保持 50 条总量），视频类抽样的来源集中度下降
 
 ### Docs
 
 1. `pypi_desc.md` 澄清 PyPI 上的 `gne` 属于上游 GeneralNewsExtractor，本项目不向 PyPI 发布；`pyproject.toml` 同步标注 source-distribution only 与真实维护者
 2. `AGENTS.md` 同步 SSL 开关、`raw_content`、CI 分层与离线回归基线
+3. `README.md` 增加包名冲突警告：本项目发行包名同为 `gne`，与 PyPI 上游同名，`pip install -e .` 会生成 `gne-1.1.2.dist-info`，请使用独立虚拟环境，不要与 PyPI 的 `gne` 混装
 
 ## 1.1.2 (2026-11-03)
 
