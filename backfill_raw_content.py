@@ -62,8 +62,12 @@ def find_candidates(
         sql += " AND source = ?"
         params.append(source)
     sql += " ORDER BY publish_time DESC, source, url"
-    # 统一用游标逐行读取：skip 非空时也要在凑够 limit 后立即停止，
-    # 避免大库把全部候选行一次性读进内存（skip 为空时同样受益）。
+    # skip 为空时把 LIMIT 下推到 SQL：让 SQLite 只做 top-N，避免为排序扫描全表；
+    # skip 非空时不能下推（被排除的行会占用名额），改用游标逐行过滤，凑够 limit 立即停止，
+    # 避免把全部候选行一次性读进内存。
+    if limit > 0 and not skip:
+        sql += " LIMIT ?"
+        params.append(limit)
     rows: list[tuple[str, str]] = []
     cursor = conn.execute(sql, params)
     try:
@@ -222,9 +226,12 @@ def main(argv: list[str] | None = None) -> int:
     failed_path = Path(args.failed_list) if args.failed_list else db_path.parent / "backfill_failed.txt"
     # 输出路径的防呆必须在抓取之前：否则整批网络请求做完才发现清单路径无效，白跑一趟。
     # 用 samefile() 比较文件身份：resolve() 只能消除符号链接与路径差异，
-    # 认不出指向数据库的硬链接，会把数据库原地截断。
-    if failed_path.exists() and failed_path.samefile(db_path):
-        print("--failed-list 不能指向数据库文件本身", file=sys.stderr)
+    # 认不出指向数据库的硬链接，会把数据库原地截断；WAL/SHM 侧车文件同样不能覆盖。
+    db_sidecars = (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm"))
+    if failed_path.exists() and any(
+        sidecar.exists() and failed_path.samefile(sidecar) for sidecar in db_sidecars
+    ):
+        print("--failed-list 不能指向数据库文件或其 WAL/SHM 侧车文件", file=sys.stderr)
         return 2
     if failed_path.is_dir():
         print(f"--failed-list 是目录：{failed_path}", file=sys.stderr)
