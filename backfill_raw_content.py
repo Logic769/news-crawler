@@ -62,16 +62,20 @@ def find_candidates(
         sql += " AND source = ?"
         params.append(source)
     sql += " ORDER BY publish_time DESC, source, url"
-    # skip 为空时可以把 LIMIT 下推到 SQL，避免大库把全部候选读进内存；
-    # skip 非空时必须在 Python 侧截断，否则被排除的行也会占用名额。
-    if limit > 0 and not skip:
-        sql += " LIMIT ?"
-        params.append(limit)
-    rows = [(str(row[0]), str(row[1])) for row in conn.execute(sql, params)]
-    if skip:
-        rows = [row for row in rows if row not in skip]
-    if limit > 0:
-        rows = rows[:limit]
+    # 统一用游标逐行读取：skip 非空时也要在凑够 limit 后立即停止，
+    # 避免大库把全部候选行一次性读进内存（skip 为空时同样受益）。
+    rows: list[tuple[str, str]] = []
+    cursor = conn.execute(sql, params)
+    try:
+        for row in cursor:
+            candidate = (str(row[0]), str(row[1]))
+            if skip and candidate in skip:
+                continue
+            rows.append(candidate)
+            if limit > 0 and len(rows) >= limit:
+                break
+    finally:
+        cursor.close()
     return rows
 
 
@@ -217,7 +221,9 @@ def main(argv: list[str] | None = None) -> int:
 
     failed_path = Path(args.failed_list) if args.failed_list else db_path.parent / "backfill_failed.txt"
     # 输出路径的防呆必须在抓取之前：否则整批网络请求做完才发现清单路径无效，白跑一趟。
-    if failed_path.resolve() == db_path.resolve():
+    # 用 samefile() 比较文件身份：resolve() 只能消除符号链接与路径差异，
+    # 认不出指向数据库的硬链接，会把数据库原地截断。
+    if failed_path.exists() and failed_path.samefile(db_path):
         print("--failed-list 不能指向数据库文件本身", file=sys.stderr)
         return 2
     if failed_path.is_dir():

@@ -4,13 +4,40 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import sqlite3
 import tempfile
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import backfill_raw_content as bf
 from news_crawler import init_db
+
+
+class _CountingCursor:
+    """按需迭代的假游标，记录实际读取了多少行。"""
+
+    def __init__(self, rows: list[tuple[str, str]]) -> None:
+        self._rows = rows
+        self.consumed = 0
+
+    def __iter__(self) -> Iterator[tuple[str, str]]:
+        for row in self._rows:
+            self.consumed += 1
+            yield row
+
+    def close(self) -> None:
+        pass
+
+
+class _FakeConnection:
+    def __init__(self, cursor: _CountingCursor) -> None:
+        self._cursor = cursor
+
+    def execute(self, sql: str, params: list[object]) -> _CountingCursor:
+        return self._cursor
 
 
 class BackfillUnitTest(unittest.TestCase):
@@ -95,6 +122,35 @@ class BackfillUnitTest(unittest.TestCase):
         self.assertIsNone(self.raw_of(url))
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(bf.main(["--db", str(self.db), "--failed-list", str(self.root)]), 2)
+
+    def test_main_rejects_hardlink_to_database(self) -> None:
+        link_path = self.root / "db_link.txt"
+        try:
+            os.link(self.db, link_path)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"当前文件系统不支持硬链接：{exc}")
+        self.insert("https://example.com/keep.html")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(bf.main(["--db", str(self.db), "--failed-list", str(link_path)]), 2)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute("SELECT count(*) FROM articles").fetchone()[0], 1)
+        finally:
+            conn.close()
+
+    def test_find_candidates_stops_reading_once_limit_reached(self) -> None:
+        skip = {("site", f"https://example.com/skip-{index}.html") for index in range(3)}
+        rows = [("site", f"https://example.com/skip-{index}.html") for index in range(3)] + [
+            ("site", f"https://example.com/keep-{index}.html") for index in range(100)
+        ]
+        cursor = _CountingCursor(rows)
+        fake = cast(sqlite3.Connection, _FakeConnection(cursor))
+        self.assertEqual(
+            bf.find_candidates(fake, "", 2, skip),
+            [("site", "https://example.com/keep-0.html"), ("site", "https://example.com/keep-1.html")],
+        )
+        # 3 条 skip + 2 条命中即停，不应读完 103 行
+        self.assertEqual(cursor.consumed, 5)
 
 
 if __name__ == "__main__":
