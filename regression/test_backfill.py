@@ -4,13 +4,48 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import sqlite3
 import tempfile
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import backfill_raw_content as bf
 from news_crawler import init_db
+
+
+class _CountingCursor:
+    """按需迭代的假游标，记录实际读取了多少行以及是否被关闭。"""
+
+    def __init__(self, rows: list[tuple[str, str]], fail_after: int | None = None) -> None:
+        self._rows = rows
+        self._fail_after = fail_after
+        self.consumed = 0
+        self.closed = False
+
+    def __iter__(self) -> Iterator[tuple[str, str]]:
+        for index, row in enumerate(self._rows):
+            if self._fail_after is not None and index >= self._fail_after:
+                raise RuntimeError("模拟游标读取失败")
+            self.consumed += 1
+            yield row
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeConnection:
+    def __init__(self, cursor: _CountingCursor) -> None:
+        self._cursor = cursor
+        self.sql = ""
+        self.params: list[object] = []
+
+    def execute(self, sql: str, params: list[object]) -> _CountingCursor:
+        self.sql = sql
+        self.params = params
+        return self._cursor
 
 
 class BackfillUnitTest(unittest.TestCase):
@@ -95,6 +130,100 @@ class BackfillUnitTest(unittest.TestCase):
         self.assertIsNone(self.raw_of(url))
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(bf.main(["--db", str(self.db), "--failed-list", str(self.root)]), 2)
+
+    def test_main_rejects_hardlink_to_database(self) -> None:
+        link_path = self.root / "db_link.txt"
+        try:
+            os.link(self.db, link_path)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"当前文件系统不支持硬链接：{exc}")
+        self.insert("https://127.0.0.1:1/unreachable.html")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(bf.main(["--db", str(self.db), "--failed-list", str(link_path)]), 2)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute("SELECT count(*) FROM articles").fetchone()[0], 1)
+        finally:
+            conn.close()
+
+    def test_find_candidates_stops_reading_once_limit_reached(self) -> None:
+        skip = {("site", f"https://example.com/skip-{index}.html") for index in range(3)}
+        rows = [("site", f"https://example.com/skip-{index}.html") for index in range(3)] + [
+            ("site", f"https://example.com/keep-{index}.html") for index in range(100)
+        ]
+        cursor = _CountingCursor(rows)
+        fake = cast(sqlite3.Connection, _FakeConnection(cursor))
+        self.assertEqual(
+            bf.find_candidates(fake, "", 2, skip),
+            [("site", "https://example.com/keep-0.html"), ("site", "https://example.com/keep-1.html")],
+        )
+        # 3 条 skip + 2 条命中即停，不应读完 103 行
+        self.assertEqual(cursor.consumed, 5)
+
+    def test_find_candidates_pushes_limit_down_without_skip(self) -> None:
+        rows = [("site", f"https://example.com/{index}.html") for index in range(10)]
+        conn = _FakeConnection(_CountingCursor(rows))
+        self.assertEqual(len(bf.find_candidates(cast(sqlite3.Connection, conn), "", 3)), 3)
+        # skip 为空时 LIMIT 必须下推到 SQL，避免 SQLite 为 ORDER BY 全量排序
+        self.assertIn("LIMIT ?", conn.sql)
+        self.assertEqual(conn.params, ["ok", "unknown_date", 3])
+
+    def test_find_candidates_limit_without_skip_real_sqlite(self) -> None:
+        for index in range(5):
+            self.insert(f"https://example.com/{index}.html")
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(len(bf.find_candidates(conn, "", 2)), 2)
+            self.assertEqual(len(bf.find_candidates(conn, "", 0)), 5)
+        finally:
+            conn.close()
+
+    def test_find_candidates_does_not_push_limit_when_skip_present(self) -> None:
+        skip = {("site", "https://example.com/a.html")}
+        conn = _FakeConnection(
+            _CountingCursor([("site", "https://example.com/a.html"), ("site", "https://example.com/b.html")])
+        )
+        rows = bf.find_candidates(cast(sqlite3.Connection, conn), "", 1, skip)
+        self.assertEqual(rows, [("site", "https://example.com/b.html")])
+        self.assertNotIn("LIMIT", conn.sql)
+
+    def test_find_candidates_closes_cursor_when_iteration_fails(self) -> None:
+        cursor = _CountingCursor([("site", "https://example.com/a.html")], fail_after=0)
+        fake = cast(sqlite3.Connection, _FakeConnection(cursor))
+        with self.assertRaises(RuntimeError):
+            bf.find_candidates(fake, "", 0)
+        self.assertTrue(cursor.closed)
+
+    def test_main_rejects_symlink_to_database(self) -> None:
+        link_path = self.root / "db_symlink.txt"
+        try:
+            os.symlink(self.db, link_path)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"当前环境不支持符号链接：{exc}")
+        self.insert("https://127.0.0.1:1/unreachable.html")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(bf.main(["--db", str(self.db), "--failed-list", str(link_path)]), 2)
+
+    def test_main_rejects_uncreated_wal_and_shm_sidecar_paths(self) -> None:
+        self.insert("https://127.0.0.1:1/unreachable.html")
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self.db}{suffix}")
+            # 防呆必须在 sidecar 尚不存在时也生效，否则 write_text 会创建伪 sidecar
+            self.assertFalse(sidecar.exists())
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(bf.main(["--db", str(self.db), "--failed-list", str(sidecar)]), 2)
+            self.assertFalse(sidecar.exists())
+
+    def test_main_accepts_existing_failed_list_file(self) -> None:
+        failed = self.root / "failed.txt"
+        failed.write_text("# source\turl\terror\n", encoding="utf-8")
+        self.insert("https://127.0.0.1:1/unreachable.html")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                bf.main(["--db", str(self.db), "--failed-list", str(failed), "--dry-run"]),
+                0,
+            )
+        self.assertTrue(failed.is_file())
 
 
 if __name__ == "__main__":

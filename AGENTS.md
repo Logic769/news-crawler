@@ -501,7 +501,7 @@ curl http://localhost:8000/v1/health
 | `regression/test_gne_regression.py` | 3 个用例：全部样本与基线一致、基线可复现、样本集合与基线匹配 |
 | `regression/test_list_page.py` | 3 个用例：列表页解析的条目定位、feature 缺失、少于 4 条时不回退 |
 | `regression/test_video_detection.py` | 5 个用例：路径规则、`og:type`、JSON-LD `VideoObject`、文章内嵌视频不误判 |
-| `regression/test_backfill.py` | 5 个用例：候选 skip/limit、失败清单列清洗、BOM 跳过清单、`--skip-file` 条目在下次失败清单中保留、`--failed-list` 指向数据库/目录时抓取前返回 2 |
+| `regression/test_backfill.py` | 14 个用例：候选 skip/limit（含真实 SQLite）、LIMIT 下推与游标提前停止、游标异常关闭、失败清单列清洗、BOM 跳过清单、`--skip-file` 条目在下次失败清单中保留、`--failed-list` 指向数据库/目录/硬链接/符号链接/未创建的 WAL·SHM 侧车路径时抓取前返回 2、正常清单文件不误杀 |
 
 运行方式：`python -X utf8 -m unittest discover -s regression -t . -p "test_*.py" -v`（约 15 秒，无需网络）。
 
