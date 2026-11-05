@@ -618,6 +618,10 @@ class UnsupportedContentEncoding(ValueError):
 # 正常新闻页 HTML 远小于此，超限直接拒绝该响应。
 MAX_DECODED_BYTES = 32 * 1024 * 1024
 
+# 多 member gzip 每结束一段都要复制剩余压缩后缀并新建 decompressobj。恶意响应
+# 可以用大量极小 member 在字节上限内放大 CPU/内存开销，因此额外限制 member 数量。
+MAX_COMPRESSION_MEMBERS = 32
+
 # urllib 的 timeout 只是单次 socket 操作超时，慢速滴流（每隔几十秒吐一个字节）
 # 能让整个响应无限期拖住抓取线程。这里再加一个总墙钟预算，并配合按剩余预算
 # 收缩 socket 超时来强制中止。
@@ -643,6 +647,7 @@ def _decompress_stage(raw: bytes, wbits: int) -> bytes:
     obj = zlib.decompressobj(wbits)
     out = bytearray()
     buf = raw
+    members = 1
     while True:
         out += obj.decompress(buf, MAX_DECODED_BYTES + 1 - len(out))
         if len(out) > MAX_DECODED_BYTES:
@@ -657,6 +662,11 @@ def _decompress_stage(raw: bytes, wbits: int) -> bytes:
         # 仅 gzip 支持多 member：deflate 的尾随字节不是新 member（例如 smoke 里
         # 去掉 zlib 头的裸流会残留 Adler-32 尾字节），误当 member 会解压失败。
         if wbits > 15 and obj.eof and obj.unused_data:
+            members += 1
+            if members > MAX_COMPRESSION_MEMBERS:
+                raise UnsupportedContentEncoding(
+                    f"压缩流包含超过 {MAX_COMPRESSION_MEMBERS} 个 member，拒绝该响应"
+                )
             buf = obj.unused_data
             obj = zlib.decompressobj(wbits)
             continue
@@ -758,13 +768,29 @@ def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) 
             handlers.append(urllib.request.HTTPSHandler(context=context))
         opener = urllib.request.build_opener(*handlers)
         req = urllib.request.Request(url, headers=HEADERS)
-        with opener.open(req, timeout=PER_OP_TIMEOUT) as resp:
+        # 总预算从建立连接前开始计时，连接、等待响应头、读取正文共用同一截止时间。
+        deadline = time.monotonic() + MAX_FETCH_TOTAL_SECONDS
+        open_timeout = min(PER_OP_TIMEOUT, deadline - time.monotonic())
+        if open_timeout <= 0:
+            raise TimeoutError(
+                f"抓取超过 {MAX_FETCH_TOTAL_SECONDS} 秒总时限：{url}"
+            )
+        with opener.open(req, timeout=open_timeout) as resp:
             # 分块读取，边读边查总墙钟预算：单次 socket 超时挡不住慢速滴流，
-            # 每轮把 socket 超时收缩到“剩余预算”，超时即中止整次抓取。
-            # 同时累计字节数，未压缩但超大的响应不能无限读入内存；压缩流
-            # 一般远小于解压结果，真正的解压上限由 _decompress 兜底。
-            deadline = time.monotonic() + MAX_FETCH_TOTAL_SECONDS
+            # 每轮把 socket 超时收缩到“剩余预算”，阻塞读取也会在剩余预算耗尽时
+            # 由 socket.timeout 中止。同时累计字节数，未压缩但超大的响应不能
+            # 无限读入内存；压缩流一般远小于解压结果，真正上限由 _decompress 兜底。
             sock = _response_socket(resp)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"抓取超过 {MAX_FETCH_TOTAL_SECONDS} 秒总时限：{url}"
+                )
+            if sock is not None:
+                try:
+                    sock.settimeout(min(PER_OP_TIMEOUT, remaining))
+                except OSError:
+                    pass
             chunks: list[bytes] = []
             total = 0
             while True:
