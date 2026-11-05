@@ -60,6 +60,16 @@ class JobCreate(BaseModel):
         if self.type == "extract":
             if not self.url:
                 raise ValueError("extract 任务必须提供 url")
+            # extract 只抓单个 URL，crawl 的窗口/并发/批量参数对它无意义；
+            # 显式传入（而非默认值）时一律拒绝，避免静默忽略造成预期落空。
+            crawl_only = {"days", "since", "force", "limit_per_source", "workers"}
+            extra = sorted(
+                field
+                for field in crawl_only & set(self.model_fields_set)
+                if getattr(self, field) not in (None, False)
+            )
+            if extra:
+                raise ValueError(f"extract 任务不接受字段：{extra}")
         elif self.url:
             raise ValueError("crawl 任务不接受 url 字段")
         return self

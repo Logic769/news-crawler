@@ -164,8 +164,20 @@ def backfill(
                 failures.append((source, url, "抽取结果没有正文"))
                 print(f"  [失败] {source} {url}")
                 continue
-            cursor = conn.execute(_UPDATE_SQL, (raw_content, source, url))
-            conn.commit()
+            try:
+                cursor = conn.execute(_UPDATE_SQL, (raw_content, source, url))
+                conn.commit()
+            except sqlite3.Error as exc:  # 单行写库失败不中止整批
+                # commit 阶段失败时 UPDATE 可能仍留在事务里，best-effort 回滚，
+                # 避免后续某次 commit 把本已计为失败的行一并提交。
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                failed += 1
+                failures.append((source, url, f"写库失败: {exc}"))
+                print(f"  [失败] {source} {url}：写库失败 {exc}")
+                continue
             if cursor.rowcount:
                 updated += 1
                 print(f"  [回填 {len(raw_content)} 字] {source} {url}")

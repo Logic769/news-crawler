@@ -42,7 +42,9 @@ def _is_useless_node(class_name: str, id_name: str) -> bool:
 
 def normalize_node(element: HtmlElement) -> None:
     """Remove unusable tags and page furniture from ``element`` in place."""
-    etree.strip_elements(element, *USELESS_TAG)
+    # 默认 with_tail=True 会把被删标签后面的 tail 文本一起丢掉，
+    # 例如 <p>…</p><script>…</script>正文会连“正文”一起消失；保留 tail。
+    etree.strip_elements(element, *USELESS_TAG, with_tail=False)
     nodes_to_remove: list[HtmlElement] = []
     for node in list(iter_node(element)):
         if node.tag.lower() in TAGS_CAN_BE_REMOVE_IF_EMPTY and is_empty_element(node):

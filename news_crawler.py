@@ -28,6 +28,7 @@ from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import lxml.html
+from lxml import etree
 
 from gne import GeneralNewsExtractor
 from url_extract import (
@@ -46,7 +47,7 @@ DEFAULT_DB_FILE = "news.db"
 # 锁等待时长与 sqlite3.connect(timeout=...) 保持一致，避免 PRAGMA 把
 # 30s 的连接超时悄悄压成 5s（并发写时更早报 database is locked）。
 DB_BUSY_TIMEOUT_MS = 30000
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS articles (
@@ -56,6 +57,9 @@ CREATE TABLE IF NOT EXISTS articles (
     list_title   TEXT,
     title        TEXT,
     publish_time TEXT,
+    -- 真实时刻（UTC，YYYY-MM-DD HH:MM:SS）：混时区站点按墙钟比较会错位，
+    -- 统一存 UTC 供时间过滤；publish_time 仍是站点本地墙钟，供展示与排序。
+    publish_time_utc TEXT,
     timezone     TEXT,
     author       TEXT,
     content      TEXT,
@@ -75,8 +79,7 @@ CREATE INDEX IF NOT EXISTS idx_articles_status
     ON articles(status);
 CREATE INDEX IF NOT EXISTS idx_articles_publish_time
     ON articles(publish_time);
-
--- 两条查询性能覆盖索引由 _PERFORMANCE_INDEX_SQL 建（见 init_db 的迁移事务），
+-- 查询性能覆盖索引由 _PERFORMANCE_INDEX_SQL 建（见 init_db 的迁移事务），
 -- 不写在这里：executescript 会隐式提交，放进 SCHEMA_SQL 会让建索引落在
 -- BEGIN IMMEDIATE 之外，多进程并发首启老库时可能撞上 database is locked。
 
@@ -117,6 +120,9 @@ _PERFORMANCE_INDEX_SQL = (
     # TEMP B-TREE 全表排序；有它之后索引本身即最终顺序。
     "CREATE INDEX IF NOT EXISTS idx_articles_status_updated "
     "ON articles(status, updated_at DESC, source, url)",
+    # v6：时间过滤改用 publish_time_utc；放迁移事务内建，老库先 ALTER 补列再建索引。
+    "CREATE INDEX IF NOT EXISTS idx_articles_publish_time_utc "
+    "ON articles(publish_time_utc)",
 )
 
 
@@ -244,7 +250,7 @@ def parse_datetime(
 
     # Full year: 2026-08-26 / 2026年8月26日 / 2026-08-26 10:30:00
     full = re.search(
-        r"(20\d{2}|\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})"
+        r"(?<!\d)((?:19|20)\d{2}|\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})"
         r"(?:日)?(?:[ T]+(\d{1,2})[:：](\d{1,2})(?::(\d{1,2}))?)?",
         text,
     )
@@ -265,7 +271,10 @@ def parse_datetime(
         except ValueError:
             return None
         if parsed > now + dt.timedelta(days=1):
-            parsed = parsed.replace(year=parsed.year - 1)
+            try:
+                parsed = parsed.replace(year=parsed.year - 1)
+            except ValueError:
+                return None
         return parsed
 
     # Month/day only: 08-26 / 8月26日 / 08-26 10:30
@@ -289,7 +298,10 @@ def parse_datetime(
         except ValueError:
             return None
         if parsed > now + dt.timedelta(days=1):
-            parsed = parsed.replace(year=parsed.year - 1)
+            try:
+                parsed = parsed.replace(year=parsed.year - 1)
+            except ValueError:
+                return None
         return parsed
 
     try:
@@ -304,6 +316,28 @@ def format_publish_time(value: dt.datetime, timezone_name: str) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=tz)
     return value.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def publish_time_to_utc(publish_time: str, timezone_name: str) -> str:
+    """把站点本地墙钟发布时间换算成 UTC 墙钟串（YYYY-MM-DD HH:MM:SS）。
+
+    混时区站点若直接按 publish_time 墙钟字符串比较，边界会错位；统一换算
+    为 UTC 后可在 SQL 里做同口径过滤。无法解析或缺时区时返回空串。
+    """
+    text = str(publish_time or "").strip()
+    tz_name = str(timezone_name or "").strip()
+    if not text or not tz_name:
+        return ""
+    try:
+        parsed = dt.datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        try:
+            parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=get_timezone(tz_name))
+    return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
@@ -324,7 +358,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     required_indexes |= {"idx_articles_article_id", "idx_crawl_jobs_dedupe"}
     if (
         version >= SCHEMA_VERSION
-        and {"article_id", "timezone", "raw_content", "content_length"} <= columns
+        and {"article_id", "timezone", "raw_content", "content_length", "publish_time_utc"} <= columns
         and required_indexes <= indexes
     ):
         return
@@ -339,6 +373,9 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     # v5：列表接口用 content_length 列避免读整段正文 blob；老库补列后回填。
     if "content_length" not in columns:
         conn.execute("ALTER TABLE articles ADD COLUMN content_length INTEGER")
+    # v6：publish_time_utc 存真实时刻（UTC），修复混时区按墙钟过滤的错位。
+    if "publish_time_utc" not in columns:
+        conn.execute("ALTER TABLE articles ADD COLUMN publish_time_utc TEXT")
 
     # 分批回填，避免大库一次性 fetchall 占满内存；仍在同一事务内，保证
     # article_id 全部回填后才会置位 user_version。用 rowid 键集分页而不是
@@ -364,6 +401,30 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         "UPDATE articles SET content_length = length(content) "
         "WHERE content_length IS NULL AND content IS NOT NULL"
     )
+    # 回填 publish_time_utc：按每行自己的 timezone 换算，缺 timezone 的行保持
+    # NULL（查询侧对 NULL 回退旧的墙钟比较，行为与升级前一致）。
+    last_rowid = -1
+    while True:
+        batch = conn.execute(
+            "SELECT rowid, publish_time, timezone FROM articles "
+            "WHERE (publish_time_utc IS NULL OR publish_time_utc = '') "
+            "AND publish_time IS NOT NULL AND publish_time <> '' "
+            "AND timezone IS NOT NULL AND timezone <> '' AND rowid > ? "
+            "ORDER BY rowid LIMIT 2000",
+            (last_rowid,),
+        ).fetchall()
+        if not batch:
+            break
+        updates = []
+        for rowid, publish_time, tz_name in batch:
+            utc = publish_time_to_utc(publish_time, tz_name)
+            if utc:
+                updates.append((utc, rowid))
+        if updates:
+            conn.executemany(
+                "UPDATE articles SET publish_time_utc = ? WHERE rowid = ?", updates
+            )
+        last_rowid = batch[-1][0]
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_article_id "
         "ON articles(article_id)"
@@ -413,20 +474,24 @@ def _ensure_wal(conn: sqlite3.Connection) -> None:
 
 def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=DB_BUSY_TIMEOUT_MS / 1000)
-    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
-    _ensure_wal(conn)
-    conn.executescript(SCHEMA_SQL)
-    # 迁移必须串行执行：API 可能同时运行多个 extract 作业，
-    # 并发 ALTER TABLE / 回填会互相冲突。BEGIN IMMEDIATE 让其他
-    # 连接在 busy_timeout 内等待，进入后再重新读取列状态。
-    conn.execute("BEGIN IMMEDIATE")
     try:
-        _migrate_schema(conn)
+        conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
+        _ensure_wal(conn)
+        conn.executescript(SCHEMA_SQL)
+        # 迁移必须串行执行：API 可能同时运行多个 extract 作业，
+        # 并发 ALTER TABLE / 回填会互相冲突。BEGIN IMMEDIATE 让其他
+        # 连接在 busy_timeout 内等待，进入后再重新读取列状态。
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _migrate_schema(conn)
+        except Exception:
+            conn.rollback()
+            raise
+        conn.commit()
+        return conn
     except Exception:
-        conn.rollback()
+        conn.close()
         raise
-    conn.commit()
-    return conn
 
 
 def resolve_config_path(path: str) -> str:
@@ -494,7 +559,16 @@ def xpath_href(node, xpath: str | None) -> str:
 
 def parse_list_items(html: str, source: dict, base_url: str) -> list[dict]:
     doc = lxml.html.fromstring(html)
-    nodes = doc.xpath(source["item_xpath"])
+    try:
+        nodes = doc.xpath(source["item_xpath"])
+    except etree.XPathEvalError as exc:
+        LOG.error(
+            "[%s] item_xpath 非法：%s（%s）",
+            source.get("name"),
+            source["item_xpath"],
+            exc,
+        )
+        return []
     tz_name = source.get("timezone", "Asia/Shanghai")
     date_format = source.get("date_format")
     items: list[dict] = []
@@ -511,12 +585,29 @@ def parse_list_items(html: str, source: dict, base_url: str) -> list[dict]:
         if url in seen:
             continue
         seen.add(url)
-        date_text = xpath_text(node, source.get("date_xpath") or ".")
-        parsed = parse_datetime(date_text, date_format, tz_name)
-        if parsed is None:
-            # Some sites put the publish date in the article URL instead,
-            # for example https://.../2026/09/05/article.shtml
+        date_xpath = source.get("date_xpath")
+        if date_xpath:
+            date_text = xpath_text(node, date_xpath)
+            parsed = parse_datetime(date_text, date_format, tz_name)
+            if parsed is None:
+                # Some sites put the publish date in the article URL instead,
+                # for example https://.../2026/09/05/article.shtml
+                parsed = parse_datetime(url, None, tz_name)
+        else:
+            # 未配置 date_xpath 时，URL 中的日期比整节点文本更权威；
+            # 直接用整节点文本会把标题里的日期（如“2024年1月1日起施行”）
+            # 误当成发布日，故先尝试 URL，再退到“剔除标题后的节点文本”。
+            date_text = ""
             parsed = parse_datetime(url, None, tz_name)
+            if parsed is None:
+                node_text = clean_text(node.text_content())
+                title_text = title or xpath_text(
+                    node, source.get("title_xpath") or ".//a"
+                )
+                if title_text:
+                    node_text = node_text.replace(title_text, " ", 1)
+                date_text = node_text
+                parsed = parse_datetime(date_text, date_format, tz_name)
         items.append(
             {
                 "title": title,
@@ -631,6 +722,9 @@ def save_article(
     只有调用方显式传 [] 才清空，避免成功重抓因抽取失败抹掉历史图片。
     """
     article_id = article_id_for(source, url)
+    # 无法换算（缺 timezone / 解析失败）时写 NULL 而不是空串：查询侧对 NULL
+    # 回退旧的 wall-clock 比较，空串会让这类行被日期过滤漏掉。
+    publish_time_utc = publish_time_to_utc(publish_time, timezone) or None
     images_json = (
         json.dumps(images, ensure_ascii=False) if images is not None else None
     )
@@ -638,15 +732,16 @@ def save_article(
     conn.execute(
         """
         INSERT INTO articles (
-            article_id, source, url, list_title, title, publish_time, timezone,
-            author, content, content_length, raw_content, images, status, error,
-            first_seen_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            article_id, source, url, list_title, title, publish_time,
+            publish_time_utc, timezone, author, content, content_length,
+            raw_content, images, status, error, first_seen_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source, url) DO UPDATE SET
             article_id = excluded.article_id,
             list_title = COALESCE(NULLIF(excluded.list_title, ''), articles.list_title),
             title = COALESCE(NULLIF(excluded.title, ''), articles.title),
             publish_time = COALESCE(NULLIF(excluded.publish_time, ''), articles.publish_time),
+            publish_time_utc = COALESCE(NULLIF(excluded.publish_time_utc, ''), articles.publish_time_utc),
             timezone = COALESCE(NULLIF(excluded.timezone, ''), articles.timezone),
             author = COALESCE(NULLIF(excluded.author, ''), articles.author),
             content = COALESCE(NULLIF(excluded.content, ''), articles.content),
@@ -666,6 +761,7 @@ def save_article(
             list_title,
             title,
             publish_time,
+            publish_time_utc,
             timezone,
             author,
             content,
@@ -734,7 +830,9 @@ def process_entry(
         return "skip"
 
     list_date = entry.get("parsed")
-    if list_date and list_date < cutoff:
+    # --force 表示“忽略已抓记录、强制重抓”，因此窗口外条目也不应被直接标 old 短路，
+    # 否则 force 对窗口外的历史条目并不生效。
+    if list_date and list_date < cutoff and not force:
         save_article(
             conn,
             source_name,
@@ -845,7 +943,8 @@ def run_source(
     limit_per_source: int,
 ) -> tuple[str, dict[str, int]]:
     source = {**common, **raw_source}
-    source_name = source["name"]
+    # 站名缺失时用 <未命名> 兜底，避免 KeyError 在 try 之外抛出、导致整个抓取轮次中断。
+    source_name = str(source.get("name") or "<未命名>")
     counts = {
         "ok": 0,
         "old": 0,
@@ -855,9 +954,10 @@ def run_source(
         "error": 0,
         "list_empty": 0,
     }
-    conn = sqlite3.connect(db_path, timeout=DB_BUSY_TIMEOUT_MS / 1000)
-    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
+    conn = None
     try:
+        conn = sqlite3.connect(db_path, timeout=DB_BUSY_TIMEOUT_MS / 1000)
+        conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
         entries = collect_list_entries(source)
         if not entries:
             counts["list_empty"] = 1
@@ -913,7 +1013,8 @@ def run_source(
         counts["error"] += 1
         LOG.exception("[%s] 站点处理失败：%s", source_name, exc)
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
         # 站点处理结束就释放该线程的浏览器，避免 worker 池长期占着 Chromium。
         close_thread_browser()
     return source_name, counts
@@ -970,7 +1071,12 @@ def cmd_run(args: argparse.Namespace) -> None:
             for raw_source in sources
         ]
         for future in concurrent.futures.as_completed(futures):
-            name, counts = future.result()
+            try:
+                name, counts = future.result()
+            except Exception as exc:
+                # 单个站点任务抛出未捕获异常时隔离，不影响其余站点继续汇总。
+                LOG.exception("站点任务异常：%s", exc)
+                continue
             for key, value in counts.items():
                 total[key] = total.get(key, 0) + value
             print(f"[{name}] " + ", ".join(f"{k}={v}" for k, v in counts.items()))

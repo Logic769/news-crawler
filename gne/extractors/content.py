@@ -117,7 +117,7 @@ class ContentExtractor:
                 "sbdi": sbdi,
             }
             if use_visiable_info:
-                node_info["is_visiable"] = node.attrib["is_visiable"]
+                node_info["is_visiable"] = node.attrib.get("is_visiable", True)
                 node_info["coordinate"] = node.attrib.get("coordinate", "")
             if include_body_html:
                 node_info["body_html"] = unescape(

@@ -79,11 +79,18 @@ class GeneralNewsExtractor:
         if not content:
             raise NoContentException("无法提取正文！")
 
+        # content 非空不代表正文有效：ContentExtractor 可能返回 text 为空串/None，
+        # 直接当正文入库会让下游拿到空内容却标记成功，这里统一按“无正文”处理。
+        raw_text = content[0][1].get("text")
+        body_text = str(raw_text) if raw_text is not None else ""
+        if not body_text.strip():
+            raise NoContentException("无法提取正文（内容为空）！")
+
         result: dict[str, Any] = {
             "title": title,
             "author": author,
             "publish_time": publish_time,
-            "content": content[0][1]["text"],
+            "content": body_text,
             "images": content[0][1]["images"],
             "meta": meta_content,
         }

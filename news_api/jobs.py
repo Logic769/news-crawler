@@ -266,11 +266,16 @@ class JobManager:
                     f"SELECT COUNT(*) AS n FROM crawl_jobs{where_sql}", params
                 ).fetchone()["n"]
             )
-            rows = conn.execute(
-                f"SELECT * FROM crawl_jobs{where_sql} ORDER BY created_at DESC, id DESC "
-                "LIMIT ? OFFSET ?",
-                [*params, limit, offset],
-            ).fetchall()
+            if offset >= total:
+                # 超出总数的深分页直接返回空页：避免 (page-1)*page_size 溢出
+                # SQLite INTEGER 绑定导致 OverflowError，与 db.query_articles 口径一致。
+                rows = []
+            else:
+                rows = conn.execute(
+                    f"SELECT * FROM crawl_jobs{where_sql} ORDER BY created_at DESC, id DESC "
+                    "LIMIT ? OFFSET ?",
+                    [*params, limit, offset],
+                ).fetchall()
             conn.commit()
         return [_row_to_job(row) for row in rows], total
 

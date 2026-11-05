@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from zoneinfo import ZoneInfo
 
 _FALLBACK_OFFSET = dt.timezone(dt.timedelta(hours=8))
+
+LOG = logging.getLogger("news_api.timeutil")
 
 
 def resolve_timezone(name: str | None) -> dt.tzinfo:
@@ -14,6 +17,8 @@ def resolve_timezone(name: str | None) -> dt.tzinfo:
     try:
         return ZoneInfo(name)
     except Exception:
+        # 非法时区不能静默回退：下游按 +08:00 处理会让墙钟错位且难以定位。
+        LOG.warning("无效时区 %r，回退到 +08:00", name)
         return _FALLBACK_OFFSET
 
 
