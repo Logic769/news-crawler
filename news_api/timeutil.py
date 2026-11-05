@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from zoneinfo import ZoneInfo
 
 _FALLBACK_OFFSET = dt.timezone(dt.timedelta(hours=8))
+
+LOG = logging.getLogger("news_api.timeutil")
+
+# resolve_timezone 在读取路径上会被每个值/每个请求调用；同一个非法时区只告警一次，
+# 避免一次列表请求刷出上百条重复 warning 把真正的错误淹没。
+_WARNED_TIMEZONES: set[str] = set()
 
 
 def resolve_timezone(name: str | None) -> dt.tzinfo:
@@ -14,6 +21,10 @@ def resolve_timezone(name: str | None) -> dt.tzinfo:
     try:
         return ZoneInfo(name)
     except Exception:
+        # 非法时区不能静默回退：下游按 +08:00 处理会让墙钟错位且难以定位。
+        if name not in _WARNED_TIMEZONES:
+            _WARNED_TIMEZONES.add(name)
+            LOG.warning("无效时区 %r，回退到 +08:00", name)
         return _FALLBACK_OFFSET
 
 

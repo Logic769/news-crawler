@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -24,6 +25,8 @@ from news_crawler import (
     resolve_config_path,
 )
 from url_extract import normalize_images
+
+LOG = logging.getLogger("news_api.db")
 
 
 def connect(db_path: str, *, read_only: bool = True) -> sqlite3.Connection:
@@ -57,7 +60,15 @@ def load_timezones(config_path: str, default_tz: str) -> dict[str, str]:
     """Map source name -> configured timezone; tolerate a missing config."""
     try:
         config = load_config(resolve_config_path(config_path))
-    except Exception:
+    except Exception as exc:
+        # 配置缺失/损坏时不能静默：下游会把所有来源按 default_tz 处理，
+        # 混时区场景会因此错位，必须留下 warning 便于定位。
+        LOG.warning(
+            "加载时区配置失败，按默认时区 %s 处理：%s（%s）",
+            default_tz,
+            config_path,
+            exc,
+        )
         return {}
     fallback = config.get("timezone") or default_tz
     result: dict[str, str] = {}
@@ -72,6 +83,16 @@ def _source_timezone(
     source: str, timezones: dict[str, str], default_tz: str
 ) -> str:
     return timezones.get(source, default_tz)
+
+
+def _wall_bound_to_utc(value: str, tz_name: str) -> str:
+    """把查询边界（默认时区的墙钟串）换算成 UTC 墙钟串，用于同口径过滤。"""
+    try:
+        parsed = dt.datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return value
+    parsed = parsed.replace(tzinfo=resolve_timezone(tz_name))
+    return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _like_needle(value: str) -> str:
@@ -161,12 +182,25 @@ def query_articles(
     if source:
         where.append("source = ?")
         params.append(source)
+    # 时间过滤按真实时刻（publish_time_utc）比较，避免 UTC 站点与 UTC+8 站点
+    # 的墙钟串直接相减造成边界错位；历史行没有 publish_time_utc 时回退旧的
+    # 墙钟比较，保证升级前后这些行的命中集合不变。
     if published_from:
-        where.append("publish_time >= ?")
-        params.append(published_from)
+        where.append(
+            "(publish_time_utc >= ? "
+            "OR (COALESCE(publish_time_utc, '') = '' AND publish_time >= ?))"
+        )
+        params.extend(
+            [_wall_bound_to_utc(published_from, default_tz), published_from]
+        )
     if published_to:
-        where.append("publish_time <= ?")
-        params.append(published_to)
+        where.append(
+            "(publish_time_utc <= ? "
+            "OR (COALESCE(publish_time_utc, '') = '' AND publish_time <= ?))"
+        )
+        params.extend(
+            [_wall_bound_to_utc(published_to, default_tz), published_to]
+        )
     if q:
         where.append(
             "(title LIKE ? ESCAPE '!' OR content LIKE ? ESCAPE '!' "

@@ -301,7 +301,8 @@ CREATE TABLE IF NOT EXISTS articles (
     url           TEXT NOT NULL,   -- 文章 URL
     list_title    TEXT,            -- 列表页标题
     title         TEXT,            -- GNE 抽取标题
-    publish_time  TEXT,            -- 统一为 YYYY-MM-DD HH:MM:SS
+    publish_time  TEXT,            -- 统一为 YYYY-MM-DD HH:MM:SS（站点本地墙钟，供展示/排序）
+    publish_time_utc TEXT,         -- 真实时刻 UTC 墙钟串，供跨时区时间过滤；缺 timezone 的历史行为 NULL
     timezone      TEXT,            -- 写入时的站点时区，历史行可能为空
     author        TEXT,
     content       TEXT,            -- 正文纯文本（clean_text 归一化，段落换行被压成空格）
@@ -328,9 +329,9 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 );
 ```
 
-索引：`source`、`status`、`publish_time`、`article_id`（唯一），以及两条查询性能覆盖索引：`(status, publish_time DESC, source, url)` 供列表分页、`(source, publish_time DESC, updated_at DESC, timezone, status)` 供 `/v1/sources` 聚合；`crawl_jobs` 的 `status`、`created_at`、`(type, payload, status)` 去重索引。
+索引：`source`、`status`、`publish_time`、`article_id`（唯一），以及四条查询性能覆盖索引：`(status, publish_time DESC, source, url)`、`(status, updated_at DESC, source, url)` 供列表分页、`(source, publish_time DESC, updated_at DESC, timezone, status)` 供 `/v1/sources` 聚合、`publish_time_utc` 供真实时刻过滤；`crawl_jobs` 的 `status`、`created_at`、`(type, payload, status)` 去重索引。
 
-旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 5`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、`timezone`、v4 的 `raw_content`（只补列，原文已不可得，历史行不回填）与 v5 的 `content_length`（补列后按 `length(content)` 回填 NULL 行），按 rowid 键集分页（每批 2000 行）回填 `article_id`，不边读游标边 UPDATE 同表；再补建唯一索引、去重索引与三条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这三条，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外）。迁移早退条件校验四列齐全且 `required_indexes`（三条性能索引 + `idx_articles_article_id` + `idx_crawl_jobs_dedupe`）齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
+旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 6`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、`timezone`、v4 的 `raw_content`（只补列，原文已不可得，历史行不回填）、v5 的 `content_length`（补列后按 `length(content)` 回填 NULL 行）与 v6 的 `publish_time_utc`（补列后按每行 `timezone` 换算 UTC 回填，供混时区按真实时刻过滤），按 rowid 键集分页（每批 2000 行）回填 `article_id`，不边读游标边 UPDATE 同表；再补建唯一索引、去重索引与四条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这些，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外）。迁移早退条件校验五列齐全且 `required_indexes`（四条性能索引 + `idx_articles_article_id` + `idx_crawl_jobs_dedupe`）齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
 
 ### 7.2 status 语义
 
@@ -349,7 +350,7 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 - `content` 入库前会被 `clean_text()` 压缩空白，段落换行会丢失；GNE 原始换行正文另存 `raw_content`（代价是正文体积约翻倍，仅 `ok`/`unknown_date` 写入，`old`/`error` 不写）；v4 之前入库的历史行需要 `--force` 重抓，或用 `backfill_raw_content.py` 批量回填（只 `UPDATE raw_content`，不改 `content`/`status`/`updated_at`）；
 - 同一 `(source, url)` 使用 upsert，不会产生重复记录；
 - `save_article()` 是**部分更新**：空字符串表示“这次没拿到”，不会覆盖库中已有值，因此抓取失败或重新分类时只更新 `status`/`error`，已成功入库的正文不会被清空；`images` 例外地区分三态：`None` 保留旧值、`[]` 明确清空、非空列表覆盖；抓取流程用 `normalize_images_for_update` 把"抽取不到图"归一为 `None`（保留旧值），只有显式传 `[]` 才清空，避免成功重抓因抽取失败抹掉历史图片；
-- `timezone` 随文章落库，读取时优先使用该列，旧行（NULL）才回落到当前配置推断；`published_from`/`published_to` 仍按站点本地墙钟字符串比较，混合时区时会有偏差；
+- `timezone` 随文章落库，读取时优先使用该列，旧行（NULL）才回落到当前配置推断；`publish_time_utc` 存真实时刻（UTC），`published_from`/`published_to` 按它过滤以消除混时区偏差，`publish_time_utc` 为 NULL/空串的历史行回退旧的 `publish_time` 墙钟比较；列表排序仍按 `publish_time` 墙钟；
 - `article_id` 由 `sha256(source + \x1f + url)` 派生，不随数据库重建变化，可安全作为下游引用；
 - SQLite 启用 WAL 与 `busy_timeout=30000`（`DB_BUSY_TIMEOUT_MS`，与连接 timeout 一致，不用 5s 覆盖 30s 连接超时），API 作业默认单 worker 写入；只读查询使用 `file:...?mode=ro` URI（路径会转义），WAL 库仍要求目录可写（需要 -shm/-wal）。
 

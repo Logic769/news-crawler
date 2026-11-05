@@ -11,6 +11,7 @@ from typing import Any
 import news_crawler
 import url_extract
 from gne import GeneralNewsExtractor
+from news_api.db import load_timezones
 from news_api.netguard import ensure_url_allowed
 from news_api.settings import Settings
 from url_extract import close_thread_browser, normalize_images_for_update
@@ -48,73 +49,74 @@ def _init_db(settings: Settings) -> None:
 
 
 def execute_crawl(payload: dict[str, Any], settings: Settings) -> dict[str, Any]:
-    config_path = news_crawler.resolve_config_path(settings.config_path)
-    config = news_crawler.load_config(config_path)
-    sources = list(config.get("sources") or [])
-    source_filter = payload.get("source")
-    if source_filter:
-        sources = [item for item in sources if item.get("name") == source_filter]
+    try:
+        config_path = news_crawler.resolve_config_path(settings.config_path)
+        config = news_crawler.load_config(config_path)
+        sources = list(config.get("sources") or [])
+        source_filter = payload.get("source")
+        if source_filter:
+            sources = [item for item in sources if item.get("name") == source_filter]
+            if not sources:
+                names = [item.get("name") for item in config.get("sources", [])]
+                raise ValueError(f"找不到站点 {source_filter}；已配置：{names}")
         if not sources:
-            names = [item.get("name") for item in config.get("sources", [])]
-            raise ValueError(f"找不到站点 {source_filter}；已配置：{names}")
-    if not sources:
-        raise ValueError(f"{config_path} 里没有配置任何站点")
+            raise ValueError(f"{config_path} 里没有配置任何站点")
 
-    _init_db(settings)
-    tz_name = str(config.get("timezone") or settings.timezone)
-    tz = news_crawler.get_timezone(tz_name)
-    since = payload.get("since")
-    if since:
-        cutoff = dt.datetime.strptime(str(since), "%Y-%m-%d").replace(tzinfo=tz)
-    else:
-        days = int(payload.get("days") or config.get("days", 3))
-        cutoff = dt.datetime.now(tz) - dt.timedelta(days=days)
+        _init_db(settings)
+        tz_name = str(config.get("timezone") or settings.timezone)
+        tz = news_crawler.get_timezone(tz_name)
+        since = payload.get("since")
+        if since:
+            cutoff = dt.datetime.strptime(str(since), "%Y-%m-%d").replace(tzinfo=tz)
+        else:
+            days = int(payload.get("days") or config.get("days", 3))
+            cutoff = dt.datetime.now(tz) - dt.timedelta(days=days)
 
-    workers = int(payload.get("workers") or config.get("workers", 3))
-    workers = max(1, min(workers, len(sources)))
-    limit_per_source = int(payload.get("limit_per_source") or 0)
-    force = bool(payload.get("force"))
+        workers = int(payload.get("workers") or config.get("workers", 3))
+        workers = max(1, min(workers, len(sources)))
+        limit_per_source = int(payload.get("limit_per_source") or 0)
+        force = bool(payload.get("force"))
 
-    results: list[dict[str, Any]] = []
-    totals: dict[str, int] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(
-                news_crawler.run_source,
-                raw_source,
-                config,
-                settings.db_path,
-                cutoff,
-                force,
-                limit_per_source,
-            ): raw_source
-            for raw_source in sources
+        results: list[dict[str, Any]] = []
+        totals: dict[str, int] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    news_crawler.run_source,
+                    raw_source,
+                    config,
+                    settings.db_path,
+                    cutoff,
+                    force,
+                    limit_per_source,
+                ): raw_source
+                for raw_source in sources
+            }
+            for future in concurrent.futures.as_completed(futures):
+                raw_source = futures[future]
+                try:
+                    name, counts = future.result()
+                except Exception as exc:  # noqa: BLE001 - isolate one bad site
+                    LOG.exception("站点任务失败: %s", raw_source.get("name"))
+                    name = str(raw_source.get("name") or "unknown")
+                    counts = {"error": 1}
+                    results.append({"name": name, "counts": counts, "error": str(exc)[:500]})
+                else:
+                    results.append({"name": name, "counts": counts})
+                for key, value in counts.items():
+                    totals[key] = totals.get(key, 0) + value
+
+        results.sort(key=lambda item: item["name"])
+        return {
+            "config": config_path,
+            "cutoff": cutoff.isoformat(),
+            "sources": results,
+            "totals": totals,
         }
-        for future in concurrent.futures.as_completed(futures):
-            raw_source = futures[future]
-            try:
-                name, counts = future.result()
-            except Exception as exc:  # noqa: BLE001 - isolate one bad site
-                LOG.exception("站点任务失败: %s", raw_source.get("name"))
-                name = str(raw_source.get("name") or "unknown")
-                counts = {"error": 1}
-                results.append({"name": name, "counts": counts, "error": str(exc)[:500]})
-            else:
-                results.append({"name": name, "counts": counts})
-            for key, value in counts.items():
-                totals[key] = totals.get(key, 0) + value
-
-    results.sort(key=lambda item: item["name"])
-    # 浏览器在 run_source 的 worker 线程里按线程复用，并由 run_source 的
-    # finally 逐个释放；作业线程本身通常没有浏览器，这里的调用是兜底
-    # （例如作业线程曾直接渲染过页面），不做也不会有泄漏。
-    close_thread_browser()
-    return {
-        "config": config_path,
-        "cutoff": cutoff.isoformat(),
-        "sources": results,
-        "totals": totals,
-    }
+    finally:
+        # 无论前面哪一步抛错（配置加载/建库/并发执行），都释放本线程可能
+        # 复用的浏览器，避免作业线程上的浏览器资源泄漏。
+        close_thread_browser()
 
 
 def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, Any]:
@@ -132,6 +134,14 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
         source = requested_source
     else:
         source = "on_demand"
+    # extract 落库的墙钟/时区必须与该 URL 所属站点一致：source 为配置站点时用
+    # 站点自身 timezone，否则（on_demand）才回落到全局 settings.timezone。
+    if requested_source:
+        tz_name = load_timezones(settings.config_path, settings.timezone).get(
+            requested_source, settings.timezone
+        )
+    else:
+        tz_name = settings.timezone
     ensure_url_allowed(url, allow_private=settings.allow_private_urls)
     validator = (
         None
@@ -160,11 +170,9 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
 
         raw_content = str(result.get("content") or "").strip()
         publish_text = news_crawler.clean_text(result.get("publish_time"))
-        publish_dt = news_crawler.parse_datetime(publish_text, None, settings.timezone)
+        publish_dt = news_crawler.parse_datetime(publish_text, None, tz_name)
         if publish_dt is not None:
-            publish_text = news_crawler.format_publish_time(
-                publish_dt, settings.timezone
-            )
+            publish_text = news_crawler.format_publish_time(publish_dt, tz_name)
         status = "ok" if publish_dt is not None else "unknown_date"
         error = "" if publish_dt is not None else "无法解析发布日期"
         article_id = news_crawler.save_article(
@@ -173,7 +181,7 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             url,
             title=news_crawler.clean_text(result.get("title")),
             publish_time=publish_text,
-            timezone=settings.timezone,
+            timezone=tz_name,
             author=news_crawler.clean_text(result.get("author")),
             content=news_crawler.clean_text(raw_content),
             raw_content=raw_content,

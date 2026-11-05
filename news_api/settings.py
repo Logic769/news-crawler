@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 
 def _env_int(name: str, default: int) -> int:
@@ -46,12 +47,18 @@ class Settings:
             for item in os.getenv("NEWS_CORS_ORIGINS", "").split(",")
             if item.strip()
         )
+        tz_raw = os.getenv("NEWS_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
+        try:
+            ZoneInfo(tz_raw)
+        except Exception as exc:
+            # 显式配置的时区非法时启动即失败，避免运行期静默回退把墙钟写错。
+            raise ValueError(f"NEWS_TIMEZONE 非法时区: {tz_raw!r}（{exc}）") from exc
         return cls(
             db_path=db_path,
             config_path=config_path,
             api_key=api_key,
             job_workers=max(1, _env_int("NEWS_JOB_WORKERS", 1)),
-            timezone=os.getenv("NEWS_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai",
+            timezone=tz_raw,
             cors_origins=origins,
             allow_private_urls=_env_bool("NEWS_ALLOW_PRIVATE_URLS"),
             max_pending_jobs=max(1, _env_int("NEWS_MAX_PENDING_JOBS", 50)),

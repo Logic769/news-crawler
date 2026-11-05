@@ -41,7 +41,7 @@ class TimeExtractor:
         date_part = date_part.replace("年", "-").replace("月", "-").replace("日", "")
         parts = _DATE_SEP_RE.split(date_part)
         try:
-            if len(parts) >= 3:
+            if len(parts) >= 2:
                 month = int(parts[-2])
                 day = int(parts[-1])
                 if month < 1 or month > 12:

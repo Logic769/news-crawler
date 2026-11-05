@@ -9,6 +9,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import zlib
@@ -429,7 +430,7 @@ def extract_video_meta(html_text: str, url: str) -> dict | None:
         "author": author,
         "publish_time": publish,
         "content": content,
-        "images": [absolute_url(url, image)] if image else [],
+        "images": normalize_images([image], url) if image else [],
         "is_video": True,
     }
 
@@ -617,6 +618,16 @@ class UnsupportedContentEncoding(ValueError):
 # 正常新闻页 HTML 远小于此，超限直接拒绝该响应。
 MAX_DECODED_BYTES = 32 * 1024 * 1024
 
+# 多 member gzip 每结束一段都要复制剩余压缩后缀并新建 decompressobj。恶意响应
+# 可以用大量极小 member 在字节上限内放大 CPU/内存开销，因此额外限制 member 数量。
+MAX_COMPRESSION_MEMBERS = 32
+
+# urllib 的 timeout 只是单次 socket 操作超时，慢速滴流（每隔几十秒吐一个字节）
+# 能让整个响应无限期拖住抓取线程。这里再加一个总墙钟预算，并配合按剩余预算
+# 收缩 socket 超时来强制中止。
+PER_OP_TIMEOUT = 25
+MAX_FETCH_TOTAL_SECONDS = 30
+
 
 def _check_size(data: bytes) -> bytes:
     if len(data) > MAX_DECODED_BYTES:
@@ -636,6 +647,7 @@ def _decompress_stage(raw: bytes, wbits: int) -> bytes:
     obj = zlib.decompressobj(wbits)
     out = bytearray()
     buf = raw
+    members = 1
     while True:
         out += obj.decompress(buf, MAX_DECODED_BYTES + 1 - len(out))
         if len(out) > MAX_DECODED_BYTES:
@@ -643,8 +655,22 @@ def _decompress_stage(raw: bytes, wbits: int) -> bytes:
                 f"解压后超过 {MAX_DECODED_BYTES} 字节上限，拒绝该响应（疑似压缩炸弹）"
             )
         buf = obj.unconsumed_tail
-        if not buf:
-            break
+        if buf:
+            continue
+        # 多 member（多个 gzip 流拼接）时，一个 member 结束后剩余字节在
+        # unused_data 里；需用新的 decompressobj 继续解，否则第二段起被静默丢弃。
+        # 仅 gzip 支持多 member：deflate 的尾随字节不是新 member（例如 smoke 里
+        # 去掉 zlib 头的裸流会残留 Adler-32 尾字节），误当 member 会解压失败。
+        if wbits > 15 and obj.eof and obj.unused_data:
+            members += 1
+            if members > MAX_COMPRESSION_MEMBERS:
+                raise UnsupportedContentEncoding(
+                    f"压缩流包含超过 {MAX_COMPRESSION_MEMBERS} 个 member，拒绝该响应"
+                )
+            buf = obj.unused_data
+            obj = zlib.decompressobj(wbits)
+            continue
+        break
     out += obj.flush()
     if len(out) > MAX_DECODED_BYTES:
         raise UnsupportedContentEncoding(
@@ -705,6 +731,19 @@ def _decompress(raw: bytes, encoding: str | None) -> bytes:
     return raw
 
 
+def _response_socket(resp: Any) -> socket.socket | None:
+    """尽力取出 HTTPResponse 底层的 socket，用于按剩余预算设置读取超时。
+
+    取不到（实现差异/已被包装）时返回 None，调用方仍可依赖每轮墙钟检查兜底。
+    """
+    fp = getattr(resp, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if isinstance(sock, socket.socket):
+        return sock
+    return None
+
+
 def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) -> str:
     """Fetch a page and decode it using the charset from headers/meta tags.
 
@@ -729,15 +768,65 @@ def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) 
             handlers.append(urllib.request.HTTPSHandler(context=context))
         opener = urllib.request.build_opener(*handlers)
         req = urllib.request.Request(url, headers=HEADERS)
-        with opener.open(req, timeout=25) as resp:
-            # 先按上限 +1 读取原始响应体：未压缩但超大的响应不能无限读入内存；
-            # 压缩流本身一般远小于解压结果，真正的解压上限由 _decompress 兜底。
-            compressed = resp.read(MAX_DECODED_BYTES + 1)
-            if len(compressed) > MAX_DECODED_BYTES:
-                raise UnsupportedContentEncoding(
-                    f"响应体超过 {MAX_DECODED_BYTES} 字节上限，拒绝该响应"
+        # 总预算从建立连接前开始计时，连接、等待响应头、读取正文共用同一截止时间。
+        deadline = time.monotonic() + MAX_FETCH_TOTAL_SECONDS
+        open_timeout = min(PER_OP_TIMEOUT, deadline - time.monotonic())
+        if open_timeout <= 0:
+            raise TimeoutError(
+                f"抓取超过 {MAX_FETCH_TOTAL_SECONDS} 秒总时限：{url}"
+            )
+        with opener.open(req, timeout=open_timeout) as resp:
+            # 分块读取，边读边查总墙钟预算：单次 socket 超时挡不住慢速滴流，
+            # 每轮把 socket 超时收缩到“剩余预算”，阻塞读取也会在剩余预算耗尽时
+            # 由 socket.timeout 中止。同时累计字节数，未压缩但超大的响应不能
+            # 无限读入内存；压缩流一般远小于解压结果，真正上限由 _decompress 兜底。
+            sock = _response_socket(resp)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"抓取超过 {MAX_FETCH_TOTAL_SECONDS} 秒总时限：{url}"
                 )
-            raw = _decompress(compressed, resp.headers.get("Content-Encoding"))
+            if sock is not None:
+                try:
+                    sock.settimeout(min(PER_OP_TIMEOUT, remaining))
+                except OSError:
+                    pass
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"抓取超过 {MAX_FETCH_TOTAL_SECONDS} 秒总时限：{url}"
+                    )
+                if sock is not None:
+                    try:
+                        sock.settimeout(min(PER_OP_TIMEOUT, remaining))
+                    except OSError:
+                        pass
+                try:
+                    # read1 只做一次底层 recv 就返回，能让循环频繁回到墙钟检查；
+                    # 若用 read(n) 会一直阻塞到读满 n 字节或 EOF，慢速滴流下
+                    # 整个函数仍被拖到数据发完为止。
+                    read_chunk = getattr(resp, "read1", None) or resp.read
+                    chunk = read_chunk(65536)
+                except TimeoutError as exc:
+                    raise TimeoutError(
+                        f"抓取超过 {MAX_FETCH_TOTAL_SECONDS} 秒总时限：{url}"
+                    ) from exc
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_DECODED_BYTES:
+                    raise UnsupportedContentEncoding(
+                        f"响应体超过 {MAX_DECODED_BYTES} 字节上限，拒绝该响应"
+                    )
+                chunks.append(chunk)
+            compressed = b"".join(chunks)
+            # 服务端可能用多条重复的 Content-Encoding 头（而非逗号合并），
+            # .get() 只拿第一条会漏解一层；get_all 合并后交给 _decompress 逐层解。
+            ce_headers = resp.headers.get_all("Content-Encoding") or []
+            raw = _decompress(compressed, ",".join(ce_headers) if ce_headers else None)
             return raw, resp.headers.get_content_charset()
 
     try:
@@ -871,7 +960,13 @@ def extract_article(
             return None
         html = rendered
         already_rendered = True
-    except (urllib.error.URLError, ValueError, TimeoutError, ConnectionError) as exc:
+    except (
+        urllib.error.URLError,
+        ValueError,
+        TimeoutError,
+        ConnectionError,
+        http.client.HTTPException,
+    ) as exc:
         LOG.warning("抓取失败（网络错误或网址无效）：%s", exc)
         return None
 

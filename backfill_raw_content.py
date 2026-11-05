@@ -132,20 +132,22 @@ def backfill(
     delay: float,
     allow_browser: bool,
     dry_run: bool,
-) -> tuple[int, int, int, list[Failure]]:
+) -> tuple[int, int, int, list[Failure], int]:
     """逐条重抓并写回 raw_content。
 
-    返回 (成功数, 失败数, 跳过数, 失败明细)。跳过指 UPDATE 未命中：
+    返回 (成功数, 失败数, 跳过数, 抓取失败明细, 写库失败数)。跳过指 UPDATE 未命中：
     通常是另一个进程已经回填，或行已被删除，不能与抓取失败混为一谈。
+    写库失败（如数据库锁）是临时错误，不写入 --skip-file，数据库恢复后下次会重试。
     """
     if dry_run or not candidates:
-        return 0, 0, 0, []
+        return 0, 0, 0, [], 0
 
     # 单线程串行复用同一实例是安全的（跨线程共享才会出 math domain error）。
     extractor = GeneralNewsExtractor()
     updated = 0
     failed = 0
     skipped = 0
+    write_failed = 0
     failures: list[Failure] = []
     try:
         for index, (source, url) in enumerate(candidates):
@@ -164,8 +166,22 @@ def backfill(
                 failures.append((source, url, "抽取结果没有正文"))
                 print(f"  [失败] {source} {url}")
                 continue
-            cursor = conn.execute(_UPDATE_SQL, (raw_content, source, url))
-            conn.commit()
+            try:
+                cursor = conn.execute(_UPDATE_SQL, (raw_content, source, url))
+                conn.commit()
+            except sqlite3.Error as exc:  # 单行写库失败不中止整批
+                # commit 阶段失败时 UPDATE 可能仍留在事务里，best-effort 回滚，
+                # 避免后续某次 commit 把本已计为失败的行一并提交。
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                failed += 1
+                write_failed += 1
+                # 写库失败通常是数据库锁等临时问题，不能写进 --skip-file，
+                # 否则数据库恢复后这些文章会被永久排除在候选之外。
+                print(f"  [失败] {source} {url}：写库失败 {exc}")
+                continue
             if cursor.rowcount:
                 updated += 1
                 print(f"  [回填 {len(raw_content)} 字] {source} {url}")
@@ -174,7 +190,7 @@ def backfill(
                 print(f"  [跳过] {source} {url}（已被其他进程回填或条件不再满足）")
     finally:
         close_thread_browser()
-    return updated, failed, skipped, failures
+    return updated, failed, skipped, failures, write_failed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -272,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"候选 {len(candidates)} 条（status in {statuses} 且 raw_content 为空）")
         if skip:
             print(f"已跳过清单中的 {len(skip)} 条")
-        updated, failed, skipped, failures = backfill(
+        updated, failed, skipped, failures, write_failed = backfill(
             conn,
             candidates,
             delay=args.delay,
@@ -297,8 +313,15 @@ def main(argv: list[str] | None = None) -> int:
             f"失败清单已写入：{failed_path}"
             f"（本次失败 {len(failures)} 条，保留上次失败 {len(preserved)} 条；下次可用 --skip-file 跳过这些条目）"
         )
+    if write_failed:
+        print(
+            f"警告：有 {write_failed} 条因写库失败未回填；这些条目未加入失败清单，"
+            "数据库恢复后下次运行会重试。",
+            file=sys.stderr,
+        )
     print(f"完成：回填 {updated} 条，失败 {failed} 条，跳过 {skipped} 条。")
-    return 0
+    # 写库失败说明本次数据未完整落库，返回非零让调度器能识别任务失败。
+    return 1 if write_failed else 0
 
 
 if __name__ == "__main__":

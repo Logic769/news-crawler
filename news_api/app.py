@@ -134,7 +134,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         foreign = sorted({tz for tz in timezones.values() if tz != settings.timezone})
         if foreign:
             LOG.warning(
-                "站点时区 %s 与 NEWS_TIMEZONE=%s 不一致，列表排序与时间过滤按站点本地时间处理",
+                "站点时区 %s 与 NEWS_TIMEZONE=%s 不一致：列表排序按站点本地墙钟，时间过滤按真实时刻(UTC)",
                 ",".join(foreign),
                 settings.timezone,
             )
@@ -373,7 +373,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             None, pattern="^(queued|running|succeeded|failed)$"
         ),
         type: str | None = Query(None, pattern="^(crawl|extract)$"),
-        page: int = Query(1, ge=1),
+        page: int = Query(1, ge=1, le=1_000_000),
         page_size: int = Query(20, ge=1, le=100),
     ) -> dict[str, Any]:
         rows, total = request.app.state.jobs.list(
