@@ -1,0 +1,45 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "pip_requirements": {
+    "managerFilePatterns": [
+      "/(^|/)docker/constraints\\.txt$/"
+    ]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Keep the ruff/mypy pins in the CI workflow in sync with pyproject.toml [dependency-groups].",
+      "managerFilePatterns": [
+        "/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "pip install \"(?<depName>ruff|mypy)==(?<currentValue>[0-9][^\"]*)\""
+      ],
+      "datasourceTemplate": "pypi",
+      "versioningTemplate": "pep440"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Update the ruff/mypy dev-tool pins in pyproject.toml and .github/workflows/deploy-test.yml in a single PR.",
+      "matchPackageNames": [
+        "ruff",
+        "mypy"
+      ],
+      "groupName": "python dev tooling"
+    },
+    {
+      "description": "docker/constraints.txt is a fully-resolved snapshot derived from uv.lock (see its header and README). Bumping an individual pin - especially a transitive one such as pydantic-core that a parent like pydantic pins exactly - breaks the locked set, so `pip install -c docker/constraints.txt` becomes unresolvable; groupName only batches PRs and does not guarantee compatibility. Therefore Renovate must not update this file on its own: regenerate it from uv.lock (`uv lock` then re-sync the versions). The CI docker build fails closed on any drift.",
+      "matchManagers": [
+        "pip_requirements"
+      ],
+      "matchFileNames": [
+        "docker/constraints.txt"
+      ],
+      "enabled": false
+    }
+  ]
+}
