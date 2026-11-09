@@ -2,5 +2,42 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "pip_requirements": {
+    "managerFilePatterns": [
+      "/(^|/)docker/constraints\\.txt$/"
+    ]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Keep the ruff/mypy pins in the CI workflow in sync with pyproject.toml [dependency-groups].",
+      "managerFilePatterns": [
+        "/(^|/)\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "pip install \"(?<depName>ruff|mypy)==(?<currentValue>[0-9][^\"]*)\""
+      ],
+      "datasourceTemplate": "pypi",
+      "versioningTemplate": "pep440"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Group the runtime dependency ranges (pyproject.toml) with the pinned versions in docker/constraints.txt so the image never builds against a stale pin.",
+      "matchManagers": [
+        "pep621",
+        "pip_requirements"
+      ],
+      "groupName": "python runtime dependencies"
+    },
+    {
+      "description": "Update the ruff/mypy dev-tool pins in pyproject.toml and .github/workflows/deploy-test.yml in a single PR.",
+      "matchPackageNames": [
+        "ruff",
+        "mypy"
+      ],
+      "groupName": "python dev tooling"
+    }
   ]
 }
