@@ -9,7 +9,7 @@
 #   PLAYWRIGHT_DOWNLOAD_HOST  Playwright 浏览器下载镜像（国内可用 https://npmmirror.com/mirrors/playwright）
 
 # 基础镜像按 digest 固定，保证可复现构建（升级时手动更新 digest）
-FROM python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 
 ARG PIP_INDEX_URL=https://pypi.org/simple
 ARG INSTALL_BROWSER=1
