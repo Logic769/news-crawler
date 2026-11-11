@@ -24,8 +24,9 @@ import sqlite3
 import sys
 import time
 import urllib.error
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
