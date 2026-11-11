@@ -20,6 +20,7 @@ class TitleExtractor:
     """Extract a news title with the legacy fallback chain."""
 
     def extract_by_xpath(self, element: HtmlElement, title_xpath: str) -> str:
+        """Return the text matched by title_xpath; empty string when it is unusable."""
         if not title_xpath:
             return ""
         try:

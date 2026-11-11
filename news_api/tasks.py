@@ -140,6 +140,7 @@ def execute_crawl(payload: dict[str, Any], settings: Settings) -> dict[str, Any]
 
 
 def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    """执行 extract 作业：校验来源与 URL，抽取正文后写库并返回结果摘要。"""
     url = str(payload["url"])
     requested_source = str(payload.get("source") or "").strip()
     if requested_source:

@@ -532,6 +532,7 @@ def _validate_title_xpath(name: object, value: object) -> str:
 
 
 def load_config(path: str) -> dict:
+    """读取 JSON 配置并补齐默认值，同时校验各站点的 article_title_xpath。"""
     if not Path(path).exists():
         raise FileNotFoundError(
             f"找不到配置文件 {path}。请参考 README 创建并填写配置文件。"
@@ -866,6 +867,7 @@ def process_entry(
     force: bool,
     delay: float = 0.0,
 ) -> str:
+    """处理单篇文章：去重、时间过滤、抓取、抽取并入库，返回处理结果标签。"""
     url = entry["url"]
     source_name = source["name"]
     tz_name = source.get("timezone", "Asia/Shanghai")

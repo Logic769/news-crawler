@@ -944,6 +944,7 @@ def extract_article(
     url_validator: Callable[[str], None] | None = None,
     title_xpath: str = "",
 ) -> dict | None:
+    """抓取单个 URL 并抽取正文；必要时回退浏览器，失败或正文为空时返回 None。"""
     LOG.info("正在抓取: %s", url)
     already_rendered = False
     try:
