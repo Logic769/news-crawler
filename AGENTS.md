@@ -263,7 +263,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | `url_xpath` | 否 | 默认第一个 `a` 的 `href` |
 | `date_xpath` | 否 | 默认从整条节点文本中自动识别日期 |
 | `date_format` | 否 | 指定 `strptime` 格式 |
-| `article_title_xpath` | 否 | 详情页标题 XPath（`<title>` 是站点名、真标题在正文 h1 时使用）；推荐以 `/text()` 结尾，写元素节点也能兜底取其文本，不能用 `string(...)`（只返回首字符） |
+| `article_title_xpath` | 否 | 详情页标题 XPath（`<title>` 是站点名、真标题在正文 h1 时使用）；推荐直接写标题元素（如 `//h1`），会取其全部文本（含 `<em>` 等子元素）；`/text()` 只取第一个直接文本节点，标题含子标签时会截断；以 `string(` 开头的表达式会被忽略 |
 | `timezone` | 否 | 默认 `Asia/Shanghai` |
 | `render` | 否 | 列表页是否强制 Chrome 渲染 |
 | `delay` | 否 | 请求间隔秒数，默认 0.5；列表页与文章详情页请求前都会等待 |

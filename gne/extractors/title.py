@@ -26,7 +26,11 @@ class TitleExtractor:
             title_list = element.xpath(title_xpath)
         except Exception:  # 非法 XPath 不该让整篇文章变成 error
             return ""
-        if not title_list:
+        # XPath 1.0 的标量结果：字符串可直接用（normalize-space(//h1) 等），
+        # 数字/布尔没有文本语义，返回空串交给下一级回退，绝不能当成序列索引。
+        if isinstance(title_list, str):
+            return title_list.strip()
+        if not isinstance(title_list, list) or not title_list:
             return ""
         value = title_list[0]
         if isinstance(value, str):
