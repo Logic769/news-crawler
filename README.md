@@ -388,7 +388,7 @@ cp sources.json sources.local.json
 | --- | --- | --- |
 | `name` | 必填 | 站点唯一标识，例如 `ncu_news` |
 | `list_url` | 二选一 | 新闻列表页地址 |
-| `list_urls` | 二选一 | 多个列表页地址组成的数组，用于分页等情况 |
+| `list_urls` | 二选一 | 多个固定列表页地址组成的数组（旧版分页方式；单 `list_url` 站点请优先用 `pagination`） |
 | `item_xpath` | 必填 | 定位每条新闻节点的 XPath |
 | `title_xpath` | 可选 | 标题 XPath，不填默认取第一个 `a` 标签 |
 | `url_xpath` | 可选 | 详情页链接 XPath，不填默认取第一个 `a` 标签的 `href` |
@@ -398,12 +398,43 @@ cp sources.json sources.local.json
 | `article_title_xpath` | 可选 | 详情页标题 XPath。用于 `<title>` 写的是站点名、真标题在正文 `h1` 的站点。推荐直接写标题元素（如 `//h1[@class='article-title']`），会取其全部文本（含 `<em>` 等子元素）；写成 `//h1/text()` 只能取第一个直接文本节点，标题含子标签时会截断。以 `string(` 开头的表达式会被忽略 |
 | `article_publish_time_xpath` | 可选 | 详情页发布时间 XPath。用于正文里更早出现无关时间、页头日期才是真发布时间的站点；推荐写包含日期的元素（如 `//p[contains(@class,'article__subTitle')]/span[1]`）。以 `string(` 开头或非法表达式会被忽略 |
 | `date_skew_days` | 可选 | 详情日期与列表日期允许相差的天数，默认 7，范围 0–365；超过时改用列表日期，避免正文里的未来时间或站内推荐日期污染发布时间 |
+| `pagination` | 可选 | 自动分页配置对象，见下方“自动分页（可选）”；只对单个 `list_url` 生效，配置 `list_urls` 时仍按固定地址列表抓取（不受 `max_pages`/`stop_when_older_than_cutoff` 影响） |
 | `render` | 可选 | 设为 `true` 表示列表页需要用 Chrome 渲染后再解析 |
 | `delay` | 可选 | 每个请求之间的等待秒数，默认 0.3 |
 
 > 顶层还可以配置 `workers`（同时处理几个站点，默认 16）和 `days`（默认抓取天数）。
 >
 > **内存提示**：`workers` 是站点级线程数；开启浏览器回退时，每个线程可能各自启动一个 Chromium（约 200–300 MB）。`workers=16` 建议至少 4 GB 可用内存；小内存机器或 JS 站点较多时请调低 `--workers`，否则可能被 OOM Kill。
+
+#### 自动分页（可选）
+
+列表页是 `index_2.html` 这类固定模板时，不必再手写 `list_urls`：
+
+```json
+"pagination": {
+  "mode": "template",
+  "url_template": "https://example.com/news/index_{page}.html",
+  "total_pages_regex": "index_(\\d+)\\.html",
+  "start": 2,
+  "max_pages": 50,
+  "stop_when_older_than_cutoff": true,
+  "stop_after_known_pages": 2
+}
+```
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `mode` | `none` | `none` 只抓 `list_url`；`template` 按 `url_template` 生成后续页；`next` 跟随“下一页”链接；`auto` 有模板用模板，否则跟随下一页 |
+| `url_template` | 空 | 页码模板，必须包含 `{page}`；缺少占位符时 `template` 模式回退为只抓首页，`auto` 模式改走下一页 |
+| `last_url_xpath` | 空 | 尾页链接 XPath；命中元素时依次尝试 href/onclick/data-page/value 和文本，从中提取最大页码。不填时从整页 HTML 用 `total_pages_regex` 探测 |
+| `next_url_xpath` | 空 | “下一页”链接 XPath；支持相对地址，也兼容常见 `onclick=location.href=...` 写法 |
+| `total_pages_regex` | `(?:index_|page[=/])(\\d+)` | 从 HTML 提取最大页码的正则，捕获组必须是数字 |
+| `start` | `1` | 模板模式从第几页开始生成（第 1 页始终是 `list_url`，通常设为 2）；范围 1–1000 |
+| `max_pages` | `50` | 最多抓取页数，防御性上限；范围 1–500 |
+| `stop_when_older_than_cutoff` | `true` | 当前页最晚日期早于抓取窗口起点时停止翻页（整页都早于窗口才停，避免置顶旧文导致漏抓） |
+| `stop_after_known_pages` | `2` | 连续 N 页链接都已入库时停止（增量运行）；范围 0–100，设为 0 关闭；仅 template/next/auto 模式生效 |
+
+自动分页会在页内按 URL 去重，并在 `test` 命令输出页数与停止原因（如 `cutoff`、`known_pages`、`no_next`、`max_pages`、`empty`、`fetch_failed`、`done`）。
 
 ### 第 3 步：测试列表解析
 

@@ -352,8 +352,11 @@ def align_yearless_datetime(
 ) -> dt.datetime | None:
     """用可信基准日期的年份补齐无年份日期，月日与时分来自 *value*。"""
     tz = get_timezone(timezone_name)
-    local_value = value.astimezone(tz)
-    local_reference = reference.astimezone(tz)
+    # 无 tzinfo 的 datetime 按站点本地墙钟解释，不依赖进程系统时区。
+    local_value = value.replace(tzinfo=tz) if value.tzinfo is None else value.astimezone(tz)
+    local_reference = (
+        reference.replace(tzinfo=tz) if reference.tzinfo is None else reference.astimezone(tz)
+    )
     candidate = (
         f"{local_reference.year:04d}-{local_value.month:02d}-{local_value.day:02d} "
         f"{local_value.hour:02d}:{local_value.minute:02d}:{local_value.second:02d}"
@@ -764,22 +767,356 @@ def fetch_list_html(url: str, render: bool) -> str | None:
         return fetch_html_with_browser(url)
 
 
-def collect_list_entries(source: dict) -> list[dict]:
-    urls = source.get("list_urls") or [source["list_url"]]
+def _pagination_int(
+    raw: dict[str, Any], name: str, default: int, minimum: int, maximum: int
+) -> int:
+    value = raw.get(name, default)
+    if isinstance(value, bool):
+        LOG.warning("pagination.%s 不能是布尔值，回退为 %d", name, default)
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        LOG.warning("pagination.%s 不是整数（%r），回退为 %d", name, value, default)
+        return default
+    if parsed < minimum or parsed > maximum:
+        LOG.warning(
+            "pagination.%s 超出范围 %d..%d（%r），回退为 %d",
+            name,
+            minimum,
+            maximum,
+            value,
+            default,
+        )
+        return default
+    return parsed
+
+
+def _pagination_bool(raw: dict[str, Any], name: str, default: bool) -> bool:
+    value = raw.get(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    LOG.warning("pagination.%s 不是布尔值（%r），回退为 %s", name, value, default)
+    return default
+
+
+def _pagination_settings(source: dict) -> dict[str, Any]:
+    """返回归一化后的分页配置。
+
+    兼容旧配置：未配置 pagination 时保持 list_urls/list_url 的原有行为。
+    """
+    defaults: dict[str, Any] = {
+        "mode": "none",
+        "url_template": "",
+        "last_url_xpath": "",
+        "next_url_xpath": "",
+        "total_pages_regex": r"(?:index_|page[=/])(\d+)",
+        "start": 1,
+        "max_pages": 50,
+        "stop_when_older_than_cutoff": True,
+        "stop_after_known_pages": 2,
+    }
+    raw = source.get("pagination")
+    if raw is None or source.get("list_urls"):
+        # list_urls 是固定地址列表，pagination 配置不生效；提前返回避免无意义告警。
+        return defaults
+    if not isinstance(raw, dict):
+        LOG.warning("站点 %r 的 pagination 不是对象，已忽略", source.get("name"))
+        return defaults
+
+    mode = str(raw.get("mode") or "none").strip().lower()
+    if mode not in {"auto", "next", "template", "none"}:
+        LOG.warning(
+            "站点 %r 的 pagination.mode=%r 非法（可选 auto/next/template/none），已回退为 none",
+            source.get("name"),
+            raw.get("mode"),
+        )
+        mode = "none"
+    defaults["mode"] = mode
+    defaults["url_template"] = str(raw.get("url_template") or "").strip()
+    if defaults["url_template"] and "{page}" not in defaults["url_template"]:
+        LOG.warning(
+            "站点 %r 的 pagination.url_template 缺少 {page} 占位符，已忽略：%r",
+            source.get("name"),
+            defaults["url_template"],
+        )
+        defaults["url_template"] = ""
+        if mode == "template":
+            defaults["mode"] = "none"
+    defaults["last_url_xpath"] = str(raw.get("last_url_xpath") or "").strip()
+    defaults["next_url_xpath"] = str(raw.get("next_url_xpath") or "").strip()
+    defaults["total_pages_regex"] = str(
+        raw.get("total_pages_regex") or defaults["total_pages_regex"]
+    ).strip()
+    defaults["start"] = _pagination_int(raw, "start", 1, 1, 1000)
+    defaults["max_pages"] = _pagination_int(raw, "max_pages", 50, 1, 500)
+    defaults["stop_when_older_than_cutoff"] = _pagination_bool(
+        raw, "stop_when_older_than_cutoff", True
+    )
+    defaults["stop_after_known_pages"] = _pagination_int(
+        raw, "stop_after_known_pages", 2, 0, 100
+    )
+    return defaults
+
+
+def _max_page_number(text: str, pattern: str) -> int | None:
+    """从 HTML/URL 文本中用正则提取最大的页码。"""
+    if not text or not pattern:
+        return None
+    try:
+        matches = re.findall(pattern, text)
+    except re.error as exc:
+        LOG.warning("total_pages_regex 非法：%s（%s）", pattern, exc)
+        return None
+    numbers: list[int] = []
+    for match in matches:
+        value = match[0] if isinstance(match, tuple) and match else match
+        if isinstance(value, str) and value.isdigit():
+            numbers.append(int(value))
+    return max(numbers) if numbers else None
+
+
+def _max_page_from_html(html: str, source: dict, settings: dict[str, Any]) -> int | None:
+    pattern = str(settings["total_pages_regex"])
+    doc = lxml.html.fromstring(html)
+    last_xpath = str(settings["last_url_xpath"] or "")
+    if last_xpath:
+        try:
+            values = doc.xpath(last_xpath)
+        except Exception as exc:
+            LOG.warning("站点 %r 的 last_url_xpath 无效：%s", source.get("name"), exc)
+            values = []
+        for value in values:
+            candidates: list[str] = []
+            if isinstance(value, str):
+                candidates.append(value)
+            else:
+                for attr in ("href", "onclick", "data-page", "value"):
+                    attr_value = value.get(attr)
+                    if attr_value:
+                        candidates.append(str(attr_value))
+                candidates.append(value.text_content() or "")
+            for candidate in candidates:
+                number = _max_page_number(candidate, pattern)
+                if number is not None:
+                    return number
+    return _max_page_number(html, pattern)
+
+
+def _template_page_urls(
+    html: str, page_url: str, source: dict, settings: dict[str, Any]
+) -> list[str]:
+    template = str(settings["url_template"] or "")
+    if not template:
+        return []
+    max_pages = int(settings["max_pages"])
+    detected = _max_page_from_html(html, source, settings)
+    if detected is not None:
+        max_pages = min(max_pages, detected)
+    start = int(settings["start"])
+    urls: list[str] = []
+    for page in range(start, max_pages + 1):
+        try:
+            url = template.format(page=page)
+        except (KeyError, IndexError, ValueError) as exc:
+            LOG.warning(
+                "站点 %r 的 url_template 无法格式化（%s）：%r",
+                source.get("name"),
+                exc,
+                template,
+            )
+            return []
+        if url != page_url:
+            urls.append(url)
+    return urls
+
+
+def _find_next_page_url(html: str, page_url: str, source: dict, settings: dict[str, Any]) -> str:
+    doc = lxml.html.fromstring(html)
+    next_xpath = str(settings["next_url_xpath"] or "")
+    if next_xpath:
+        try:
+            values = doc.xpath(next_xpath)
+        except Exception as exc:
+            LOG.warning("站点 %r 的 next_url_xpath 无效：%s", source.get("name"), exc)
+            values = []
+        for value in values:
+            if isinstance(value, str):
+                text = value.strip()
+                if text and not text.startswith("javascript:") and any(
+                    token in text for token in ("/", "?", ".html")
+                ):
+                    return urljoin(page_url, text)
+                continue
+            href = value.get("href")
+            if href and not str(href).startswith("javascript:"):
+                return urljoin(page_url, str(href).strip())
+            onclick = str(value.get("onclick") or "")
+            match = re.search(
+                r"(?:window\.)?location(?:\.href)?\s*=\s*"
+                r"(?:encodeURI\()?['\"]([^'\"]+)['\"]",
+                onclick,
+            )
+            if match:
+                return urljoin(page_url, match.group(1).strip())
+            text = clean_text(value.text_content())
+            if text and not text.startswith("javascript:") and any(
+                token in text for token in ("/", "?", ".html")
+            ):
+                return urljoin(page_url, text)
+
+    for anchor in doc.xpath("//a"):
+        rel = str(anchor.get("rel") or "").lower()
+        text = clean_text(anchor.text_content())
+        lower_text = text.lower()
+        if "next" not in rel and not any(
+            token in lower_text for token in ("下一页", "下页", "后一页", "next")
+        ):
+            continue
+        href = anchor.get("href")
+        if href and not href.startswith("javascript:"):
+            return urljoin(page_url, href.strip())
+        onclick = str(anchor.get("onclick") or "")
+        match = re.search(
+            r"(?:window\.)?location(?:\.href)?\s*=\s*"
+            r"(?:encodeURI\()?['\"]([^'\"]+)['\"]",
+            onclick,
+        )
+        if match:
+            return urljoin(page_url, match.group(1).strip())
+    return ""
+
+
+def collect_list_entries_detailed(
+    source: dict,
+    *,
+    cutoff: dt.datetime | None = None,
+    known_urls: set[str] | None = None,
+) -> dict[str, Any]:
+    """抓取列表页并返回条目、页数与停止原因。
+
+    pagination.mode:
+    - none: 只抓 list_urls/list_url（旧行为）；
+    - template: 抓 list_url 后按 url_template 生成后续页；
+    - next: 按 next_url_xpath 或“下一页”链接跟随；
+    - auto: 有 url_template 时按模板，否则按下一页链接。
+    """
+    settings = _pagination_settings(source)
+    fixed_urls = [str(url) for url in (source.get("list_urls") or [source["list_url"]])]
+    fixed_mode = settings["mode"] == "none" or bool(source.get("list_urls"))
+    pending = list(fixed_urls)
     all_items: list[dict] = []
-    for list_url in urls:
-        render = bool(source.get("render"))
-        html = fetch_list_html(list_url, render)
-        if html:
-            items = parse_list_items(html, source, list_url)
-            if not items and not render:
-                LOG.info("列表解析为空，尝试 Chrome 渲染 %s", list_url)
-                rendered = fetch_html_with_browser(list_url)
-                if rendered:
-                    items = parse_list_items(rendered, source, list_url)
-            all_items.extend(items)
-        time.sleep(float(source.get("delay", 0)))
-    return all_items
+    seen_urls: set[str] = set()
+    visited_pages: set[str] = set()
+    page_urls: list[str] = []
+    pages = 0
+    known_streak = 0
+    fixed_failed = False
+    fixed_empty = False
+    stop_reason = "done"
+    render = bool(source.get("render"))
+    delay = float(source.get("delay", 0))
+
+    while pending:
+        page_url = pending.pop(0)
+        if page_url in visited_pages:
+            continue
+        if not fixed_mode and pages >= int(settings["max_pages"]):
+            stop_reason = "max_pages"
+            break
+        visited_pages.add(page_url)
+        html = fetch_list_html(page_url, render)
+        if not html:
+            if fixed_mode:
+                fixed_failed = True
+                LOG.warning("固定列表页抓取失败，继续下一页：%s", page_url)
+                continue
+            stop_reason = "fetch_failed"
+            break
+        items = parse_list_items(html, source, page_url)
+        if not items and not render:
+            LOG.info("列表解析为空，尝试 Chrome 渲染 %s", page_url)
+            rendered = fetch_html_with_browser(page_url)
+            if rendered:
+                items = parse_list_items(rendered, source, page_url)
+        pages += 1
+        page_urls.append(page_url)
+        if not items:
+            if fixed_mode:
+                fixed_empty = True
+                LOG.warning("固定列表页没有解析到条目，继续下一页：%s", page_url)
+                continue
+            stop_reason = "empty"
+            break
+        for item in items:
+            url = item["url"]
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            all_items.append(item)
+
+        parsed_dates = [item["parsed"] for item in items if item.get("parsed")]
+        if (
+            not fixed_mode
+            and cutoff is not None
+            and settings["stop_when_older_than_cutoff"]
+            and parsed_dates
+            and max(parsed_dates) < cutoff
+        ):
+            stop_reason = "cutoff"
+            break
+
+        if (
+            not fixed_mode
+            and known_urls is not None
+            and int(settings["stop_after_known_pages"]) > 0
+        ):
+            page_known = all(item["url"] in known_urls for item in items)
+            known_streak = known_streak + 1 if page_known else 0
+            if known_streak >= int(settings["stop_after_known_pages"]):
+                stop_reason = "known_pages"
+                break
+
+        if not fixed_mode and settings["mode"] in {"template", "auto"} and settings["url_template"]:
+            if pages == 1:
+                pending.extend(_template_page_urls(html, page_url, source, settings))
+        elif not fixed_mode and settings["mode"] in {"next", "auto"}:
+            next_url = _find_next_page_url(html, page_url, source, settings)
+            if next_url and next_url not in visited_pages:
+                pending.append(next_url)
+            else:
+                stop_reason = "no_next"
+        time.sleep(delay)
+
+    if fixed_mode and not all_items:
+        if fixed_failed:
+            stop_reason = "fetch_failed"
+        elif fixed_empty:
+            stop_reason = "empty"
+    return {
+        "items": all_items,
+        "pages": pages,
+        "page_urls": page_urls,
+        "stop_reason": stop_reason,
+    }
+
+
+def collect_list_entries(
+    source: dict,
+    *,
+    cutoff: dt.datetime | None = None,
+    known_urls: set[str] | None = None,
+) -> list[dict]:
+    """兼容旧调用：只返回条目列表。"""
+    return collect_list_entries_detailed(
+        source, cutoff=cutoff, known_urls=known_urls
+    )["items"]
 
 
 def fetch_article_html(url: str) -> tuple[str, bool] | None:
@@ -1182,10 +1519,32 @@ def run_source(
     try:
         conn = sqlite3.connect(db_path, timeout=DB_BUSY_TIMEOUT_MS / 1000)
         conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
-        entries = collect_list_entries(source)
+        known_urls: set[str] | None = None
+        pagination = _pagination_settings(source)
+        if not force and pagination["mode"] != "none" and not source.get("list_urls"):
+            known_urls = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT url FROM articles WHERE source = ?", (source_name,)
+                )
+            }
+        collected = collect_list_entries_detailed(
+            source, cutoff=cutoff, known_urls=known_urls
+        )
+        entries = collected["items"]
+        LOG.info(
+            "[%s] 列表抓取 %d 页（停止原因：%s），解析 %d 条",
+            source_name,
+            collected["pages"],
+            collected["stop_reason"],
+            len(entries),
+        )
         if not entries:
             counts["list_empty"] = 1
-            LOG.warning("[%s] 列表页没有解析到任何条目。", source_name)
+            if collected["stop_reason"] == "cutoff":
+                LOG.info("[%s] 抓取窗口内没有新条目。", source_name)
+            else:
+                LOG.warning("[%s] 列表页没有解析到任何条目。", source_name)
         else:
             now = dt.datetime.now(get_timezone(source.get("timezone")))
             entries.sort(key=lambda item: item.get("parsed") or now, reverse=True)
@@ -1329,7 +1688,8 @@ def cmd_test(args: argparse.Namespace) -> None:
             source = {**config, **raw_source}
             print(f"\n===== {source['name']} =====")
             try:
-                entries = collect_list_entries(source)
+                collected = collect_list_entries_detailed(source)
+                entries = collected["items"]
                 for entry in entries[: args.limit]:
                     parsed = entry.get("parsed")
                     date_show = (
@@ -1340,7 +1700,10 @@ def cmd_test(args: argparse.Namespace) -> None:
                     title = entry["title"]
                     url = entry["url"]
                     print(f"{date_show:<20} {title[:50]:<52} {url}")
-                print(f"共解析到 {len(entries)} 条")
+                print(
+                    f"共解析到 {len(entries)} 条（{collected['pages']} 页，"
+                    f"停止原因：{collected['stop_reason']}）"
+                )
             except Exception as exc:
                 LOG.exception("测试站点失败：%s", exc)
     finally:
