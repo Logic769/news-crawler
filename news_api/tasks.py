@@ -42,6 +42,26 @@ def _configured_source_names(settings: Settings) -> set[str]:
     }
 
 
+def _title_xpath_for(settings: Settings, source_name: str) -> str:
+    """站点配置里的 article_title_xpath；on_demand 或配置缺失时为空。
+
+    extract 作业和 crawler 走同一条抽取路径，否则对已修好标题的文章重抓一次
+    会把标题打回站点名（save_article 非空即覆盖）。
+    """
+    if not source_name:
+        return ""
+    try:
+        config = news_crawler.load_config(
+            news_crawler.resolve_config_path(settings.config_path)
+        )
+    except Exception:
+        return ""
+    for item in config.get("sources") or []:
+        if str(item.get("name") or "").strip() == source_name:
+            return str(item.get("article_title_xpath") or "").strip()
+    return ""
+
+
 def _init_db(settings: Settings) -> None:
     Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = news_crawler.init_db(settings.db_path)
@@ -156,6 +176,7 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             GeneralNewsExtractor(),
             allow_browser=settings.extract_allow_browser,
             url_validator=validator,
+            title_xpath=_title_xpath_for(settings, source),
         )
         if result is None:
             # 只标记错误：save_article 是部分更新，已有正文不会被清空。

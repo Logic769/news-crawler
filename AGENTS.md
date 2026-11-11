@@ -263,6 +263,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | `url_xpath` | 否 | 默认第一个 `a` 的 `href` |
 | `date_xpath` | 否 | 默认从整条节点文本中自动识别日期 |
 | `date_format` | 否 | 指定 `strptime` 格式 |
+| `article_title_xpath` | 否 | 详情页标题 XPath（`<title>` 是站点名、真标题在正文 h1 时使用）；推荐以 `/text()` 结尾，写元素节点也能兜底取其文本，不能用 `string(...)`（只返回首字符） |
 | `timezone` | 否 | 默认 `Asia/Shanghai` |
 | `render` | 否 | 列表页是否强制 Chrome 渲染 |
 | `delay` | 否 | 请求间隔秒数，默认 0.5；列表页与文章详情页请求前都会等待 |
@@ -613,7 +614,7 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 - `fetch_html_with_browser(url) -> str | None`：失败返回 `None`；
 - `content_needs_render(content: str) -> bool`：True 表示需要浏览器渲染（空、短于 100 字、或含加载占位词）；
 - `content_is_too_short(content: str) -> bool`：True 表示正文短于 `MIN_CONTENT_LENGTH`（100 字）；
-- `extract_article(url, extractor, *, allow_browser: bool = True, url_validator=None) -> dict | None`：单 URL 完整流程；`allow_browser=False` 时禁用浏览器渲染回退（API 的 extract 默认如此）；
+- `extract_article(url, extractor, *, allow_browser: bool = True, url_validator=None, title_xpath: str = "") -> dict | None`：单 URL 完整流程；`allow_browser=False` 时禁用浏览器渲染回退（API 的 extract 默认如此）；`title_xpath` 透传给 GNE 标题抽取（crawler 与 API extract 作业共用）；
 - `GeneralNewsExtractor.extract(html, **kwargs) -> dict`：正文抽取入口；实例无跨调用可变状态，可跨线程复用（每次 extract 内部新建 ContentExtractor）；
 - `create_app(settings=None) -> FastAPI`：API 应用工厂，测试可注入独立设置；
 - `article_id_for(source, url) -> str`：稳定文章 ID，改动会破坏下游引用；

@@ -20,11 +20,21 @@ class TitleExtractor:
     """Extract a news title with the legacy fallback chain."""
 
     def extract_by_xpath(self, element: HtmlElement, title_xpath: str) -> str:
-        if title_xpath:
+        if not title_xpath:
+            return ""
+        try:
             title_list = element.xpath(title_xpath)
-            if title_list:
-                return title_list[0]
-        return ""
+        except Exception:  # 非法 XPath 不该让整篇文章变成 error
+            return ""
+        if not title_list:
+            return ""
+        value = title_list[0]
+        if isinstance(value, str):
+            return value.strip()
+        # 元素节点兜底：配置写成 //h1 而不是 //h1/text() 时取它的全部文本。
+        # 直接返回元素会让上层 .replace() 撞上 lxml 的 _Element.replace() 抛 AttributeError。
+        text = value.text_content() if hasattr(value, "text_content") else ""
+        return (text or "").strip()
 
     def extract_by_title(self, element: HtmlElement) -> str:
         title_list = element.xpath("//title/text()")
