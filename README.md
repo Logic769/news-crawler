@@ -258,13 +258,23 @@ curl "http://localhost:8000/v1/articles?status=all&page_size=50"
 | `published_at` | 带时区的 ISO 8601 发布时间，例如 `2026-10-30T10:00:00+08:00` |
 | `published_at_utc` | 同一时间的 UTC 表示，以 `Z` 结尾 |
 | `published_raw` | 数据库里的原始发布时间字符串 |
-| `timezone` | 该文章写入时使用的站点时区（落库保存，站点配置变化不影响历史数据；`unknown_date` 等没有发布时间的结果不会写入该列） |
+| `publish_time_source` | 发布时间来源：`xpath`（详情页配置的 XPath）、`labeled_text`（“发布时间：…”标签）、`meta`（meta/JSON-LD/time 标签）、`text`（正文扫描）、`video_meta`（视频页 meta）、`detail`（其他详情页来源）、`list`（回退列表页日期）；历史行或无法判定时可能为空字符串 |
+| `publish_time_raw` | 详情页抽取到的发布时间文本（XPath 场景可能是匹配出的日期子串；文本扫描可能只有“09月30日”这类无年份日期），便于核对日期为什么被回退 |
+| `list_publish_time` | 列表页解析出的日期；详情日期缺失或与列表相差过大时用于交叉校验 |
+| `title_source` | 标题来源：`article_title_xpath`（配置的标题 XPath **实际命中**）或 `gne_default`（未命中时回退 GNE 自动识别） |
+| `timezone` | 该文章写入时使用的站点时区（落库保存，站点配置变化不影响历史数据；`unknown_date` 等没有发布时间的结果不会写入该列，API extract 路径同样如此） |
 | `content` / `content_length` | 正文与字数（已归一化为单行；列表默认不返回，详情始终返回） |
 | `raw_content` | GNE 原始正文，保留段落换行；只在 `GET /v1/articles/{id}` 详情返回，列表（含 `include_content=true`）为 `null`；v4 之前入库的历史行为空，需 `--force` 重抓，或用 `backfill_raw_content.py` 回填（先 `--dry-run` 看候选数，再 `--limit 50` 小批试跑；容器内必须显式传 `--db /app/data/news.db`，命令见 AGENTS.md §8） |
 | `images` | 图片 URL 数组 |
 | `status` / `error` | 抓取状态与错误信息 |
 
 > 时间排序与过滤基于数据库内的站点本地时间字符串。若同时接入不同时区的来源，分页排序与 `published_from`/`published_to` 区间可能存在偏差：建议统一各站点的 `timezone`，或在展示层用 `published_at_utc` 做二次校准。升级前写入的老数据没有 `timezone` 列，会回落到当前配置推断。
+>
+> 详情页日期若晚于当前时间超过 1 天，视为不可信：不会再自动减一年，而是回退到列表页日期；列表日期也缺失时记 `unknown_date`。
+>
+> GNE 的文本扫描可能只抽到 `09月30日` 这类无年份日期：主抓取路径会优先用列表日期的年份补齐；列表日期也缺失时，以及 API 单 URL extract 没有列表日期可交叉校验时，这类日期会记 `unknown_date`，不会按当前年猜测。
+>
+> `old` 分支的 `publish_time_source` 固定为 `list`（本次用列表日期说明超出窗口）；`publish_time_raw` 可能保留上次成功抽取的详情原文。`unknown_date` 本次没有可信发布时间，不会写入新的来源：新行为空字符串，已有行保留旧来源与旧时间，避免“旧时间挂新来源”。
 
 详情示例：
 
@@ -365,7 +375,8 @@ cp sources.json sources.local.json
       "url_xpath": ".//a/@href",
       "date_xpath": ".//*[contains(@class,'time')]",
       "date_format": "%Y-%m-%d",
-      "timezone": "Asia/Shanghai"
+      "timezone": "Asia/Shanghai",
+      "date_skew_days": 7
     }
   ]
 }
@@ -385,6 +396,8 @@ cp sources.json sources.local.json
 | `date_format` | 可选 | 日期格式，例如 `%Y-%m-%d`、`%Y-%m-%d %H:%M` |
 | `timezone` | 可选 | 站点时区，默认 `Asia/Shanghai` |
 | `article_title_xpath` | 可选 | 详情页标题 XPath。用于 `<title>` 写的是站点名、真标题在正文 `h1` 的站点。推荐直接写标题元素（如 `//h1[@class='article-title']`），会取其全部文本（含 `<em>` 等子元素）；写成 `//h1/text()` 只能取第一个直接文本节点，标题含子标签时会截断。以 `string(` 开头的表达式会被忽略 |
+| `article_publish_time_xpath` | 可选 | 详情页发布时间 XPath。用于正文里更早出现无关时间、页头日期才是真发布时间的站点；推荐写包含日期的元素（如 `//p[contains(@class,'article__subTitle')]/span[1]`）。以 `string(` 开头或非法表达式会被忽略 |
+| `date_skew_days` | 可选 | 详情日期与列表日期允许相差的天数，默认 7，范围 0–365；超过时改用列表日期，避免正文里的未来时间或站内推荐日期污染发布时间 |
 | `render` | 可选 | 设为 `true` 表示列表页需要用 Chrome 渲染后再解析 |
 | `delay` | 可选 | 每个请求之间的等待秒数，默认 0.3 |
 

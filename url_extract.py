@@ -429,6 +429,7 @@ def extract_video_meta(html_text: str, url: str) -> dict | None:
         "title": title,
         "author": author,
         "publish_time": publish,
+        "publish_time_source": "video_meta" if publish else "",
         "content": content,
         "images": normalize_images([image], url) if image else [],
         "is_video": True,
@@ -878,6 +879,7 @@ def extract_from_html(
     url_validator: Callable[[str], None] | None = None,
     already_rendered: bool = False,
     title_xpath: str = "",
+    publish_time_xpath: str = "",
 ) -> dict | None:
     """Extract one article already-fetched HTML (shared by CLI and crawler).
 
@@ -892,7 +894,11 @@ def extract_from_html(
             return video
 
     try:
-        result = extractor.extract(html, title_xpath=title_xpath)
+        result = extractor.extract(
+            html,
+            title_xpath=title_xpath,
+            publish_time_xpath=publish_time_xpath,
+        )
     except NoContentException:
         result = None
 
@@ -919,7 +925,11 @@ def extract_from_html(
                 return None
             html = rendered
             try:
-                result = extractor.extract(html, title_xpath=title_xpath)
+                result = extractor.extract(
+                    html,
+                    title_xpath=title_xpath,
+                    publish_time_xpath=publish_time_xpath,
+                )
             except NoContentException:
                 result = None
             if result is None:
@@ -943,6 +953,7 @@ def extract_article(
     allow_browser: bool = True,
     url_validator: Callable[[str], None] | None = None,
     title_xpath: str = "",
+    publish_time_xpath: str = "",
 ) -> dict | None:
     """抓取单个 URL 并抽取正文；必要时回退浏览器，失败或正文为空时返回 None。"""
     LOG.info("正在抓取: %s", url)
@@ -981,6 +992,7 @@ def extract_article(
         url_validator=url_validator,
         already_rendered=already_rendered,
         title_xpath=title_xpath,
+        publish_time_xpath=publish_time_xpath,
     )
 
 

@@ -141,6 +141,8 @@ PUBLISH_TIME_META = [
     '//meta[starts-with(@name, "og:time")]/@content',
     '//meta[starts-with(@name, "apub:time")]/@content',
     '//meta[starts-with(@name, "publication_date")]/@content',
+    '//meta[starts-with(@name, "firstpublishedtime")]/@content',
+    '//meta[starts-with(@name, "firstPublishedTime")]/@content',
     '//meta[starts-with(@name, "sailthru.date")]/@content',
     '//meta[starts-with(@name, "PublishDate")]/@content',
     '//meta[starts-with(@name, "publishdate")]/@content',

@@ -97,13 +97,23 @@ class TitleExtractor:
 
     def extract(self, element: HtmlElement, title_xpath: str = "") -> str:
         """Extract the title using the same priority order as before."""
+        return self.extract_with_source(element, title_xpath)[0]
+
+    def extract_with_source(
+        self, element: HtmlElement, title_xpath: str = ""
+    ) -> tuple[str, str]:
+        """Return (title, source) so callers can tell an XPath hit from a fallback."""
         title_xpath = title_xpath or config.get("title", {}).get("xpath")
+        title = self.extract_by_xpath(element, title_xpath)
+        if title:
+            return title.strip(), (
+                "article_title_xpath" if title_xpath else "gne_default"
+            )
         title = (
-            self.extract_by_xpath(element, title_xpath)
-            or self.extract_by_htag_and_title(element)
+            self.extract_by_htag_and_title(element)
             or self.extract_by_og_title(element)
             or self.extract_by_json_ld(element)
             or self.extract_by_title(element)
             or self.extract_by_htag(element)
         )
-        return title.strip()
+        return title.strip(), "gne_default"

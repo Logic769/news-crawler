@@ -264,6 +264,8 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | `date_xpath` | 否 | 默认从整条节点文本中自动识别日期 |
 | `date_format` | 否 | 指定 `strptime` 格式 |
 | `article_title_xpath` | 否 | 详情页标题 XPath（`<title>` 是站点名、真标题在正文 h1 时使用）；推荐直接写标题元素（如 `//h1`），会取其全部文本（含 `<em>` 等子元素）；`/text()` 只取第一个直接文本节点，标题含子标签时会截断；以 `string(` 开头的表达式会被忽略 |
+| `article_publish_time_xpath` | 否 | 详情页发布时间 XPath；推荐直接写日期元素（如 `//p[contains(@class,'article__subTitle')]/span[1]`）；以 `string(` 开头或非法表达式会被忽略 |
+| `date_skew_days` | 否 | 详情日期与列表日期允许相差的天数，默认 7，范围 0–365；超过时改用列表日期 |
 | `timezone` | 否 | 默认 `Asia/Shanghai` |
 | `render` | 否 | 列表页是否强制 Chrome 渲染 |
 | `delay` | 否 | 请求间隔秒数，默认 0.3；列表页与文章详情页请求前都会等待 |
@@ -304,6 +306,10 @@ CREATE TABLE IF NOT EXISTS articles (
     title         TEXT,            -- GNE 抽取标题
     publish_time  TEXT,            -- 统一为 YYYY-MM-DD HH:MM:SS（站点本地墙钟，供展示/排序）
     publish_time_utc TEXT,         -- 真实时刻 UTC 墙钟串，供跨时区时间过滤；缺 timezone 的历史行为 NULL
+    publish_time_source TEXT,      -- 发布时间来源：xpath/labeled_text/meta/text/video_meta/detail/list
+    publish_time_raw TEXT,         -- 详情页抽取到的发布时间文本（XPath 场景可能是日期子串）
+    list_publish_time TEXT,        -- 列表页给出的日期，用于与详情日期交叉校验
+    title_source TEXT,             -- 标题来源：实际命中 article_title_xpath，否则 gne_default
     timezone      TEXT,            -- 写入时的站点时区，历史行可能为空
     author        TEXT,
     content       TEXT,            -- 正文纯文本（clean_text 归一化，段落换行被压成空格）
@@ -332,7 +338,7 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 
 索引：`source`、`status`、`publish_time`、`article_id`（唯一），以及四条查询性能覆盖索引：`(status, publish_time DESC, source, url)`、`(status, updated_at DESC, source, url)` 供列表分页、`(source, publish_time DESC, updated_at DESC, timezone, status)` 供 `/v1/sources` 聚合、`publish_time_utc` 供真实时刻过滤；`crawl_jobs` 的 `status`、`created_at`、`(type, payload, status)` 去重索引。
 
-旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 6`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、`timezone`、v4 的 `raw_content`（只补列，原文已不可得，历史行不回填）、v5 的 `content_length`（补列后按 `length(content)` 回填 NULL 行）与 v6 的 `publish_time_utc`（补列后按每行 `timezone` 换算 UTC 回填，供混时区按真实时刻过滤），按 rowid 键集分页（每批 2000 行）回填 `article_id`，不边读游标边 UPDATE 同表；再补建唯一索引、去重索引与四条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这些，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外）。迁移早退条件校验五列齐全且 `required_indexes`（四条性能索引 + `idx_articles_article_id` + `idx_crawl_jobs_dedupe`）齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
+旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 7`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、`timezone`、v4 的 `raw_content`（只补列，原文已不可得，历史行不回填）、v5 的 `content_length`（补列后按 `length(content)` 回填 NULL 行）、v6 的 `publish_time_utc`（补列后按每行 `timezone` 换算 UTC 回填，供混时区按真实时刻过滤）与 v7 的 `publish_time_source`/`publish_time_raw`/`list_publish_time`/`title_source`（只补列，历史行为 NULL），按 rowid 键集分页（每批 2000 行）回填 `article_id`，不边读游标边 UPDATE 同表；再补建唯一索引、去重索引与四条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这些，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外）。迁移早退条件校验九列齐全且 `required_indexes`（四条性能索引 + `idx_articles_article_id` + `idx_crawl_jobs_dedupe`）齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
 
 ### 7.2 status 语义
 
@@ -352,6 +358,8 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 - 同一 `(source, url)` 使用 upsert，不会产生重复记录；
 - `save_article()` 是**部分更新**：空字符串表示“这次没拿到”，不会覆盖库中已有值，因此抓取失败或重新分类时只更新 `status`/`error`，已成功入库的正文不会被清空；`images` 例外地区分三态：`None` 保留旧值、`[]` 明确清空、非空列表覆盖；抓取流程用 `normalize_images_for_update` 把"抽取不到图"归一为 `None`（保留旧值），只有显式传 `[]` 才清空，避免成功重抓因抽取失败抹掉历史图片；
 - `timezone` 随文章落库，读取时优先使用该列，旧行（NULL）才回落到当前配置推断；`publish_time_utc` 存真实时刻（UTC），`published_from`/`published_to` 按它过滤以消除混时区偏差，`publish_time_utc` 为 NULL/空串的历史行回退旧的 `publish_time` 墙钟比较；列表排序仍按 `publish_time` 墙钟；
+- 详情页日期晚于当前时间超过 1 天时视为不可信（不再自动减一年），回退列表日期；列表日期也缺失时记 `unknown_date`；`date_skew_days` 范围为 0–365；GNE 文本扫描可能只抽到“09月30日”这类无年份日期：主抓取路径优先用列表日期的年份补齐，列表日期也缺失时记 `unknown_date`；API 单 URL extract 无列表日期可交叉校验时同样记 `unknown_date`，不按当前年猜测；
+- `old` 分支的 `publish_time_source` 固定为 `list`，`publish_time_raw` 可能保留上次成功抽取的详情原文；`unknown_date` 本次不写新来源（新行为空，已有行保留旧来源与旧时间），避免旧时间挂新来源；
 - `article_id` 由 `sha256(source + \x1f + url)` 派生，不随数据库重建变化，可安全作为下游引用；
 - SQLite 启用 WAL 与 `busy_timeout=30000`（`DB_BUSY_TIMEOUT_MS`，与连接 timeout 一致，不用 5s 覆盖 30s 连接超时），API 作业默认单 worker 写入；只读查询使用 `file:...?mode=ro` URI（路径会转义），WAL 库仍要求目录可写（需要 -shm/-wal）。
 
@@ -507,6 +515,10 @@ curl http://localhost:8000/v1/health
 | `regression/test_list_page.py` | 3 个用例：列表页解析的条目定位、feature 缺失、少于 4 条时不回退 |
 | `regression/test_video_detection.py` | 5 个用例：路径规则、`og:type`、JSON-LD `VideoObject`、文章内嵌视频不误判 |
 | `regression/test_backfill.py` | 14 个用例：候选 skip/limit（含真实 SQLite）、LIMIT 下推与游标提前停止、游标异常关闭、失败清单列清洗、BOM 跳过清单、`--skip-file` 条目在下次失败清单中保留、`--failed-list` 指向数据库/目录/硬链接/符号链接/未创建的 WAL·SHM 侧车路径时抓取前返回 2、正常清单文件不误杀 |
+| `regression/test_time_extractor.py` | 26 个用例：标签日期优先于正文、XPath 元素/字符串/多值、脚本与页脚排除、兄弟/嵌套行内节点拼接、块级边界、停止词、dateUpdate 兜底、拆分年份重建 |
+| `regression/test_publish_source.py` | 2 个用例：GNE 内部来源映射到落库值、视频页 meta 来源标记 |
+| `regression/test_process_entry_dates.py` | 11 个用例：未来/超 skew 详情日期回退列表、跨 UTC 日期边界、无年份按列表年补齐、无列表日期记 unknown_date、title_source 归一、skew 钳制、unknown_date 不覆盖旧来源 |
+| `regression/test_extract_job_dates.py` | 4 个用例：API extract 作业超 skew 回退库内列表日期、无年份兜底、详情不可解析兜底、无列表日期记 unknown_date |
 
 运行方式：`python -X utf8 -m unittest discover -s regression -t . -p "test_*.py" -v`（约 15 秒，无需网络）。
 
@@ -616,7 +628,12 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 - `fetch_html_with_browser(url) -> str | None`：失败返回 `None`；
 - `content_needs_render(content: str) -> bool`：True 表示需要浏览器渲染（空、短于 100 字、或含加载占位词）；
 - `content_is_too_short(content: str) -> bool`：True 表示正文短于 `MIN_CONTENT_LENGTH`（100 字）；
-- `extract_article(url, extractor, *, allow_browser: bool = True, url_validator=None, title_xpath: str = "") -> dict | None`：单 URL 完整流程；`allow_browser=False` 时禁用浏览器渲染回退（API 的 extract 默认如此）；`title_xpath` 透传给 GNE 标题抽取（crawler 与 API extract 作业共用）；
+- `extract_article(url, extractor, *, allow_browser: bool = True, url_validator=None, title_xpath: str = "", publish_time_xpath: str = "") -> dict | None`：单 URL 完整流程；`allow_browser=False` 时禁用浏览器渲染回退（API 的 extract 默认如此）；`title_xpath`/`publish_time_xpath` 透传给 GNE 抽取（crawler 与 API extract 作业共用）；
+- `TitleExtractor.extract_with_source(element, title_xpath: str = "") -> tuple[str, str]`：返回 `(title, title_source)`，`title_source` 为 `article_title_xpath`（配置的 XPath 实际命中）或 `gne_default`；
+- `TimeExtractor.extract_with_source(element, publish_time_xpath: str = "") -> tuple[str, str]`：返回 `(publish_time, source)`，`source` 为 `xpath`/`labeled_text`/`meta`/`json_ld`/`time_tag`/`text` 等内部来源；
+- `publish_source_for(raw: str) -> str`：把 GNE 内部来源映射为落库值 `xpath`/`labeled_text`/`meta`/`text`/`video_meta`/`detail`/`list`，未知值记 `detail`；
+- `has_explicit_year(value: Any) -> bool`：日期文本是否自带 19xx/20xx 四位年份；用于判断能否安全按当前年或列表日期年份补齐；
+- `align_yearless_datetime(value: dt.datetime, reference: dt.datetime, timezone_name: str = "Asia/Shanghai") -> dt.datetime | None`：用 `reference` 的年份重建无年份日期的月日时分并复算；非法日期（如 2 月 29 日遇上非闰年）返回 `None`；
 - `GeneralNewsExtractor.extract(html, **kwargs) -> dict`：正文抽取入口；实例无跨调用可变状态，可跨线程复用（每次 extract 内部新建 ContentExtractor）；
 - `create_app(settings=None) -> FastAPI`：API 应用工厂，测试可注入独立设置；
 - `article_id_for(source, url) -> str`：稳定文章 ID，改动会破坏下游引用；

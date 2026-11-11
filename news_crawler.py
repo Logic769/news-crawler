@@ -47,7 +47,7 @@ DEFAULT_DB_FILE = "news.db"
 # 锁等待时长与 sqlite3.connect(timeout=...) 保持一致，避免 PRAGMA 把
 # 30s 的连接超时悄悄压成 5s（并发写时更早报 database is locked）。
 DB_BUSY_TIMEOUT_MS = 30000
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS articles (
@@ -60,6 +60,13 @@ CREATE TABLE IF NOT EXISTS articles (
     -- 真实时刻（UTC，YYYY-MM-DD HH:MM:SS）：混时区站点按墙钟比较会错位，
     -- 统一存 UTC 供时间过滤；publish_time 仍是站点本地墙钟，供展示与排序。
     publish_time_utc TEXT,
+    -- 发布时间来源与原始文本：xpath/labeled_text/meta/text/video_meta/detail/list，便于排查站点改版。
+    publish_time_source TEXT,
+    publish_time_raw TEXT,
+    -- 列表页给出的日期，用于与详情日期交叉校验。
+    list_publish_time TEXT,
+    -- 标题来源：article_title_xpath / gne_default。
+    title_source TEXT,
     timezone     TEXT,
     author       TEXT,
     content      TEXT,
@@ -151,10 +158,35 @@ def clean_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
+def has_explicit_year(value: Any) -> bool:
+    """判断日期文本是否带四位年份；无年份日期不能按当前年猜测。"""
+    return bool(re.search(r"(?:19|20)\d{2}", clean_text(value)))
+
+
+# 详情抽取器报告的来源 -> 落库展示用的三档来源。
+# 解析型来源（meta/json_ld/time_tag）统一归为 meta，避免暴露内部实现细节。
+_PUBLISH_SOURCE_MAP = {
+    "xpath": "xpath",
+    "labeled_text": "labeled_text",
+    "meta": "meta",
+    "json_ld": "meta",
+    "time_tag": "meta",
+    "text": "text",
+    "video_meta": "video_meta",
+}
+
+
+def publish_source_for(raw: str) -> str:
+    """Map a GNE publish-time source to the stored publish_time_source value."""
+    return _PUBLISH_SOURCE_MAP.get(raw, "detail" if raw else "")
+
+
 def parse_datetime(
     value: Any,
     date_format: str | None = None,
     timezone_name: str = "Asia/Shanghai",
+    *,
+    allow_year_adjust: bool = True,
 ) -> dt.datetime | None:
     """Parse common Chinese news date strings into an aware datetime."""
     text = clean_text(value)
@@ -163,6 +195,19 @@ def parse_datetime(
 
     tz = get_timezone(timezone_name)
     now = dt.datetime.now(tz)
+
+    def _finalize(parsed: dt.datetime) -> dt.datetime | None:
+        """Reject (or optionally shift) a future date, regardless of parse path."""
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=tz)
+        if parsed > now + dt.timedelta(days=1):
+            if not allow_year_adjust:
+                return None
+            try:
+                return parsed.replace(year=parsed.year - 1)
+            except ValueError:
+                return None
+        return parsed
 
     # ISO8601 带显式时区（Z / +08:00 / +0800）必须先处理：下面的通用日期正则
     # 会先命中日期时间部分并把尾部的时区偏移丢掉，再套用站点时区，导致
@@ -189,7 +234,7 @@ def parse_datetime(
                     sign
                     * dt.timedelta(hours=int(digits[:2]), minutes=int(digits[2:4]))
                 )
-            return dt.datetime(
+            return _finalize(dt.datetime(
                 int(iso_tz.group("y")),
                 int(iso_tz.group("mo")),
                 int(iso_tz.group("d")),
@@ -198,7 +243,7 @@ def parse_datetime(
                 int(iso_tz.group("s") or 0),
                 micro,
                 tzinfo=parsed_tz,
-            )
+            ))
         except ValueError:
             pass
 
@@ -223,7 +268,7 @@ def parse_datetime(
     if date_format:
         try:
             parsed = dt.datetime.strptime(text, date_format)
-            return parsed.replace(tzinfo=tz)
+            return _finalize(parsed.replace(tzinfo=tz))
         except ValueError:
             pass
 
@@ -246,7 +291,7 @@ def parse_datetime(
         except ValueError:
             pass
         else:
-            return parsed
+            return _finalize(parsed)
 
     # Full year: 2026-08-26 / 2026年8月26日 / 2026-08-26 10:30:00
     full = re.search(
@@ -270,12 +315,7 @@ def parse_datetime(
             )
         except ValueError:
             return None
-        if parsed > now + dt.timedelta(days=1):
-            try:
-                parsed = parsed.replace(year=parsed.year - 1)
-            except ValueError:
-                return None
-        return parsed
+        return _finalize(parsed)
 
     # Month/day only: 08-26 / 8月26日 / 08-26 10:30
     short = re.search(
@@ -297,17 +337,28 @@ def parse_datetime(
             )
         except ValueError:
             return None
-        if parsed > now + dt.timedelta(days=1):
-            try:
-                parsed = parsed.replace(year=parsed.year - 1)
-            except ValueError:
-                return None
-        return parsed
+        return _finalize(parsed)
 
     try:
-        return dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return _finalize(dt.datetime.fromisoformat(text.replace("Z", "+00:00")))
     except ValueError:
         return None
+
+
+def align_yearless_datetime(
+    value: dt.datetime,
+    reference: dt.datetime,
+    timezone_name: str = "Asia/Shanghai",
+) -> dt.datetime | None:
+    """用可信基准日期的年份补齐无年份日期，月日与时分来自 *value*。"""
+    tz = get_timezone(timezone_name)
+    local_value = value.astimezone(tz)
+    local_reference = reference.astimezone(tz)
+    candidate = (
+        f"{local_reference.year:04d}-{local_value.month:02d}-{local_value.day:02d} "
+        f"{local_value.hour:02d}:{local_value.minute:02d}:{local_value.second:02d}"
+    )
+    return parse_datetime(candidate, None, timezone_name, allow_year_adjust=False)
 
 
 def format_publish_time(value: dt.datetime, timezone_name: str) -> str:
@@ -358,7 +409,17 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     required_indexes |= {"idx_articles_article_id", "idx_crawl_jobs_dedupe"}
     if (
         version >= SCHEMA_VERSION
-        and {"article_id", "timezone", "raw_content", "content_length", "publish_time_utc"} <= columns
+        and {
+            "article_id",
+            "timezone",
+            "raw_content",
+            "content_length",
+            "publish_time_utc",
+            "publish_time_source",
+            "publish_time_raw",
+            "list_publish_time",
+            "title_source",
+        } <= columns
         and required_indexes <= indexes
     ):
         return
@@ -376,6 +437,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     # v6：publish_time_utc 存真实时刻（UTC），修复混时区按墙钟过滤的错位。
     if "publish_time_utc" not in columns:
         conn.execute("ALTER TABLE articles ADD COLUMN publish_time_utc TEXT")
+    # v7：记录发布时间/标题来源，供站点质量统计与问题排查；老行保持 NULL。
+    for column in ("publish_time_source", "publish_time_raw", "list_publish_time", "title_source"):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE articles ADD COLUMN {column} TEXT")
 
     # 分批回填，避免大库一次性 fetchall 占满内存；仍在同一事务内，保证
     # article_id 全部回填后才会置位 user_version。用 rowid 键集分页而不是
@@ -501,20 +566,24 @@ def resolve_config_path(path: str) -> str:
     return path
 
 
-def _validate_title_xpath(name: object, value: object) -> str:
-    """校验手写的 article_title_xpath，把两类常见错误挡在启动期。
+def _validate_xpath_field(name: object, value: object, field_name: str) -> str:
+    """校验手写的 article_title_xpath / article_publish_time_xpath。
 
     - `string(...)` 开头的表达式一律忽略（统一改用元素节点或 /text()）；
-    - 非法 XPath 会在抽取时抛错。
-    元素节点写法（`//h1`）由 TitleExtractor 取 text_content，可拿到完整标题。
+    - 非法 XPath 或 count()/boolean()/string-length() 等标量表达式会被忽略；
+    - 运行时无效的表达式由各抽取器安全跳过，不会中断整篇抽取。
+    元素节点写法（`//h1`）由标题抽取器取 text_content，可拿到完整标题。
     """
     xpath = str(value or "").strip()
     if not xpath:
         return ""
-    if xpath.startswith("string("):
+    if xpath.startswith("string(") or xpath.startswith(
+        ("count(", "boolean(", "string-length(", "number(")
+    ):
         LOG.warning(
-            "站点 %r 的 article_title_xpath 不能写成 %r（请直接写标题元素，如 //h1），已忽略",
+            "站点 %r 的 %s 不能写成 %r（请直接写目标元素，如 //h1），已忽略",
             name,
+            field_name,
             xpath,
         )
         return ""
@@ -522,8 +591,9 @@ def _validate_title_xpath(name: object, value: object) -> str:
         etree.XPath(xpath)
     except Exception as exc:
         LOG.warning(
-            "站点 %r 的 article_title_xpath 不是合法 XPath（%s），已忽略: %r",
+            "站点 %r 的 %s 不是合法 XPath（%s），已忽略: %r",
             name,
+            field_name,
             exc,
             xpath,
         )
@@ -531,8 +601,13 @@ def _validate_title_xpath(name: object, value: object) -> str:
     return xpath
 
 
+def _validate_title_xpath(name: object, value: object) -> str:
+    """兼容旧调用：只校验 article_title_xpath。"""
+    return _validate_xpath_field(name, value, "article_title_xpath")
+
+
 def load_config(path: str) -> dict:
-    """读取 JSON 配置并补齐默认值，同时校验各站点的 article_title_xpath。"""
+    """读取 JSON 配置并补齐默认值，同时校验各站点的字段 XPath。"""
     if not Path(path).exists():
         raise FileNotFoundError(
             f"找不到配置文件 {path}。请参考 README 创建并填写配置文件。"
@@ -546,11 +621,28 @@ def load_config(path: str) -> dict:
     data.setdefault("days", 3)
     data.setdefault("timezone", "Asia/Shanghai")
     data.setdefault("delay", 0.3)
+    data.setdefault("date_skew_days", 7)
     for source in data.get("sources") or []:
-        if isinstance(source, dict) and "article_title_xpath" in source:
-            source["article_title_xpath"] = _validate_title_xpath(
-                source.get("name"), source.get("article_title_xpath")
+        if not isinstance(source, dict):
+            continue
+        for field_name in ("article_title_xpath", "article_publish_time_xpath"):
+            if field_name in source:
+                source[field_name] = _validate_xpath_field(
+                    source.get("name"), source.get(field_name), field_name
+                )
+        source.setdefault("date_skew_days", data["date_skew_days"])
+        try:
+            raw_skew = source["date_skew_days"]
+            if isinstance(raw_skew, bool):
+                raise ValueError("boolean is not a valid day count")
+            source["date_skew_days"] = max(0, min(365, int(raw_skew)))
+        except (TypeError, ValueError):
+            LOG.warning(
+                "站点 %r 的 date_skew_days 不是整数，回退为 7: %r",
+                source.get("name"),
+                source.get("date_skew_days"),
             )
+            source["date_skew_days"] = 7
     return data
 
 
@@ -720,6 +812,7 @@ def extract_article(
     *,
     already_rendered: bool = False,
     title_xpath: str = "",
+    publish_time_xpath: str = "",
 ) -> dict | None:
     """用已抓取的 HTML 抽取一篇文章（与 url_extract.extract_article 共用实现）。
 
@@ -736,6 +829,7 @@ def extract_article(
         allow_browser=True,
         already_rendered=already_rendered,
         title_xpath=title_xpath,
+        publish_time_xpath=publish_time_xpath,
     )
 
 
@@ -747,6 +841,10 @@ def save_article(
     list_title: str = "",
     title: str = "",
     publish_time: str = "",
+    publish_time_source: str = "",
+    publish_time_raw: str = "",
+    list_publish_time: str = "",
+    title_source: str = "",
     timezone: str = "",
     author: str = "",
     content: str = "",
@@ -778,15 +876,30 @@ def save_article(
         """
         INSERT INTO articles (
             article_id, source, url, list_title, title, publish_time,
-            publish_time_utc, timezone, author, content, content_length,
-            raw_content, images, status, error, first_seen_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            publish_time_utc, publish_time_source, publish_time_raw,
+            list_publish_time, title_source, timezone, author, content,
+            content_length, raw_content, images, status, error,
+            first_seen_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source, url) DO UPDATE SET
             article_id = excluded.article_id,
             list_title = COALESCE(NULLIF(excluded.list_title, ''), articles.list_title),
             title = COALESCE(NULLIF(excluded.title, ''), articles.title),
             publish_time = COALESCE(NULLIF(excluded.publish_time, ''), articles.publish_time),
-            publish_time_utc = COALESCE(NULLIF(excluded.publish_time_utc, ''), articles.publish_time_utc),
+            publish_time_utc = CASE
+                WHEN excluded.publish_time <> '' THEN excluded.publish_time_utc
+                ELSE articles.publish_time_utc
+            END,
+            -- 来源必须与本次写入的时间绑定：本次没拿到时间（unknown_date）
+            -- 时不能改来源，否则旧时间会挂着新来源。
+            publish_time_source = CASE
+                WHEN excluded.publish_time <> ''
+                THEN COALESCE(NULLIF(excluded.publish_time_source, ''), articles.publish_time_source)
+                ELSE articles.publish_time_source
+            END,
+            publish_time_raw = COALESCE(NULLIF(excluded.publish_time_raw, ''), articles.publish_time_raw),
+            list_publish_time = COALESCE(NULLIF(excluded.list_publish_time, ''), articles.list_publish_time),
+            title_source = COALESCE(NULLIF(excluded.title_source, ''), articles.title_source),
             timezone = COALESCE(NULLIF(excluded.timezone, ''), articles.timezone),
             author = COALESCE(NULLIF(excluded.author, ''), articles.author),
             content = COALESCE(NULLIF(excluded.content, ''), articles.content),
@@ -807,6 +920,10 @@ def save_article(
             title,
             publish_time,
             publish_time_utc,
+            publish_time_source,
+            publish_time_raw,
+            list_publish_time,
+            title_source,
             timezone,
             author,
             content,
@@ -876,6 +993,12 @@ def process_entry(
         return "skip"
 
     list_date = entry.get("parsed")
+    list_publish_text = format_publish_time(list_date, tz_name) if list_date else ""
+    try:
+        date_skew_days = max(0, min(365, int(source.get("date_skew_days", 7))))
+    except (TypeError, ValueError):
+        date_skew_days = 7
+
     # --force 表示“忽略已抓记录、强制重抓”，因此窗口外条目也不应被直接标 old 短路，
     # 否则 force 对窗口外的历史条目并不生效。
     if list_date and list_date < cutoff and not force:
@@ -884,7 +1007,10 @@ def process_entry(
             source_name,
             url,
             list_title=entry.get("title", ""),
-            publish_time=format_publish_time(list_date, tz_name),
+            publish_time=list_publish_text,
+            publish_time_source="list",
+            publish_time_raw="",
+            list_publish_time=list_publish_text,
             timezone=tz_name,
             status="old",
         )
@@ -901,6 +1027,7 @@ def process_entry(
             source_name,
             url,
             list_title=entry.get("title", ""),
+            list_publish_time=list_publish_text,
             status="error",
             error="抓取 HTML 失败（直接抓取和浏览器回退均失败）",
         )
@@ -912,6 +1039,7 @@ def process_entry(
         url,
         already_rendered=already_rendered,
         title_xpath=source.get("article_title_xpath") or "",
+        publish_time_xpath=source.get("article_publish_time_xpath") or "",
     )
     if result is None:
         save_article(
@@ -919,6 +1047,7 @@ def process_entry(
             source_name,
             url,
             list_title=entry.get("title", ""),
+            list_publish_time=list_publish_text,
             status="no_content",
             error="无法提取正文",
         )
@@ -928,16 +1057,48 @@ def process_entry(
     # content 继续存归一化文本（搜索/摘要/既有下游语义不变），
     # raw_content 存原始换行版本，供正文展示与导出使用。
     raw_content = str(result.get("content") or "").strip()
-    publish_text = clean_text(result.get("publish_time"))
-    publish_dt = parse_datetime(
-        publish_text,
-        None,
-        tz_name,
-    )
-    if publish_dt is None:
-        publish_dt = list_date
-    if publish_dt is not None:
-        publish_text = format_publish_time(publish_dt, tz_name)
+    publish_raw = clean_text(result.get("publish_time"))
+    # 详情日期不允许“未来年份自动减一年”：那会把 2026 年的正文时间
+    # 改成 2025 年，从而错误命中 old。解析失败时交给列表日期兜底。
+    publish_dt = parse_datetime(publish_raw, None, tz_name, allow_year_adjust=False)
+    raw_publish_source = str(result.get("publish_time_source") or "")
+    publish_source = publish_source_for(raw_publish_source)
+    title_source = str(result.get("title_source") or "gne_default")
+    if title_source not in ("article_title_xpath", "gne_default"):
+        title_source = "gne_default"
+    if list_date is not None:
+        if publish_dt is None:
+            publish_dt = list_date
+            publish_source = "list"
+        elif abs(
+            (
+                publish_dt.astimezone(get_timezone(tz_name)).date()
+                - list_date.astimezone(get_timezone(tz_name)).date()
+            ).days
+        ) > date_skew_days:
+            LOG.warning(
+                "文章 %s 详情日期 %s 与列表日期 %s 相差超过 %d 天，改用列表日期",
+                url,
+                publish_dt.isoformat(),
+                list_date.isoformat(),
+                date_skew_days,
+            )
+            publish_dt = list_date
+            publish_source = "list"
+    # 无年份日期（如 09月30日）只能借列表日期补年份；没有可信基准时
+    # 记 unknown_date，不能把当前年当成真实年份入库。
+    if publish_dt is not None and publish_source != "list" and not has_explicit_year(publish_raw):
+        if list_date is not None:
+            reconciled = align_yearless_datetime(publish_dt, list_date, tz_name)
+            if reconciled is not None:
+                publish_dt = reconciled
+            else:
+                publish_dt = list_date
+                publish_source = "list"
+        else:
+            publish_dt = None
+            publish_source = ""
+    publish_text = format_publish_time(publish_dt, tz_name) if publish_dt else ""
 
     if publish_dt and publish_dt < cutoff:
         save_article(
@@ -947,6 +1108,10 @@ def process_entry(
             list_title=entry.get("title", ""),
             title=clean_text(result.get("title")),
             publish_time=publish_text,
+            publish_time_source=publish_source,
+            publish_time_raw=publish_raw,
+            list_publish_time=list_publish_text,
+            title_source=title_source,
             timezone=tz_name,
             author=clean_text(result.get("author")),
             status="old",
@@ -960,6 +1125,10 @@ def process_entry(
             url,
             list_title=entry.get("title", ""),
             title=clean_text(result.get("title")),
+            publish_time_source="",
+            publish_time_raw=publish_raw,
+            list_publish_time=list_publish_text,
+            title_source=title_source,
             content=clean_text(raw_content),
             raw_content=raw_content,
             images=normalize_images_for_update(result.get("images"), url),
@@ -975,6 +1144,10 @@ def process_entry(
         list_title=entry.get("title", ""),
         title=clean_text(result.get("title")),
         publish_time=publish_text,
+        publish_time_source=publish_source,
+        publish_time_raw=publish_raw,
+        list_publish_time=list_publish_text,
+        title_source=title_source,
         timezone=tz_name,
         author=clean_text(result.get("author")),
         content=clean_text(raw_content),

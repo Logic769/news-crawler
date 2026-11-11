@@ -15,7 +15,7 @@ from lxml.html import fromstring
 
 from gne import GeneralNewsExtractor
 from gne.extractors.title import TitleExtractor
-from news_crawler import _validate_title_xpath
+from news_crawler import _validate_title_xpath, _validate_xpath_field
 
 HTML = "<html><body><h1 class='t'>重要<em>通知</em>发布</h1><h2>副标题</h2></body></html>"
 
@@ -44,11 +44,31 @@ class TitleXPathTest(unittest.TestCase):
     def test_boolean_scalar_returns_empty(self) -> None:
         self.assertEqual(self.extractor.extract_by_xpath(self.element, "boolean(//h1)"), "")
 
+    def test_string_length_scalar_returns_empty(self) -> None:
+        self.assertEqual(
+            self.extractor.extract_by_xpath(self.element, "string-length(//h1)"), ""
+        )
+
+    def test_number_scalar_returns_empty(self) -> None:
+        self.assertEqual(self.extractor.extract_by_xpath(self.element, "number(//h1)"), "")
+
     def test_invalid_xpath_returns_empty(self) -> None:
         self.assertEqual(self.extractor.extract_by_xpath(self.element, "//h1["), "")
 
     def test_empty_xpath_returns_empty(self) -> None:
         self.assertEqual(self.extractor.extract_by_xpath(self.element, ""), "")
+
+    def test_engine_exposes_extraction_sources(self) -> None:
+        html = (
+            "<html><body><h1>重要通知</h1>"
+            "<p class='pub'>发布时间：2026-11-11</p>"
+            "<article><p>" + "正文内容。" * 50 + "</p></article></body></html>"
+        )
+        result = GeneralNewsExtractor().extract(
+            html, title_xpath="//h1", publish_time_xpath="//p[@class='pub']"
+        )
+        self.assertEqual(result["title_source"], "article_title_xpath")
+        self.assertEqual(result["publish_time_source"], "xpath")
 
     def test_gne_extract_with_element_title_xpath(self) -> None:
         html = (
@@ -68,6 +88,21 @@ class TitleXPathConfigTest(unittest.TestCase):
 
     def test_invalid_xpath_is_ignored(self) -> None:
         self.assertEqual(_validate_title_xpath("demo", "//h1["), "")
+
+    def test_publish_time_scalar_xpaths_are_ignored(self) -> None:
+        for xpath in ("count(//p)", "string-length(//p)", "number(//p)", "boolean(//p)"):
+            with self.subTest(xpath=xpath):
+                self.assertEqual(
+                    _validate_xpath_field("demo", xpath, "article_publish_time_xpath"), ""
+                )
+
+    def test_publish_time_element_xpath_is_kept(self) -> None:
+        self.assertEqual(
+            _validate_xpath_field(
+                "demo", "//p[@class='pub']", "article_publish_time_xpath"
+            ),
+            "//p[@class='pub']",
+        )
 
 
 if __name__ == "__main__":

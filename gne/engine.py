@@ -56,12 +56,14 @@ class GeneralNewsExtractor:
         element = html2element(normal_html)
 
         meta_content = self._meta_extractor.extract(element)
-        title = self._title_extractor.extract(
+        title, title_source = self._title_extractor.extract_with_source(
             element, title_xpath=title_xpath
-        ).replace(BR_SENTINEL, "\n").strip()
-        publish_time = self._time_extractor.extract(
+        )
+        title = title.replace(BR_SENTINEL, "\n").strip()
+        publish_time, publish_time_source = self._time_extractor.extract_with_source(
             element, publish_time_xpath=publish_time_xpath
-        ).replace(BR_SENTINEL, "\n").strip()
+        )
+        publish_time = publish_time.replace(BR_SENTINEL, "\n").strip()
         author = self._author_extractor.extract(
             element, author_xpath=author_xpath
         ).replace(BR_SENTINEL, "\n").strip()
@@ -90,6 +92,8 @@ class GeneralNewsExtractor:
             "title": title,
             "author": author,
             "publish_time": publish_time,
+            "title_source": title_source,
+            "publish_time_source": publish_time_source,
             "content": body_text,
             "images": content[0][1]["images"],
             "meta": meta_content,

@@ -35,8 +35,8 @@ class GneHtmlTest(unittest.TestCase):
         # <title> 在不同 lxml 版本下的 br 解析不同，这里直接模拟提取器返回
         # 含哨兵的标题，专门验证 engine 的元数据归一化契约。
         with patch(
-            "gne.engine.TitleExtractor.extract",
-            return_value=f"甲{BR_SENTINEL}乙",
+            "gne.engine.TitleExtractor.extract_with_source",
+            return_value=(f"甲{BR_SENTINEL}乙", "gne_default"),
         ):
             result = GeneralNewsExtractor().extract(html)
         self.assertEqual(result["title"], "甲\n乙")
@@ -51,8 +51,8 @@ class GneHtmlTest(unittest.TestCase):
             + "</p></article></body></html>"
         )
         with patch(
-            "gne.engine.TitleExtractor.extract",
-            return_value=f"{BR_SENTINEL}甲{BR_SENTINEL}",
+            "gne.engine.TitleExtractor.extract_with_source",
+            return_value=(f"{BR_SENTINEL}甲{BR_SENTINEL}", "gne_default"),
         ):
             result = GeneralNewsExtractor().extract(html)
         self.assertEqual(result["title"], "甲")

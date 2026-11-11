@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-from news_crawler import format_publish_time, parse_datetime
+from news_crawler import align_yearless_datetime, format_publish_time, parse_datetime
 
 
 class ParseDatetimeTest(unittest.TestCase):
@@ -36,6 +37,40 @@ class ParseDatetimeTest(unittest.TestCase):
             parsed = parse_datetime(raw, None, "Asia/Shanghai")
             assert parsed is not None
             self.assertEqual(parsed.isoformat(), "2026-10-30T10:00:00+08:00")
+
+    def test_future_detail_date_without_year_adjust_returns_none(self) -> None:
+        future = datetime.now(ZoneInfo("Asia/Shanghai")) + timedelta(days=2)
+        raw = future.strftime("%Y-%m-%d %H:%M:%S")
+        self.assertIsNone(
+            parse_datetime(raw, None, "Asia/Shanghai", allow_year_adjust=False)
+        )
+        # 默认行为仍保留旧逻辑（未来日期视为去年），兼容历史调用方。
+        self.assertIsNotNone(parse_datetime(raw, None, "Asia/Shanghai"))
+
+    def test_future_detail_date_guarded_on_all_parse_paths(self) -> None:
+        future = datetime.now(ZoneInfo("Asia/Shanghai")) + timedelta(days=2)
+        iso = future.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        day_first = f"{future.day} {future.year}.{future.month} 16:00"
+        custom = future.strftime("%Y-%m-%d %H:%M")
+        for raw, fmt in ((iso, None), (day_first, None), (custom, "%Y-%m-%d %H:%M")):
+            with self.subTest(raw=raw):
+                self.assertIsNone(
+                    parse_datetime(
+                        raw, fmt, "Asia/Shanghai", allow_year_adjust=False
+                    )
+                )
+
+    def test_align_yearless_datetime_uses_reference_year(self) -> None:
+        value = datetime(2026, 1, 1, 9, 30)
+        reference = datetime(2025, 1, 1, 0, 0)
+        aligned = align_yearless_datetime(value, reference, "Asia/Shanghai")
+        assert aligned is not None
+        self.assertEqual(aligned.isoformat(), "2025-01-01T09:30:00+08:00")
+
+    def test_align_yearless_datetime_returns_none_for_invalid_leap_day(self) -> None:
+        value = datetime(2024, 2, 29, 9, 30)
+        reference = datetime(2025, 1, 1, 0, 0)
+        self.assertIsNone(align_yearless_datetime(value, reference, "Asia/Shanghai"))
 
     def test_format_publish_time_converts_to_site_timezone(self) -> None:
         parsed = parse_datetime("2026-10-30T02:00:00Z")
