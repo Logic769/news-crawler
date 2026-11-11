@@ -7,6 +7,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 import news_crawler
+import url_extract
 
 
 def _page(*items: tuple[str, str, str]) -> str:
@@ -843,16 +844,97 @@ class PaginationTest(unittest.TestCase):
         validator("https://8.8.8.8/list/index_2.html")
 
     def test_pagination_validator_allows_ip_resolved_from_trusted_host(self) -> None:
-        # 可信主机名被 DNS 解析到内网 IP 时，直接写该 IP 的下一页 URL 也应放行。
+        # 可信主机名解析出的内网 IP 只允许在「该主机的配置端口」上使用；
+        # 换端口即视为非可信目标，不能把解析结果当作独立 URL 白名单。
         source = _source()
-        source["list_url"] = "http://intranet.example/list/"
+        source["list_url"] = "http://intranet.example:8080/list/"
         validator = news_crawler._pagination_url_validator(source)
         fake_infos = [(2, 1, 6, "", ("10.1.2.3", 0))]
         with mock.patch.object(
             news_crawler.socket, "getaddrinfo", return_value=fake_infos
         ) as resolver:
-            validator("http://10.1.2.3/list/index_2.html")
+            validator("http://10.1.2.3:8080/list/index_2.html")
+            with self.assertRaises(ValueError):
+                validator("http://10.1.2.3:9090/list/index_2.html")
         resolver.assert_called()
+
+    def test_connection_layer_ip_literal_keeps_scheme_and_port(self) -> None:
+        # 连接层用「带真实 scheme/port 的 IP 字面量 URL」再校验一次；
+        # 固定成 https:443 会让 http 或非 443 端口的内网列表站点被误拒。
+        source = _source()
+        source["list_url"] = "http://intranet.example:8080/list/"
+        validator = news_crawler._pagination_url_validator(source)
+        fake_infos = [(2, 1, 6, "", ("10.1.2.3", 0))]
+        with mock.patch.object(news_crawler.socket, "getaddrinfo", return_value=fake_infos):
+            pinned = url_extract._ip_literal_url("10.1.2.3", port=8080, scheme="http")
+            self.assertEqual(pinned, "http://10.1.2.3:8080/")
+            validator(pinned)
+            with self.assertRaises(ValueError):
+                validator(url_extract._ip_literal_url("10.1.2.3", port=443, scheme="https"))
+
+    def test_pinned_http_connection_validates_real_scheme_and_port(self) -> None:
+        # B1 的真正回归点是 connect() 把 scheme="http" 与真实端口传给校验器；
+        # 只测 _ip_literal_url 字符串无法发现 connect() 又改回默认 https:443。
+        source = _source()
+        source["list_url"] = "http://intranet.example:8080/list/"
+        validator = news_crawler._pagination_url_validator(source)
+        fake_infos = [(2, 1, 6, "", ("10.1.2.3", 0))]
+        seen: list[str] = []
+
+        class _FakeSocket:
+            def settimeout(self, timeout: float | None) -> None:
+                pass
+
+            def connect(self, sockaddr: object) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        def capture(target: str) -> None:
+            seen.append(target)
+            validator(target)
+
+        with (
+            mock.patch.object(url_extract.socket, "getaddrinfo", return_value=fake_infos),
+            mock.patch.object(url_extract.socket, "socket", return_value=_FakeSocket()),
+        ):
+            conn = url_extract._PinnedHTTPConnection(
+                "intranet.example", port=8080, url_validator=capture
+            )
+            conn.connect()
+        self.assertEqual(seen, ["http://10.1.2.3:8080/"])
+
+    def test_trusted_endpoint_resolution_retries_after_dns_failure(self) -> None:
+        # 首次 DNS 失败不能永久关闭可信端点，否则一次抖动就让整站连接层校验失败。
+        source = _source()
+        source["list_url"] = "http://intranet.example:8080/list/"
+        validator = news_crawler._pagination_url_validator(source)
+        fake_infos = [(2, 1, 6, "", ("10.1.2.3", 0))]
+        with (
+            mock.patch.object(
+                news_crawler.socket,
+                "getaddrinfo",
+                side_effect=[OSError("dns down"), fake_infos],
+            ),
+            # 用 -1 让冷却立即过期，避免两次调用落在同一 monotonic tick 时误判为仍在冷却。
+            mock.patch.object(news_crawler, "_TRUSTED_ENDPOINT_RETRY_SECONDS", -1.0),
+        ):
+            with self.assertRaisesRegex(ValueError, "80/443"):
+                validator("http://10.1.2.3:8080/list/index_2.html")
+            validator("http://10.1.2.3:8080/list/index_2.html")
+
+    def test_pagination_validator_rejects_nonstandard_port_on_public_host(self) -> None:
+        validator = news_crawler._pagination_url_validator(_source())
+        with self.assertRaises(ValueError):
+            validator("https://8.8.8.8:8443/list/index_2.html")
+
+    def test_pagination_validator_rejects_other_port_on_trusted_host(self) -> None:
+        source = _source()
+        source["list_url"] = "http://intranet.example:8080/list/"
+        validator = news_crawler._pagination_url_validator(source)
+        with self.assertRaises(ValueError):
+            validator("http://intranet.example:9000/list/index_2.html")
 
     def test_collect_passes_validator_to_list_fetch(self) -> None:
         source = _source(mode="next", stop_after_known_pages=0)

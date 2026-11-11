@@ -872,38 +872,78 @@ def fetch_list_html(
         return fetch_html_with_browser(url, url_validator=url_validator)
 
 
+def _url_origin(value: str) -> tuple[str, str, int] | None:
+    """Return the (scheme, host, port) origin of a configured list URL."""
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower().strip("[]")
+    if scheme not in ("http", "https") or not host:
+        return None
+    try:
+        port = parts.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        return None
+    return scheme, host, port
+
+
+_TRUSTED_ENDPOINT_RETRY_SECONDS = 60.0
+
+
 def _pagination_url_validator(source: dict) -> Callable[[str], None]:
     """Build an SSRF guard for a site's list pages and browser subrequests.
 
-    配置里的 list_url/list_urls 主机是可信的（允许内网），分页模板或下一页
-    指向的其他主机必须是公网地址；连接层解析出的内网 IP 只有命中可信主机的
-    解析结果时才放行，避免列表页把爬虫引向内网或云元数据地址。
+    配置里的 list_url/list_urls 是唯一可信目标，且必须 scheme + host + port
+    完全一致才允许内网地址。其他目标必须是公网地址，并且只允许 http 80 /
+    https 443。这样攻击者即使改下一页链接，也不能借爬虫访问配置主机的其他
+    端口；同端口无法按路径区分，配置主机本身视为可信。连接层解析出的可信
+    主机 IP 只在与该主机的配置端口组合时放行，不构成独立的 URL 白名单。
     """
     configured: list[Any] = list(source.get("list_urls") or [])
     if source.get("list_url"):
         configured.append(source["list_url"])
-    trusted_hosts: set[str] = set()
+    trusted_origins: set[tuple[str, str, int]] = set()
+    trusted_ports: dict[str, set[int]] = {}
     for raw in configured:
-        try:
-            host = urlsplit(str(raw)).hostname
-        except ValueError:
+        origin = _url_origin(str(raw))
+        if origin is None:
             continue
-        if host:
-            trusted_hosts.add(host.lower().strip("[]"))
+        _scheme, host, port = origin
+        trusted_origins.add(origin)
+        trusted_ports.setdefault(host, set()).add(port)
 
-    trusted_ips: set[str] = set()
+    trusted_endpoints: set[tuple[str, int]] = set()
     resolved = False
+    warned_hosts: set[str] = set()
+    retry_after: dict[str, float] = {}
 
-    def _resolve_trusted_ips() -> set[str]:
+    def _resolve_trusted_endpoints() -> set[tuple[str, int]]:
         nonlocal resolved
         if resolved:
-            return trusted_ips
-        resolved = True
-        for host in trusted_hosts:
+            return trusted_endpoints
+        failed = False
+        now = time.monotonic()
+        for host, ports in trusted_ports.items():
+            if retry_after.get(host, 0.0) > now:
+                # 解析失败的 host 在冷却期内跳过，避免每个连接都重试并刷日志。
+                failed = True
+                continue
             try:
                 infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-            except OSError:
+            except OSError as exc:
+                # 解析失败不写入缓存，冷却期后重试；否则一次 DNS 抖动会让
+                # 本次抓取内所有连接层校验都拿不到可信端点。
+                if host not in warned_hosts:
+                    LOG.warning("无法解析可信站点主机 %r 的地址: %s", host, exc)
+                    warned_hosts.add(host)
+                else:
+                    LOG.debug("仍未解析可信站点主机 %r: %s", host, exc)
+                failed = True
+                retry_after[host] = now + _TRUSTED_ENDPOINT_RETRY_SECONDS
                 continue
+            retry_after.pop(host, None)
             for info in infos:
                 address = str(info[4][0]).split("%", 1)[0]
                 try:
@@ -912,8 +952,11 @@ def _pagination_url_validator(source: dict) -> Callable[[str], None]:
                     continue
                 if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
                     ip = ip.ipv4_mapped
-                trusted_ips.add(str(ip))
-        return trusted_ips
+                for port in ports:
+                    trusted_endpoints.add((str(ip), port))
+        if not failed:
+            resolved = True
+        return trusted_endpoints
 
     def _validator(target: str) -> None:
         # allow_private=True 只做格式/凭据/控制字符校验；地址策略在下面自行判断。
@@ -922,23 +965,34 @@ def _pagination_url_validator(source: dict) -> Callable[[str], None]:
             parts = urlsplit(target)
         except ValueError as exc:
             raise UnsafeUrlError(f"URL 格式不合法: {exc}") from exc
+        scheme = parts.scheme.lower()
         host = (parts.hostname or "").lower().strip("[]")
         if not host:
             raise UnsafeUrlError("URL 缺少主机名")
-        if host in trusted_hosts:
+        try:
+            port = parts.port or (443 if scheme == "https" else 80)
+        except ValueError as exc:
+            raise UnsafeUrlError(f"URL 端口不合法: {exc}") from exc
+        if (scheme, host, port) in trusted_origins:
             return
         try:
             address = ipaddress.ip_address(host)
         except ValueError:
-            ensure_url_allowed(target, allow_private=False)
-            return
-        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-            address = address.ipv4_mapped
-        if address.is_global:
-            return
-        if str(address) in _resolve_trusted_ips():
-            return
-        raise UnsafeUrlError(f"拒绝访问非配置主机的内网地址: {target}")
+            address = None
+        if address is not None:
+            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+                address = address.ipv4_mapped
+            # 连接层会把可信主机解析出的 IP 以字面量 URL 再校验一次；
+            # 只有与该主机配置端口组合时放行，不构成独立的 URL 白名单。
+            if (str(address), port) in _resolve_trusted_endpoints():
+                return
+        if port not in (80, 443):
+            raise UnsafeUrlError(f"非配置主机只允许 80/443 端口: {target}")
+        if address is not None:
+            if address.is_global:
+                return
+            raise UnsafeUrlError(f"拒绝访问非配置主机的内网地址: {target}")
+        ensure_url_allowed(target, allow_private=False)
 
     return _validator
 

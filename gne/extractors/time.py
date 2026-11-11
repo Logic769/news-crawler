@@ -20,7 +20,7 @@ _BLOCK_TAGS = frozenset(
         "address", "article", "aside", "blockquote", "body", "div", "dl",
         "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2",
         "h3", "h4", "h5", "h6", "header", "html", "li", "main", "nav",
-        "ol", "p", "section", "table", "td", "th", "tr", "ul",
+        "ol", "p", "section", "table", "tr", "ul",
     }
 )
 # script/style 里的日期是脚本变量，不是页面展示的发布时间；扫描文本时必须排除。
@@ -104,9 +104,12 @@ class TimeExtractor:
         return "", ""
 
     def _extract_date_value(self, text: str) -> str:
-        """Return the first valid date substring from text, or an empty string."""
+        """Return the earliest valid date substring from text, or an empty string."""
         # XPath/meta 可能给出带时区的 ISO 时间（2026-11-10T23:30:00Z）。
         # 先完整保留，交给 parse_datetime 按真实偏移解析；若只截日期会丢失时刻和时区。
+        # 候选按在原文中的出现位置排序：同一段文本可能同时含「发布时间」和
+        # 「更新时间」，不能因为 ISO 分支先跑就选中更靠后的更新时间。
+        candidates: list[tuple[int, str]] = []
         for iso in _ISO_DATETIME_RE.finditer(text):
             candidate = iso.group(1)
             normalized = candidate
@@ -117,7 +120,7 @@ class TimeExtractor:
                 dt.datetime.fromisoformat(normalized)
             except ValueError:
                 continue
-            return candidate
+            candidates.append((iso.start(), candidate))
         for pattern in self.time_pattern:
             match = pattern.search(text)
             if match:
@@ -125,8 +128,15 @@ class TimeExtractor:
                 if self._is_valid_date(result):
                     # 相邻文本节点可能把“18-03-08”和“23:16”直接拼在一起，
                     # 统一走同一套空白修复，避免把粘连值写进基线或数据库。
-                    return self._normalize_time_text(result)
-        return ""
+                    candidates.append((match.start(), self._normalize_time_text(result)))
+        if not candidates:
+            return ""
+        earliest = min(position for position, _ in candidates)
+        # 同一位置既有 ISO 又有普通日期模式时，ISO 带时分/时区，信息更完整。
+        return max(
+            (value for position, value in candidates if position == earliest),
+            key=len,
+        )
 
     def _date_key(self, value: str) -> tuple[int | None, int, int] | None:
         match = re.search(
@@ -312,19 +322,21 @@ class TimeExtractor:
             yield str(item)
         # 标签和日期可能分处相邻的行内元素：
         # <div><span>发布时间：</span><span>2026-11-11</span></div>。
-        # parent.xpath(".//text()") 只能看到标签自身，必须继续读后续兄弟节点，
-        # 直到下一个块级元素；否则会退到全文扫描并命中正文里的旧日期。
-        sibling = parent.getnext()
-        while sibling is not None:
-            if self._is_block(sibling):
-                break
-            if not self._is_skipped_element(sibling):
-                # 必须复用 _text_nodes：脚本/样式里的日期是变量，不是页面可见文本。
-                for text in self._text_nodes(sibling):
-                    yield str(text)
-            if sibling.tail:
-                yield str(sibling.tail)
-            sibling = sibling.getnext()
+        # 只有标签所在元素本身是行内元素时才继续读它的后续兄弟；如果标签
+        # 直接位于段落/div 等块级容器里，后面的兄弟已经属于另一个块，
+        # 不能再当作本标签的日期（否则「发布时间：」会吞掉下一段正文的日期）。
+        if not self._is_block(parent):
+            sibling = parent.getnext()
+            while sibling is not None:
+                if self._is_block(sibling):
+                    break
+                if not self._is_skipped_element(sibling):
+                    # 必须复用 _text_nodes：脚本/样式里的日期是变量，不是页面可见文本。
+                    for text in self._text_nodes(sibling):
+                        yield str(text)
+                if sibling.tail:
+                    yield str(sibling.tail)
+                sibling = sibling.getnext()
         # 标签所在元素可能只是行内 span，日期位于 span.tail，而不是任何
         # 子元素的 .text 中；向上逐级取 tail，遇到块级祖先即停。
         current = parent

@@ -43,9 +43,11 @@ def _host_is_public(host: str) -> bool:
 def ensure_url_allowed(url: str, *, allow_private: bool = False) -> None:
     """Validate an extract URL; reject loopback/private/link-local/reserved hosts.
 
-    这里只做「请求前」的快速拒绝。真正的 DNS rebinding 防护在
+    这里只做「请求前」的快速拒绝。HTTP 路径的真正 DNS rebinding 防护在
     url_extract._validated_create_connection 里：每次连接都以「解析出的真实 IP」
     再过一遍本函数（IP 字面量 URL），解析与连接之间不留重新解析的窗口。
+    浏览器回退路径由 Playwright 自行解析 DNS，无法在连接层钉扎 IP；调用方
+    只能在每个请求前校验（不做 host 级缓存）并说明这一残余风险。
     该函数是加固手段，不能替代 API Key 访问控制。
     """
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):

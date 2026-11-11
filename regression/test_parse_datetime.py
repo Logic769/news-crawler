@@ -118,6 +118,9 @@ class ParseDatetimeTest(unittest.TestCase):
     def test_reference_year_is_used_before_future_rejection(self) -> None:
         today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
         future = today + timedelta(days=20)
+        if (future.month, future.day) == (2, 29):
+            # 避开闰日：reference_year 是平年，2 月 29 日在目标年份不存在。
+            future += timedelta(days=1)
         reference_year = future.year - 1
         raw = f"{future.month:02d}月{future.day:02d}日 09:30"
         parsed = parse_datetime(

@@ -253,6 +253,9 @@ class ProcessEntryDatesTest(unittest.TestCase):
     def test_future_yearless_detail_uses_list_year_and_keeps_clock(self) -> None:
         today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
         future = today + timedelta(days=20)
+        if (future.month, future.day) == (2, 29):
+            # 避开闰日：reference 是平年，replace(year=...) 会抛 ValueError。
+            future += timedelta(days=1)
         reference = future.replace(year=future.year - 1)
         detail = f"{future.month:02d}月{future.day:02d}日 09:30"
         row = self._run(

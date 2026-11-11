@@ -231,6 +231,18 @@ class TimeExtractorTest(unittest.TestCase):
         self.assertEqual(value, "2007-08-20 23:59:59")
         self.assertEqual(source, "meta")
 
+    def test_user_xpath_prefers_earlier_date_over_later_iso(self) -> None:
+        # 同一段文本里同时有发布时间与较晚的更新时间时，取文本位置更早的日期。
+        html = (
+            "<html><body><p class='pub'>发布时间：2026-11-11 "
+            "更新时间：2026-11-12T09:30:00+08:00</p></body></html>"
+        )
+        value, source = TimeExtractor().extract_with_source(
+            fromstring(html), publish_time_xpath="//p[@class='pub']"
+        )
+        self.assertEqual(value, "2026-11-11")
+        self.assertEqual(source, "xpath")
+
     def test_user_xpath_iso_datetime_keeps_time_and_offset(self) -> None:
         html = "<html><body><p class='pub'>2026-11-10T23:30:00Z</p></body></html>"
         value, source = TimeExtractor().extract_with_source(
@@ -252,13 +264,23 @@ class TimeExtractorTest(unittest.TestCase):
 
     def test_adjacent_sibling_script_date_is_skipped(self) -> None:
         html = (
-            "<html><body><div>发布时间：</div>"
-            "<span><script>var d='2010-01-01';</script>2026-11-11</span>"
+            "<html><body><div class='meta'><span>发布时间：</span>"
+            "<span><script>var d='2010-01-01';</script>2026-11-11</span></div>"
             "<div>会议于2020-01-01举行</div></body></html>"
         )
         value, source = TimeExtractor().extract_with_source(fromstring(html))
         self.assertEqual(value, "2026-11-11")
         self.assertEqual(source, "labeled_text")
+
+    def test_labeled_date_does_not_cross_block_boundary(self) -> None:
+        # 标签单独占一个块时，下一个块里的日期属于正文，不能当作发布时间。
+        html = (
+            "<html><body><div>发布时间：</div>"
+            "<div>2026-11-11</div></body></html>"
+        )
+        value, source = TimeExtractor().extract_with_source(fromstring(html))
+        self.assertEqual(value, "2026-11-11")
+        self.assertEqual(source, "text")
 
     def test_labeled_date_in_separate_adjacent_spans(self) -> None:
         html = (
@@ -269,6 +291,30 @@ class TimeExtractorTest(unittest.TestCase):
         value, source = TimeExtractor().extract_with_source(fromstring(html))
         self.assertEqual(value, "2026-11-11 09:30")
         self.assertEqual(source, "labeled_text")
+
+    def test_labeled_date_in_table_cells(self) -> None:
+        # 表格布局常见“<td>发布时间：</td><td>2026-11-11 09:30</td>”，
+        # 单元格是行内容器，不应被当成块级边界切断。
+        html = (
+            "<html><body><table><tr>"
+            "<td>发布时间：</td><td>2026-11-11 09:30</td>"
+            "</tr></table><div>会议于2020-01-01举行</div></body></html>"
+        )
+        value, source = TimeExtractor().extract_with_source(fromstring(html))
+        self.assertEqual(value, "2026-11-11 09:30")
+        self.assertEqual(source, "labeled_text")
+
+    def test_labeled_date_does_not_cross_table_rows(self) -> None:
+        # td 不再是块级边界后，必须保证不会跨 <tr> 把下一行日期当成发布时间。
+        html = (
+            "<html><body><table>"
+            "<tr><td>发布时间：</td></tr>"
+            "<tr><td>2026-11-11 09:30</td></tr>"
+            "</table></body></html>"
+        )
+        value, source = TimeExtractor().extract_with_source(fromstring(html))
+        self.assertEqual(value, "2026-11-11 09:30")
+        self.assertEqual(source, "text")
 
 
 if __name__ == "__main__":

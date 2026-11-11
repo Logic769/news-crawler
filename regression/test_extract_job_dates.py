@@ -263,6 +263,9 @@ class ExtractJobDatesTest(unittest.TestCase):
             )
             today = dt.datetime.now(ZoneInfo("Asia/Shanghai")).date()
             future = today + dt.timedelta(days=20)
+            if (future.month, future.day) == (2, 29):
+                # 避开闰日：reference 是平年，replace(year=...) 会抛 ValueError。
+                future += dt.timedelta(days=1)
             reference = future.replace(year=future.year - 1)
             detail_raw = f"{future.month:02d}月{future.day:02d}日 09:30"
             list_time = f"{reference.isoformat()} 00:00:00"
