@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -56,7 +57,7 @@ class ProcessEntryDatesTest(unittest.TestCase):
                     if list_publish
                     else None
                 )
-                source = {
+                source: dict[str, Any] = {
                     "name": "source",
                     "timezone": timezone,
                     "article_title_xpath": "//h1",

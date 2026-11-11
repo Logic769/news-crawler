@@ -33,6 +33,7 @@ class PublishSourceTest(unittest.TestCase):
         )
         result = extract_video_meta(html, "https://example.com/video/1")
         self.assertIsNotNone(result)
+        assert result is not None
         self.assertEqual(result["publish_time_source"], "video_meta")
         self.assertEqual(result["publish_time"], "2026-11-11")
 
