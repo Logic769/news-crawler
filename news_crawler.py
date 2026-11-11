@@ -504,16 +504,16 @@ def resolve_config_path(path: str) -> str:
 def _validate_title_xpath(name: object, value: object) -> str:
     """校验手写的 article_title_xpath，把两类常见错误挡在启动期。
 
-    - `string(...)` 返回的是第一个字符，不是标题；
+    - `string(...)` 开头的表达式一律忽略（统一改用元素节点或 /text()）；
     - 非法 XPath 会在抽取时抛错。
-    元素节点写法（`//h1`）由 TitleExtractor 兜底取 text_content，这里只提示。
+    元素节点写法（`//h1`）由 TitleExtractor 取 text_content，可拿到完整标题。
     """
     xpath = str(value or "").strip()
     if not xpath:
         return ""
     if xpath.startswith("string("):
         LOG.warning(
-            "站点 %r 的 article_title_xpath 不能写成 %r（只会返回单个字符），已忽略",
+            "站点 %r 的 article_title_xpath 不能写成 %r（请直接写标题元素，如 //h1），已忽略",
             name,
             xpath,
         )
@@ -528,10 +528,6 @@ def _validate_title_xpath(name: object, value: object) -> str:
             xpath,
         )
         return ""
-    if not xpath.endswith("/text()"):
-        LOG.warning(
-            "站点 %r 的 article_title_xpath 建议以 /text() 结尾: %r", name, xpath
-        )
     return xpath
 
 

@@ -15,6 +15,7 @@ from lxml.html import fromstring
 
 from gne import GeneralNewsExtractor
 from gne.extractors.title import TitleExtractor
+from news_crawler import _validate_title_xpath
 
 HTML = "<html><body><h1 class='t'>重要<em>通知</em>发布</h1><h2>副标题</h2></body></html>"
 
@@ -56,6 +57,17 @@ class TitleXPathTest(unittest.TestCase):
         )
         result = GeneralNewsExtractor().extract(html, title_xpath="//h1")
         self.assertEqual(result["title"], "重要通知发布")
+
+
+class TitleXPathConfigTest(unittest.TestCase):
+    def test_element_xpath_is_kept(self) -> None:
+        self.assertEqual(_validate_title_xpath("demo", "//h1"), "//h1")
+
+    def test_string_prefix_is_ignored(self) -> None:
+        self.assertEqual(_validate_title_xpath("demo", "string(//h1)"), "")
+
+    def test_invalid_xpath_is_ignored(self) -> None:
+        self.assertEqual(_validate_title_xpath("demo", "//h1["), "")
 
 
 if __name__ == "__main__":
