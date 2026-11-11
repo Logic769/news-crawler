@@ -352,10 +352,10 @@ cp sources.json sources.local.json
 
 ```json
 {
-  "workers": 3,
+  "workers": 16,
   "days": 3,
   "timezone": "Asia/Shanghai",
-  "delay": 0.5,
+  "delay": 0.3,
   "sources": [
     {
       "name": "example",
@@ -386,9 +386,11 @@ cp sources.json sources.local.json
 | `timezone` | 可选 | 站点时区，默认 `Asia/Shanghai` |
 | `article_title_xpath` | 可选 | 详情页标题 XPath。用于 `<title>` 写的是站点名、真标题在正文 `h1` 的站点。推荐直接写标题元素（如 `//h1[@class='article-title']`），会取其全部文本（含 `<em>` 等子元素）；写成 `//h1/text()` 只能取第一个直接文本节点，标题含子标签时会截断。以 `string(` 开头的表达式会被忽略 |
 | `render` | 可选 | 设为 `true` 表示列表页需要用 Chrome 渲染后再解析 |
-| `delay` | 可选 | 每个请求之间的等待秒数，默认 0.5 |
+| `delay` | 可选 | 每个请求之间的等待秒数，默认 0.3 |
 
-> 顶层还可以配置 `workers`（同时处理几个站点）和 `days`（默认抓取天数）。
+> 顶层还可以配置 `workers`（同时处理几个站点，默认 16）和 `days`（默认抓取天数）。
+>
+> **内存提示**：`workers` 是站点级线程数；开启浏览器回退时，每个线程可能各自启动一个 Chromium（约 200–300 MB）。`workers=16` 建议至少 4 GB 可用内存；小内存机器或 JS 站点较多时请调低 `--workers`，否则可能被 OOM Kill。
 
 ### 第 3 步：测试列表解析
 
@@ -412,7 +414,7 @@ docker compose run --rm crawler run --config sources.local.json --days 3
 | --- | --- |
 | `--days 3` | 抓取最近 3 天 |
 | `--since 2026-09-01` | 从指定日期开始抓取 |
-| `--workers 5` | 同时处理 5 个站点 |
+| `--workers 16` | 同时处理 16 个站点 |
 | `--limit-per-source 20` | 每个站点最多处理 20 条（只计实际处理的条目，已入库被跳过的不占名额） |
 | `--force` | 忽略数据库已有记录，强制重新抓取 |
 
