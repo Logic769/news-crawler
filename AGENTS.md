@@ -283,7 +283,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
   "start": 2,
   "max_pages": 50,
   "stop_when_older_than_cutoff": true,
-  "stop_after_known_pages": 2
+  "stop_after_known_pages": 0
 }
 ```
 
@@ -291,15 +291,15 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | --- | --- | --- |
 | `mode` | `none` | `none` 只抓 `list_url`；`template` 按 `url_template` 生成后续页；`next` 跟随“下一页”链接；`auto` 有模板用模板，否则跟随下一页 |
 | `url_template` | 空 | 页码模板，必须包含 `{page}`；缺少占位符时 `template` 模式回退为只抓首页，`auto` 模式改走下一页 |
-| `last_url_xpath` | 空 | 尾页链接 XPath；命中元素时依次尝试 href/onclick/data-page/value 和文本，从中提取最大页码；不填时从整页 HTML 用 `total_pages_regex` 探测 |
+| `last_url_xpath` | 空 | 尾页链接 XPath；命中元素时读取 href/onclick/data-page/value 和文本作为候选，最终取最大页码（`data-page="12"` 这类纯数字直接作为页码）；不填时从整页 HTML 用 `total_pages_regex` 探测 |
 | `next_url_xpath` | 空 | “下一页”链接 XPath；支持相对地址与常见 `onclick=location.href=...` 写法 |
-| `total_pages_regex` | `(?:index_|page[=/])(\\d+)` | 提取最大页码的正则，捕获组必须是数字 |
+| `total_pages_regex` | `(?:index_\|page[=/])(\\d+)` | 提取最大页码的正则，捕获组必须是数字（表格中 `\\|` 表示正则里的或） |
 | `start` | `1` | 模板模式从第几页开始生成后续页（第 1 页始终是 `list_url`，通常设 2）；范围 1–1000 |
-| `max_pages` | `50` | 最多抓取页数，防御性上限；范围 1–500 |
-| `stop_when_older_than_cutoff` | `true` | 当前页最晚日期早于抓取窗口起点时停止翻页（整页都早于窗口才停，避免置顶旧文导致漏抓） |
-| `stop_after_known_pages` | `2` | 连续 N 页链接都已入库时停止（增量运行）；范围 0–100，0 关闭；仅 template/next/auto 模式生效 |
+| `max_pages` | `50` | 最多抓取页数（含 `list_url` 计 1 页，后续页最多 `max_pages-1` 个）；范围 1–500 |
+| `stop_when_older_than_cutoff` | `true` | 当前页最晚日期早于抓取窗口起点时停止翻页（整页每条都能解析出日期且都早于窗口才停，避免置顶旧文或缺失日期导致漏抓） |
+| `stop_after_known_pages` | `0` | 连续 N 页链接都已入库时停止（增量运行）；范围 0–100，默认 0 关闭；仅 template/next/auto 模式生效。开启后若上次运行更后页失败，可能提前停止，建议确认完整抓取后再开 |
 
-自动分页在页内按 URL 去重；`test` 命令输出页数与停止原因（`cutoff`/`known_pages`/`no_next`/`max_pages`/`empty`/`fetch_failed`/`done`）。实现入口：`collect_list_entries_detailed(source, *, cutoff=None, known_urls=None) -> dict`，返回 `items/pages/page_urls/stop_reason`；`collect_list_entries` 保留旧返回类型。
+未配置 `render: true` 时，列表页解析为空会自动用 Chrome 渲染一次，并基于渲染后的 DOM 重新解析与继续翻页。自动分页在页内按 URL 去重；`test` 命令输出页数与停止原因（`cutoff`/`known_pages`/`no_next`/`max_pages`/`empty`/`fetch_failed`/`done`）。实现入口：`collect_list_entries_detailed(source, *, cutoff=None, known_urls=None) -> dict`，返回 `items/pages/page_urls/stop_reason`；`collect_list_entries` 保留旧返回类型。
 
 ### XPath 编写约定
 
@@ -390,7 +390,7 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 - `save_article()` 是**部分更新**：空字符串表示“这次没拿到”，不会覆盖库中已有值，因此抓取失败或重新分类时只更新 `status`/`error`，已成功入库的正文不会被清空；`images` 例外地区分三态：`None` 保留旧值、`[]` 明确清空、非空列表覆盖；抓取流程用 `normalize_images_for_update` 把"抽取不到图"归一为 `None`（保留旧值），只有显式传 `[]` 才清空，避免成功重抓因抽取失败抹掉历史图片；
 - `timezone` 随文章落库，读取时优先使用该列，旧行（NULL）才回落到当前配置推断；`publish_time_utc` 存真实时刻（UTC），`published_from`/`published_to` 按它过滤以消除混时区偏差，`publish_time_utc` 为 NULL/空串的历史行回退旧的 `publish_time` 墙钟比较；列表排序仍按 `publish_time` 墙钟；
 - 详情页日期晚于当前时间超过 1 天时视为不可信（不再自动减一年），回退列表日期；列表日期也缺失时记 `unknown_date`；`date_skew_days` 范围为 0–365；GNE 文本扫描可能只抽到“09月30日”这类无年份日期：主抓取路径优先用列表日期的年份补齐，列表日期也缺失时记 `unknown_date`；API 单 URL extract 无列表日期可交叉校验时同样记 `unknown_date`，不按当前年猜测；
-- `old` 分支的 `publish_time_source` 固定为 `list`，`publish_time_raw` 可能保留上次成功抽取的详情原文；`unknown_date` 本次不写新来源（新行为空，已有行保留旧来源与旧时间），避免旧时间挂新来源；
+- `old` 分支的 `publish_time_source` 取决于判定时机：列表阶段就确认超出窗口时记 `list`；详情抓取后才发现超出窗口时保留详情来源（`xpath`/`labeled_text`/`meta`/`text`）。`publish_time_raw` 与当前 `publish_time` 同步：回退到列表日期时清空，不再保留旧详情原文；`unknown_date` 本次没有可信发布时间，新插入行会保留本次抽取文本便于排查，已有行则保留旧值与旧时间配对；新行的 `publish_time_source` 为空字符串，已有行保留旧来源，避免旧时间挂新来源；
 - `article_id` 由 `sha256(source + \x1f + url)` 派生，不随数据库重建变化，可安全作为下游引用；
 - SQLite 启用 WAL 与 `busy_timeout=30000`（`DB_BUSY_TIMEOUT_MS`，与连接 timeout 一致，不用 5s 覆盖 30s 连接超时），API 作业默认单 worker 写入；只读查询使用 `file:...?mode=ro` URI（路径会转义），WAL 库仍要求目录可写（需要 -shm/-wal）。
 
@@ -546,11 +546,11 @@ curl http://localhost:8000/v1/health
 | `regression/test_list_page.py` | 3 个用例：列表页解析的条目定位、feature 缺失、少于 4 条时不回退 |
 | `regression/test_video_detection.py` | 5 个用例：路径规则、`og:type`、JSON-LD `VideoObject`、文章内嵌视频不误判 |
 | `regression/test_backfill.py` | 14 个用例：候选 skip/limit（含真实 SQLite）、LIMIT 下推与游标提前停止、游标异常关闭、失败清单列清洗、BOM 跳过清单、`--skip-file` 条目在下次失败清单中保留、`--failed-list` 指向数据库/目录/硬链接/符号链接/未创建的 WAL·SHM 侧车路径时抓取前返回 2、正常清单文件不误杀 |
-| `regression/test_time_extractor.py` | 26 个用例：标签日期优先于正文、XPath 元素/字符串/多值、脚本与页脚排除、兄弟/嵌套行内节点拼接、块级边界、停止词、dateUpdate 兜底、拆分年份重建 |
+| `regression/test_time_extractor.py` | 28 个用例：标签日期优先于正文、XPath 元素/字符串/多值、脚本与页脚排除、兄弟/嵌套行内节点拼接、块级边界、停止词、dateUpdate 兜底、拆分年份重建 |
 | `regression/test_publish_source.py` | 2 个用例：GNE 内部来源映射到落库值、视频页 meta 来源标记 |
-| `regression/test_process_entry_dates.py` | 11 个用例：未来/超 skew 详情日期回退列表、跨 UTC 日期边界、无年份按列表年补齐、无列表日期记 unknown_date、title_source 归一、skew 钳制、unknown_date 不覆盖旧来源 |
-| `regression/test_extract_job_dates.py` | 4 个用例：API extract 作业超 skew 回退库内列表日期、无年份兜底、详情不可解析兜底、无列表日期记 unknown_date |
-| `regression/test_pagination.py` | 17 个用例：模板分页按截止日期停止、模板生成后续页、跟随 onclick 下一页、max_pages 上限、已入库页连续早停、旧 list_urls 行为、非法 mode 回退、固定列表忽略 max_pages/分页配置/cutoff、固定页抓取失败不误报、固定列表全空报 empty、置顶旧文不提前停、next XPath 无 href 文本忽略、模板缺 {page} 回退、collect_list_entries 包装 |
+| `regression/test_process_entry_dates.py` | 14 个用例：未来/超 skew 详情日期回退列表、跨 UTC 日期边界、无年份按列表年补齐、无列表日期记 unknown_date、title_source 归一、skew 钳制、unknown_date 不覆盖旧来源 |
+| `regression/test_extract_job_dates.py` | 5 个用例：API extract 作业超 skew 回退库内列表日期、无年份兜底、详情不可解析兜底、无列表日期记 unknown_date |
+| `regression/test_pagination.py` | 29 个用例：模板分页按截止日期停止、模板生成后续页、max_pages 含首页语义、last_url_xpath 多候选取最大页码、跟随 onclick/忽略 # 锚点、渲染后 DOM 找下一页、未知日期不触发 cutoff、已入库页连续早停、旧 list_urls 行为、非法 mode 回退、固定列表忽略 max_pages/分页配置/cutoff、固定页抓取失败不误报、固定列表全空报 empty、置顶旧文不提前停、next XPath 无 href 文本忽略、next XPath 属性 onclick 解析（含 JavaScript: 前缀）、模板缺 {page} 回退、collect_list_entries 包装 |
 
 运行方式：`python -X utf8 -m unittest discover -s regression -t . -p "test_*.py" -v`（约 15 秒，无需网络）。
 
@@ -665,7 +665,8 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 - `TimeExtractor.extract_with_source(element, publish_time_xpath: str = "") -> tuple[str, str]`：返回 `(publish_time, source)`，`source` 为 `xpath`/`labeled_text`/`meta`/`json_ld`/`time_tag`/`text` 等内部来源；
 - `publish_source_for(raw: str) -> str`：把 GNE 内部来源映射为落库值 `xpath`/`labeled_text`/`meta`/`text`/`video_meta`/`detail`/`list`，未知值记 `detail`；
 - `collect_list_entries_detailed(source, *, cutoff: dt.datetime | None = None, known_urls: set[str] | None = None) -> dict[str, Any]`：抓取列表页并返回 `items/pages/page_urls/stop_reason`，支持 `pagination` 的 template/next/auto 模式；`collect_list_entries` 保留只返回条目的旧签名；
-- `has_explicit_year(value: Any) -> bool`：日期文本是否自带 19xx/20xx 四位年份；用于判断能否安全按当前年或列表日期年份补齐；
+- `has_explicit_year(value: Any) -> bool`：日期文本是否自带年份（19xx/20xx 四位或 `18-03-08` 这类两位年份）；用于判断能否安全按当前年或列表日期年份补齐；
+- `is_yearless_month_day(value: Any) -> bool`：是否是需要按基准年份补齐的“月日”文本；排除“昨天/前天/N 分钟前/小时前/天前”等相对时间与自带年份的日期；
 - `align_yearless_datetime(value: dt.datetime, reference: dt.datetime, timezone_name: str = "Asia/Shanghai") -> dt.datetime | None`：用 `reference` 的年份重建无年份日期的月日时分并复算；非法日期（如 2 月 29 日遇上非闰年）返回 `None`；
 - `GeneralNewsExtractor.extract(html, **kwargs) -> dict`：正文抽取入口；实例无跨调用可变状态，可跨线程复用（每次 extract 内部新建 ContentExtractor）；
 - `create_app(settings=None) -> FastAPI`：API 应用工厂，测试可注入独立设置；

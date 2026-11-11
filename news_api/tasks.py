@@ -237,50 +237,62 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
                 )
                 if list_dt is not None:
                     stored_list_dt = list_dt
-                    if publish_dt is None:
-                        publish_dt = list_dt
-                        publish_text = news_crawler.format_publish_time(list_dt, tz_name)
-                        publish_source = "list"
-                    else:
-                        skew = abs(
-                            (
-                                publish_dt.astimezone(news_crawler.get_timezone(tz_name)).date()
-                                - list_dt.astimezone(news_crawler.get_timezone(tz_name)).date()
-                            ).days
-                        )
-                        if skew > date_skew_days:
-                            LOG.warning(
-                                "extract 作业详情日期 %s 与列表日期 %s 相差 %d 天，改用列表日期",
-                                publish_dt.isoformat(),
-                                list_dt.isoformat(),
-                                skew,
-                            )
-                            publish_dt = list_dt
-                            publish_text = news_crawler.format_publish_time(list_dt, tz_name)
-                            publish_source = "list"
-        # 已回退到列表日期的文章，年份来自库里的可信列表日期，不能再按
-        # 详情原文的无年份文本判一次 unknown_date，否则会把刚救回来的状态覆盖掉。
+        # 先按库内列表日期年份补齐无年份详情时间，再计算偏差：
+        # “09月30日 09:30”若先按当前年解析，会与 2025-09-30 相差一年，
+        # 偏差校验会直接换成列表日期，导致详情时分和来源丢失。
+        if (
+            stored_list_dt is not None
+            and publish_dt is not None
+            and publish_source != "list"
+            and news_crawler.is_yearless_month_day(publish_raw)
+        ):
+            reconciled = news_crawler.align_yearless_datetime(
+                publish_dt, stored_list_dt, tz_name
+            )
+            if reconciled is not None:
+                publish_dt = reconciled
+                publish_text = news_crawler.format_publish_time(reconciled, tz_name)
+            else:
+                publish_dt = stored_list_dt
+                publish_text = news_crawler.format_publish_time(stored_list_dt, tz_name)
+                publish_source = "list"
+        if publish_dt is None and stored_list_dt is not None:
+            publish_dt = stored_list_dt
+            publish_text = news_crawler.format_publish_time(stored_list_dt, tz_name)
+            publish_source = "list"
+        elif (
+            stored_list_dt is not None
+            and publish_dt is not None
+            and publish_source != "list"
+        ):
+            skew = abs(
+                (
+                    publish_dt.astimezone(news_crawler.get_timezone(tz_name)).date()
+                    - stored_list_dt.astimezone(news_crawler.get_timezone(tz_name)).date()
+                ).days
+            )
+            if skew > date_skew_days:
+                LOG.warning(
+                    "extract 作业详情日期 %s 与列表日期 %s 相差 %d 天，改用列表日期",
+                    publish_dt.isoformat(),
+                    stored_list_dt.isoformat(),
+                    skew,
+                )
+                publish_dt = stored_list_dt
+                publish_text = news_crawler.format_publish_time(stored_list_dt, tz_name)
+                publish_source = "list"
+        # 没有库内列表日期时，真正缺年份的月日才记 unknown_date；
+        # 相对时间（昨天/3小时前）已解析为完整日期，不能误清空。
         if (
             publish_dt is not None
             and publish_source != "list"
-            and not news_crawler.has_explicit_year(publish_raw)
+            and stored_list_dt is None
+            and news_crawler.is_yearless_month_day(publish_raw)
         ):
-            if stored_list_dt is not None:
-                reconciled = news_crawler.align_yearless_datetime(
-                    publish_dt, stored_list_dt, tz_name
-                )
-                if reconciled is not None:
-                    publish_dt = reconciled
-                    publish_text = news_crawler.format_publish_time(reconciled, tz_name)
-                else:
-                    publish_dt = stored_list_dt
-                    publish_text = news_crawler.format_publish_time(stored_list_dt, tz_name)
-                    publish_source = "list"
-            else:
-                LOG.warning("extract 作业发布时间缺少年份，记为 unknown_date: %r", publish_raw)
-                publish_dt = None
-                publish_text = ""
-                publish_source = ""
+            LOG.warning("extract 作业发布时间缺少年份，记为 unknown_date: %r", publish_raw)
+            publish_dt = None
+            publish_text = ""
+            publish_source = ""
         if publish_dt is None:
             publish_source = ""
         title_source = str(result.get("title_source") or "gne_default")
@@ -288,6 +300,8 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             title_source = "gne_default"
         status = "ok" if publish_dt is not None else "unknown_date"
         error = "" if publish_dt is not None else "无法解析发布日期"
+        # 回退到列表日期时详情原文不再对应当前发布时间，清空避免误导下游。
+        publish_raw_for_save = "" if publish_source == "list" else publish_raw
         article_id = news_crawler.save_article(
             conn,
             source,
@@ -295,7 +309,7 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             title=news_crawler.clean_text(result.get("title")),
             publish_time=publish_text,
             publish_time_source=publish_source,
-            publish_time_raw=publish_raw,
+            publish_time_raw=publish_raw_for_save,
             title_source=title_source,
             # unknown_date 没有可信发布时间，不写站点时区；与 crawler 保持一致。
             timezone=tz_name if status == "ok" else "",

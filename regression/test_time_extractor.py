@@ -231,6 +231,24 @@ class TimeExtractorTest(unittest.TestCase):
         self.assertEqual(value, "2007-08-20 23:59:59")
         self.assertEqual(source, "meta")
 
+    def test_user_xpath_iso_datetime_keeps_time_and_offset(self) -> None:
+        html = "<html><body><p class='pub'>2026-11-10T23:30:00Z</p></body></html>"
+        value, source = TimeExtractor().extract_with_source(
+            fromstring(html), publish_time_xpath="//p[@class='pub']"
+        )
+        self.assertEqual(value, "2026-11-10T23:30:00Z")
+        self.assertEqual(source, "xpath")
+
+    def test_labeled_date_in_separate_adjacent_spans(self) -> None:
+        html = (
+            "<html><body><div class='meta'>"
+            "<span>发布时间：</span><span>2026-11-11 09:30</span></div>"
+            "<div>会议于2020-01-01举行</div></body></html>"
+        )
+        value, source = TimeExtractor().extract_with_source(fromstring(html))
+        self.assertEqual(value, "2026-11-11 09:30")
+        self.assertEqual(source, "labeled_text")
+
 
 if __name__ == "__main__":
     unittest.main()

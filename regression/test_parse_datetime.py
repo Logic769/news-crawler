@@ -6,7 +6,13 @@ import unittest
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from news_crawler import align_yearless_datetime, format_publish_time, parse_datetime
+from news_crawler import (
+    align_yearless_datetime,
+    format_publish_time,
+    has_explicit_year,
+    is_yearless_month_day,
+    parse_datetime,
+)
 
 
 class ParseDatetimeTest(unittest.TestCase):
@@ -71,6 +77,27 @@ class ParseDatetimeTest(unittest.TestCase):
         value = datetime(2024, 2, 29, 9, 30)
         reference = datetime(2025, 1, 1, 0, 0)
         self.assertIsNone(align_yearless_datetime(value, reference, "Asia/Shanghai"))
+
+    def test_two_digit_year_is_recognized_and_parsed(self) -> None:
+        self.assertTrue(has_explicit_year("18-03-08"))
+        self.assertFalse(is_yearless_month_day("18-03-08"))
+        parsed = parse_datetime("18-03-08", None, "Asia/Shanghai")
+        assert parsed is not None
+        self.assertEqual(parsed.strftime("%Y-%m-%d"), "2018-03-08")
+
+    def test_relative_time_is_not_treated_as_yearless_month_day(self) -> None:
+        for raw in ("昨天", "前天", "3小时前", "30分钟前", "2天前"):
+            with self.subTest(raw=raw):
+                self.assertFalse(is_yearless_month_day(raw))
+        self.assertTrue(is_yearless_month_day("09月30日"))
+        self.assertTrue(is_yearless_month_day("09-30"))
+
+    def test_explicit_future_year_keeps_year_in_list_parse(self) -> None:
+        future = datetime.now(ZoneInfo("Asia/Shanghai")) + timedelta(days=40)
+        raw = future.strftime("%Y-%m-%d 16:00:00")
+        parsed = parse_datetime(raw, None, "Asia/Shanghai")
+        assert parsed is not None
+        self.assertEqual(parsed.date(), future.date())
 
     def test_format_publish_time_converts_to_site_timezone(self) -> None:
         parsed = parse_datetime("2026-10-30T02:00:00Z")

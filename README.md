@@ -274,7 +274,7 @@ curl "http://localhost:8000/v1/articles?status=all&page_size=50"
 >
 > GNE 的文本扫描可能只抽到 `09月30日` 这类无年份日期：主抓取路径会优先用列表日期的年份补齐；列表日期也缺失时，以及 API 单 URL extract 没有列表日期可交叉校验时，这类日期会记 `unknown_date`，不会按当前年猜测。
 >
-> `old` 分支的 `publish_time_source` 固定为 `list`（本次用列表日期说明超出窗口）；`publish_time_raw` 可能保留上次成功抽取的详情原文。`unknown_date` 本次没有可信发布时间，不会写入新的来源：新行为空字符串，已有行保留旧来源与旧时间，避免“旧时间挂新来源”。
+> `old` 分支的 `publish_time_source` 取决于判定时机：列表阶段就确认超出窗口时记 `list`；详情抓取后才发现超出窗口时保留详情来源（`xpath`/`labeled_text`/`meta`/`text`）。`publish_time_raw` 与当前 `publish_time` 同步：回退到列表日期时清空，不再保留旧详情原文；`unknown_date` 本次没有可信发布时间，新插入行会保留本次抽取文本便于排查，已有行则保留旧值与旧时间配对，避免“旧时间挂新来源”；新行的 `publish_time_source` 为空字符串，已有行保留旧来源。
 
 详情示例：
 
@@ -418,7 +418,7 @@ cp sources.json sources.local.json
   "start": 2,
   "max_pages": 50,
   "stop_when_older_than_cutoff": true,
-  "stop_after_known_pages": 2
+  "stop_after_known_pages": 0
 }
 ```
 
@@ -426,15 +426,15 @@ cp sources.json sources.local.json
 | --- | --- | --- |
 | `mode` | `none` | `none` 只抓 `list_url`；`template` 按 `url_template` 生成后续页；`next` 跟随“下一页”链接；`auto` 有模板用模板，否则跟随下一页 |
 | `url_template` | 空 | 页码模板，必须包含 `{page}`；缺少占位符时 `template` 模式回退为只抓首页，`auto` 模式改走下一页 |
-| `last_url_xpath` | 空 | 尾页链接 XPath；命中元素时依次尝试 href/onclick/data-page/value 和文本，从中提取最大页码。不填时从整页 HTML 用 `total_pages_regex` 探测 |
+| `last_url_xpath` | 空 | 尾页链接 XPath；命中元素时读取 href/onclick/data-page/value 和文本作为候选，最终取最大页码（`data-page="12"` 这类纯数字直接作为页码）。不填时从整页 HTML 用 `total_pages_regex` 探测 |
 | `next_url_xpath` | 空 | “下一页”链接 XPath；支持相对地址，也兼容常见 `onclick=location.href=...` 写法 |
-| `total_pages_regex` | `(?:index_|page[=/])(\\d+)` | 从 HTML 提取最大页码的正则，捕获组必须是数字 |
+| `total_pages_regex` | `(?:index_\|page[=/])(\\d+)` | 从 HTML 提取最大页码的正则，捕获组必须是数字（表格中 `\\|` 表示正则里的或） |
 | `start` | `1` | 模板模式从第几页开始生成（第 1 页始终是 `list_url`，通常设为 2）；范围 1–1000 |
-| `max_pages` | `50` | 最多抓取页数，防御性上限；范围 1–500 |
-| `stop_when_older_than_cutoff` | `true` | 当前页最晚日期早于抓取窗口起点时停止翻页（整页都早于窗口才停，避免置顶旧文导致漏抓） |
-| `stop_after_known_pages` | `2` | 连续 N 页链接都已入库时停止（增量运行）；范围 0–100，设为 0 关闭；仅 template/next/auto 模式生效 |
+| `max_pages` | `50` | 最多抓取页数（含 `list_url` 计 1 页，后续页最多 `max_pages-1` 个）；范围 1–500 |
+| `stop_when_older_than_cutoff` | `true` | 当前页最晚日期早于抓取窗口起点时停止翻页（整页每条都能解析出日期且都早于窗口才停，避免置顶旧文或缺失日期导致漏抓） |
+| `stop_after_known_pages` | `0` | 连续 N 页链接都已入库时停止（增量运行）；范围 0–100，默认 0 关闭；仅 template/next/auto 模式生效。开启后若上次运行更后页失败，可能提前停止，建议确认完整抓取后再开 |
 
-自动分页会在页内按 URL 去重，并在 `test` 命令输出页数与停止原因（如 `cutoff`、`known_pages`、`no_next`、`max_pages`、`empty`、`fetch_failed`、`done`）。
+未配置 `render: true` 时，列表页解析为空会自动用 Chrome 渲染一次，并基于渲染后的 DOM 重新解析与继续翻页。自动分页会在页内按 URL 去重，并在 `test` 命令输出页数与停止原因（如 `cutoff`、`known_pages`、`no_next`、`max_pages`、`empty`、`fetch_failed`、`done`）。
 
 ### 第 3 步：测试列表解析
 

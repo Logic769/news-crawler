@@ -42,6 +42,7 @@ class ProcessEntryDatesTest(unittest.TestCase):
         publish_time_source: str = "xpath",
         expected_status: str = "ok",
         cutoff_text: str = "2026-01-01 00:00:00",
+        seed_publish_raw: str = "",
     ) -> sqlite3.Row:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "news.db")
@@ -50,6 +51,16 @@ class ProcessEntryDatesTest(unittest.TestCase):
             conn = sqlite3.connect(db_path)
             conn.row_factory = sqlite3.Row
             try:
+                if seed_publish_raw:
+                    news_crawler.save_article(
+                        conn,
+                        "source",
+                        "https://example.com/a",
+                        publish_time="2025-01-01 00:00:00",
+                        publish_time_source="xpath",
+                        publish_time_raw=seed_publish_raw,
+                        status="ok",
+                    )
                 cutoff = news_crawler.parse_datetime(cutoff_text, None, timezone)
                 assert cutoff is not None
                 list_date = (
@@ -121,9 +132,8 @@ class ProcessEntryDatesTest(unittest.TestCase):
         )
         self.assertEqual(row["publish_time"], today.strftime("%Y-%m-%d 00:00:00"))
         self.assertEqual(row["publish_time_source"], "list")
-        self.assertEqual(
-            row["publish_time_raw"], detail_date.strftime("%Y-%m-%d 16:00:00")
-        )
+        # 回退列表日期后，详情原文不再代表当前发布时间，应清空。
+        self.assertEqual(row["publish_time_raw"], "")
         self.assertEqual(row["list_publish_time"], today.strftime("%Y-%m-%d 00:00:00"))
         self.assertEqual(row["title_source"], "article_title_xpath")
 
@@ -190,6 +200,37 @@ class ProcessEntryDatesTest(unittest.TestCase):
         )
         self.assertEqual(row["publish_time"], reference.strftime("%Y-%m-%d 00:00:00"))
         self.assertEqual(row["publish_time_source"], "text")
+
+    def test_yearless_detail_keeps_detail_clock_after_list_year_alignment(self) -> None:
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        reference = today.replace(year=today.year - 1, month=9, day=30)
+        row = self._run(
+            "09月30日 09:30",
+            reference.strftime("%Y-%m-%d 00:00:00"),
+            publish_time_source="text",
+            cutoff_text=reference.strftime("%Y-%m-%d 00:00:00"),
+        )
+        self.assertEqual(
+            row["publish_time"], reference.strftime("%Y-%m-%d 09:30:00")
+        )
+        self.assertEqual(row["publish_time_source"], "text")
+
+    def test_relative_yesterday_without_list_date_is_preserved(self) -> None:
+        row = self._run("昨天", None, publish_time_source="text")
+        self.assertTrue(row["publish_time"])
+        self.assertEqual(row["publish_time_source"], "text")
+
+    def test_list_date_fallback_clears_stale_detail_raw(self) -> None:
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        detail = today - timedelta(days=30)
+        row = self._run(
+            detail.strftime("%Y-%m-%d 10:00:00"),
+            today.strftime("%Y-%m-%d 00:00:00"),
+            seed_publish_raw="2020-01-01 00:00:00",
+        )
+        self.assertEqual(row["publish_time"], today.strftime("%Y-%m-%d 00:00:00"))
+        self.assertEqual(row["publish_time_source"], "list")
+        self.assertEqual(row["publish_time_raw"], "")
 
     def test_invalid_title_source_falls_back_to_gne_default(self) -> None:
         row = self._run(

@@ -187,6 +187,48 @@ class PaginationTest(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "known_pages")
         self.assertEqual(len(calls), 2)
 
+    def test_known_pages_stop_is_disabled_by_default(self) -> None:
+        source = _source(
+            mode="template",
+            url_template="https://example.com/list/index_{page}.html",
+            last_url_xpath="//a[@class='last']",
+            start=2,
+            max_pages=10,
+            stop_when_older_than_cutoff=False,
+        )
+        first = _page(("旧一", "2026-01-01", "a1.html")).replace(
+            "</ul>",
+            '</ul><a class="last" href="index_3.html">尾页</a>',
+        )
+        pages = {
+            "https://example.com/list/": first,
+            "https://example.com/list/index_2.html": _page(
+                ("旧二", "2026-01-02", "a2.html")
+            ),
+            "https://example.com/list/index_3.html": _page(
+                ("旧三", "2026-01-03", "a3.html")
+            ),
+        }
+        known = {
+            "https://example.com/a1.html",
+            "https://example.com/a2.html",
+            "https://example.com/a3.html",
+        }
+        calls: list[str] = []
+
+        def fake_fetch(url: str, render: bool) -> str:
+            calls.append(url)
+            return pages[url]
+
+        with mock.patch.object(news_crawler, "fetch_list_html", side_effect=fake_fetch):
+            result = news_crawler.collect_list_entries_detailed(
+                source, known_urls=known
+            )
+
+        self.assertEqual(result["pages"], 3)
+        self.assertEqual(result["stop_reason"], "done")
+        self.assertEqual(len(calls), 3)
+
     def test_list_urls_keeps_legacy_fixed_url_behavior(self) -> None:
         source = _source()
         source.pop("list_url")
@@ -298,12 +340,15 @@ class PaginationTest(unittest.TestCase):
 
         with mock.patch.object(
             news_crawler, "fetch_list_html", return_value=empty
-        ):
+        ), mock.patch.object(
+            news_crawler, "fetch_html_with_browser", return_value=None
+        ) as browser:
             result = news_crawler.collect_list_entries_detailed(source)
 
         self.assertEqual(result["pages"], 3)
         self.assertEqual(result["items"], [])
         self.assertEqual(result["stop_reason"], "empty")
+        self.assertEqual(browser.call_count, 3)
 
     def test_pinned_old_item_does_not_stop_next_page_before_cutoff(self) -> None:
         source = _source(
@@ -434,6 +479,342 @@ class PaginationTest(unittest.TestCase):
             result = news_crawler.collect_list_entries_detailed(source)
 
         self.assertEqual(result["pages"], 3)
+        self.assertEqual(result["stop_reason"], "done")
+
+    def test_last_url_xpath_uses_largest_candidate_page(self) -> None:
+        source = _source(
+            mode="template",
+            url_template="https://example.com/list/index_{page}.html",
+            last_url_xpath="//a[@class='last']",
+            start=2,
+            max_pages=10,
+            stop_after_known_pages=0,
+        )
+        first = _page(("第一页", "2026-01-01", "a1.html")).replace(
+            "</ul>",
+            '</ul><a class="last" href="index_3.html">尾页</a>'
+            '<a class="last" href="index_7.html">末页</a>',
+        )
+        pages = {"https://example.com/list/": first}
+        for page in range(2, 8):
+            pages[f"https://example.com/list/index_{page}.html"] = _page(
+                (f"第{page}页", f"2026-01-{page:02d}", f"a{page}.html")
+            )
+
+        with mock.patch.object(
+            news_crawler,
+            "fetch_list_html",
+            side_effect=lambda url, render: pages[url],
+        ):
+            result = news_crawler.collect_list_entries_detailed(source)
+
+        self.assertEqual(result["pages"], 7)
+        self.assertEqual(
+            result["page_urls"][-1],
+            "https://example.com/list/index_7.html",
+        )
+
+    def test_last_url_xpath_numeric_data_page_counts_as_page_number(self) -> None:
+        source = _source(
+            mode="template",
+            url_template="https://example.com/list/index_{page}.html",
+            last_url_xpath="//a[@class='last']",
+            start=2,
+            max_pages=13,
+            stop_after_known_pages=0,
+        )
+        first = _page(("第一页", "2026-01-01", "a1.html")).replace(
+            "</ul>",
+            '</ul><a class="last" data-page="12">12</a>'
+            '<a class="last" href="index_4.html">尾页</a>',
+        )
+        pages = {"https://example.com/list/": first}
+        for page in range(2, 13):
+            pages[f"https://example.com/list/index_{page}.html"] = _page(
+                (f"第{page}页", f"2026-01-{page:02d}", f"a{page}.html")
+            )
+
+        with mock.patch.object(
+            news_crawler,
+            "fetch_list_html",
+            side_effect=lambda url, render: pages[url],
+        ):
+            result = news_crawler.collect_list_entries_detailed(source)
+
+        self.assertEqual(result["pages"], 12)
+        self.assertEqual(
+            result["page_urls"][-1],
+            "https://example.com/list/index_12.html",
+        )
+
+    def test_scalar_last_url_xpath_does_not_crash(self) -> None:
+        source = _source(
+            mode="template",
+            url_template="https://example.com/list/index_{page}.html",
+            last_url_xpath="count(//a[@class='last'])",
+            start=2,
+            max_pages=2,
+            stop_after_known_pages=0,
+        )
+        first = _page(("第一页", "2026-01-01", "a1.html")).replace(
+            "</ul>",
+            '</ul><a class="last" href="index_2.html">尾页</a>',
+        )
+        second = _page(("第二页", "2026-01-02", "a2.html"))
+        pages = {
+            "https://example.com/list/": first,
+            "https://example.com/list/index_2.html": second,
+        }
+
+        with mock.patch.object(
+            news_crawler,
+            "fetch_list_html",
+            side_effect=lambda url, render: pages[url],
+        ):
+            result = news_crawler.collect_list_entries_detailed(source)
+
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(result["stop_reason"], "done")
+
+    def test_scalar_next_url_xpath_does_not_crash(self) -> None:
+        source = _source(
+            mode="next",
+            next_url_xpath="number(//a/@href)",
+            stop_after_known_pages=0,
+        )
+        first = _page(("第一页", "2026-01-01", "a1.html")).replace(
+            "</ul>",
+            '</ul><a href="index_2.html">下一页</a>',
+        )
+        second = _page(("第二页", "2026-01-02", "a2.html"))
+        pages = {
+            "https://example.com/list/": first,
+            "https://example.com/list/index_2.html": second,
+        }
+
+        with mock.patch.object(
+            news_crawler,
+            "fetch_list_html",
+            side_effect=lambda url, render: pages[url],
+        ):
+            result = news_crawler.collect_list_entries_detailed(source)
+
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(result["stop_reason"], "no_next")
+
+    def test_template_max_pages_counts_list_url_as_first_page(self) -> None:
+        source = _source(
+            mode="template",
+            url_template="https://example.com/list/index_{page}.html",
+            start=5,
+            max_pages=3,
+            stop_when_older_than_cutoff=False,
+            stop_after_known_pages=0,
+        )
+        pages = {
+            "https://example.com/list/": _page(("第一页", "2026-01-01", "a1.html")),
+            "https://example.com/list/index_5.html": _page(
+                ("第五页", "2026-01-05", "a5.html")
+            ),
+            "https://example.com/list/index_6.html": _page(
+                ("第六页", "2026-01-06", "a6.html")
+            ),
+        }
+        calls: list[str] = []
+
+        def fake_fetch(url: str, render: bool) -> str:
+            calls.append(url)
+            return pages[url]
+
+        with mock.patch.object(news_crawler, "fetch_list_html", side_effect=fake_fetch):
+            result = news_crawler.collect_list_entries_detailed(source)
+
+        self.assertEqual(result["pages"], 3)
+        self.assertEqual(result["stop_reason"], "done")
+        self.assertEqual(
+            calls,
+            [
+                "https://example.com/list/",
+                "https://example.com/list/index_5.html",
+                "https://example.com/list/index_6.html",
+            ],
+        )
+
+    def test_next_xpath_hash_href_falls_back_to_onclick(self) -> None:
+        source = _source(
+            mode="next",
+            next_url_xpath="//a[@id='more']",
+            stop_after_known_pages=0,
+        )
+        first = _page(("第一页", "2026-01-01", "a1.html")).replace(
+            "</ul>",
+            '</ul><a id="more" href="#" '
+            'onclick="window.location.href=\'index_2.html\'">更多</a>',
+        )
+        second = _page(("第二页", "2026-01-02", "a2.html"))
+        pages = {
+            "https://example.com/list/": first,
+            "https://example.com/list/index_2.html": second,
+        }
+
+        with mock.patch.object(
+            news_crawler,
+            "fetch_list_html",
+            side_effect=lambda url, render: pages[url],
+        ):
+            result = news_crawler.collect_list_entries_detailed(source)
+
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(
+            result["page_urls"][-1],
+            "https://example.com/list/index_2.html",
+        )
+
+    def test_generic_next_anchor_hash_href_falls_back_to_onclick(self) -> None:
+        source = _source(mode="next", stop_after_known_pages=0)
+        first = _page(("第一页", "2026-01-01", "a1.html")).replace(
+            "</ul>",
+            '</ul><a href="#" onclick="window.location.href=\'index_2.html\'">'
+            "下一页</a>",
+        )
+        second = _page(("第二页", "2026-01-02", "a2.html"))
+        pages = {
+            "https://example.com/list/": first,
+            "https://example.com/list/index_2.html": second,
+        }
+
+        with mock.patch.object(
+            news_crawler,
+            "fetch_list_html",
+            side_effect=lambda url, render: pages[url],
+        ):
+            result = news_crawler.collect_list_entries_detailed(source)
+
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(
+            result["page_urls"][-1],
+            "https://example.com/list/index_2.html",
+        )
+
+    def test_next_xpath_attribute_onclick_is_resolved(self) -> None:
+        source = _source(
+            mode="next",
+            next_url_xpath="//a[@id='more']/@onclick",
+            stop_after_known_pages=0,
+        )
+        first = _page(("第一页", "2026-01-01", "a1.html")).replace(
+            "</ul>",
+            '</ul><a id="more" onclick="window.location.href=\'index_2.html\'">'
+            "更多</a>",
+        )
+        second = _page(("第二页", "2026-01-02", "a2.html"))
+        pages = {
+            "https://example.com/list/": first,
+            "https://example.com/list/index_2.html": second,
+        }
+
+        with mock.patch.object(
+            news_crawler,
+            "fetch_list_html",
+            side_effect=lambda url, render: pages[url],
+        ):
+            result = news_crawler.collect_list_entries_detailed(source)
+
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(
+            result["page_urls"][-1],
+            "https://example.com/list/index_2.html",
+        )
+
+    def test_next_xpath_attribute_javascript_prefix_is_resolved(self) -> None:
+        source = _source(
+            mode="next",
+            next_url_xpath="//a[@id='more']/@onclick",
+            stop_after_known_pages=0,
+        )
+        first = _page(("第一页", "2026-01-01", "a1.html")).replace(
+            "</ul>",
+            '</ul><a id="more" onclick="JavaScript:location=\'index_3.html\'">'
+            "更多</a>",
+        )
+        second = _page(("第二页", "2026-01-02", "a2.html"))
+        pages = {
+            "https://example.com/list/": first,
+            "https://example.com/list/index_3.html": second,
+        }
+
+        with mock.patch.object(
+            news_crawler,
+            "fetch_list_html",
+            side_effect=lambda url, render: pages[url],
+        ):
+            result = news_crawler.collect_list_entries_detailed(source)
+
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(
+            result["page_urls"][-1],
+            "https://example.com/list/index_3.html",
+        )
+
+    def test_rendered_page_is_used_for_next_link(self) -> None:
+        source = _source(mode="next", stop_after_known_pages=0)
+        raw = "<html><body></body></html>"
+        rendered = _page(("第一页", "2026-01-01", "a1.html")).replace(
+            "</ul>",
+            '</ul><a href="index_2.html">下一页</a>',
+        )
+        second = _page(("第二页", "2026-01-02", "a2.html"))
+
+        def fake_fetch(url: str, render: bool) -> str:
+            if url == "https://example.com/list/":
+                return raw
+            return second
+
+        with mock.patch.object(
+            news_crawler, "fetch_list_html", side_effect=fake_fetch
+        ), mock.patch.object(
+            news_crawler, "fetch_html_with_browser", return_value=rendered
+        ) as browser:
+            result = news_crawler.collect_list_entries_detailed(source)
+
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(len(result["items"]), 2)
+        self.assertEqual(
+            result["page_urls"][-1],
+            "https://example.com/list/index_2.html",
+        )
+        browser.assert_called_once_with("https://example.com/list/")
+
+    def test_page_with_unknown_date_does_not_trigger_cutoff(self) -> None:
+        source = _source(
+            mode="template",
+            url_template="https://example.com/list/index_{page}.html",
+            total_pages_regex=r"index_(\d+)\.html",
+            start=2,
+            max_pages=2,
+            stop_when_older_than_cutoff=True,
+            stop_after_known_pages=0,
+        )
+        first = _page(
+            ("旧闻", "2023-01-01", "a1.html"),
+            ("日期缺失", "", "a2.html"),
+        )
+        second = _page(("新文章", "2026-01-02", "a3.html"))
+        pages = {
+            "https://example.com/list/": first,
+            "https://example.com/list/index_2.html": second,
+        }
+        cutoff = datetime(2023, 11, 11, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        with mock.patch.object(
+            news_crawler,
+            "fetch_list_html",
+            side_effect=lambda url, render: pages[url],
+        ):
+            result = news_crawler.collect_list_entries_detailed(source, cutoff=cutoff)
+
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(len(result["items"]), 3)
         self.assertEqual(result["stop_reason"], "done")
 
     def test_invalid_pagination_mode_falls_back_to_none(self) -> None:
