@@ -15,22 +15,26 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import hashlib
+import ipaddress
 import json
 import logging
 import re
+import socket
 import sqlite3
 import sys
 import time
 import urllib.error
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 import lxml.html
 from lxml import etree
 
 from gne import GeneralNewsExtractor
+from gne.netguard import UnsafeUrlError, ensure_url_allowed
 from url_extract import (
     BROWSER_FALLBACK_HTTP_CODES,
     close_thread_browser,
@@ -47,7 +51,7 @@ DEFAULT_DB_FILE = "news.db"
 # 锁等待时长与 sqlite3.connect(timeout=...) 保持一致，避免 PRAGMA 把
 # 30s 的连接超时悄悄压成 5s（并发写时更早报 database is locked）。
 DB_BUSY_TIMEOUT_MS = 30000
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS articles (
@@ -60,6 +64,13 @@ CREATE TABLE IF NOT EXISTS articles (
     -- 真实时刻（UTC，YYYY-MM-DD HH:MM:SS）：混时区站点按墙钟比较会错位，
     -- 统一存 UTC 供时间过滤；publish_time 仍是站点本地墙钟，供展示与排序。
     publish_time_utc TEXT,
+    -- 发布时间来源与原始文本：xpath/labeled_text/meta/text/video_meta/detail/list，便于排查站点改版。
+    publish_time_source TEXT,
+    publish_time_raw TEXT,
+    -- 列表页给出的日期，用于与详情日期交叉校验。
+    list_publish_time TEXT,
+    -- 标题来源：article_title_xpath / gne_default。
+    title_source TEXT,
     timezone     TEXT,
     author       TEXT,
     content      TEXT,
@@ -151,10 +162,62 @@ def clean_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
+def has_explicit_year(value: Any) -> bool:
+    """判断日期文本是否自带年份（含解析器支持的两位年份）。"""
+    text = clean_text(value)
+    if re.search(r"(?:19|20)\d{2}", text):
+        return True
+    # parse_datetime 支持 18-03-08 / 18年3月8日 这类两位年份，
+    # 不能把它们当成缺年份的月日再补一次年。
+    return bool(
+        re.search(
+            r"(?<!\d)\d{2}\s*[-/.年]\s*\d{1,2}\s*[-/.月]\s*\d{1,2}\s*日?(?!\d)",
+            text,
+        )
+    )
+
+
+def is_yearless_month_day(value: Any) -> bool:
+    """是否是需要按基准年份补齐的“月日”文本。
+
+    “昨天”“3小时前”等相对时间已由 parse_datetime 解析为完整日期，
+    不能因为文本里没有年份就清空；带两位年份的日期也不算缺年份。
+    """
+    text = clean_text(value)
+    if not text or has_explicit_year(text):
+        return False
+    if re.search(r"刚刚|昨天|前天|\d+\s*(?:分钟|小时|天)前", text):
+        return False
+    return bool(
+        re.search(r"(?<!\d)\d{1,2}\s*[-/.月]\s*\d{1,2}\s*日?", text)
+    )
+
+
+# 详情抽取器报告的来源 -> 落库展示用的三档来源。
+# 解析型来源（meta/json_ld/time_tag）统一归为 meta，避免暴露内部实现细节。
+_PUBLISH_SOURCE_MAP = {
+    "xpath": "xpath",
+    "labeled_text": "labeled_text",
+    "meta": "meta",
+    "json_ld": "meta",
+    "time_tag": "meta",
+    "text": "text",
+    "video_meta": "video_meta",
+}
+
+
+def publish_source_for(raw: str) -> str:
+    """Map a GNE publish-time source to the stored publish_time_source value."""
+    return _PUBLISH_SOURCE_MAP.get(raw, "detail" if raw else "")
+
+
 def parse_datetime(
     value: Any,
     date_format: str | None = None,
     timezone_name: str = "Asia/Shanghai",
+    *,
+    allow_year_adjust: bool = True,
+    reference_year: int | None = None,
 ) -> dt.datetime | None:
     """Parse common Chinese news date strings into an aware datetime."""
     text = clean_text(value)
@@ -163,6 +226,25 @@ def parse_datetime(
 
     tz = get_timezone(timezone_name)
     now = dt.datetime.now(tz)
+
+    def _finalize(parsed: dt.datetime) -> dt.datetime | None:
+        """Reject (or optionally shift) a future date, regardless of parse path."""
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=tz)
+        if parsed > now + dt.timedelta(days=1):
+            if not allow_year_adjust:
+                return None
+            # 文本里自带年份时不能减一年：列表页若给出 2026-11-14 这类
+            # 明确未来日期，减成 2025 会被误判为 old 并永久跳过。
+            # 无年份的月日（09-30）才按“去年”回退。
+            if has_explicit_year(text):
+                LOG.warning("日期 %r 晚于当前时间，保留其显式年份", text)
+                return parsed
+            try:
+                return parsed.replace(year=parsed.year - 1)
+            except ValueError:
+                return None
+        return parsed
 
     # ISO8601 带显式时区（Z / +08:00 / +0800）必须先处理：下面的通用日期正则
     # 会先命中日期时间部分并把尾部的时区偏移丢掉，再套用站点时区，导致
@@ -189,7 +271,7 @@ def parse_datetime(
                     sign
                     * dt.timedelta(hours=int(digits[:2]), minutes=int(digits[2:4]))
                 )
-            return dt.datetime(
+            return _finalize(dt.datetime(
                 int(iso_tz.group("y")),
                 int(iso_tz.group("mo")),
                 int(iso_tz.group("d")),
@@ -198,7 +280,7 @@ def parse_datetime(
                 int(iso_tz.group("s") or 0),
                 micro,
                 tzinfo=parsed_tz,
-            )
+            ))
         except ValueError:
             pass
 
@@ -223,7 +305,7 @@ def parse_datetime(
     if date_format:
         try:
             parsed = dt.datetime.strptime(text, date_format)
-            return parsed.replace(tzinfo=tz)
+            return _finalize(parsed.replace(tzinfo=tz))
         except ValueError:
             pass
 
@@ -246,7 +328,7 @@ def parse_datetime(
         except ValueError:
             pass
         else:
-            return parsed
+            return _finalize(parsed)
 
     # Full year: 2026-08-26 / 2026年8月26日 / 2026-08-26 10:30:00
     full = re.search(
@@ -270,12 +352,7 @@ def parse_datetime(
             )
         except ValueError:
             return None
-        if parsed > now + dt.timedelta(days=1):
-            try:
-                parsed = parsed.replace(year=parsed.year - 1)
-            except ValueError:
-                return None
-        return parsed
+        return _finalize(parsed)
 
     # Month/day only: 08-26 / 8月26日 / 08-26 10:30
     short = re.search(
@@ -284,7 +361,7 @@ def parse_datetime(
         text,
     )
     if short:
-        year = now.year
+        year = reference_year if reference_year is not None else now.year
         try:
             parsed = dt.datetime(
                 year,
@@ -297,17 +374,83 @@ def parse_datetime(
             )
         except ValueError:
             return None
-        if parsed > now + dt.timedelta(days=1):
-            try:
-                parsed = parsed.replace(year=parsed.year - 1)
-            except ValueError:
-                return None
-        return parsed
+        return _finalize(parsed)
 
     try:
-        return dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return _finalize(dt.datetime.fromisoformat(text.replace("Z", "+00:00")))
     except ValueError:
         return None
+
+
+def align_yearless_datetime(
+    value: dt.datetime,
+    reference: dt.datetime,
+    timezone_name: str = "Asia/Shanghai",
+) -> dt.datetime | None:
+    """用可信基准日期的前后年份补齐无年份日期，月日与时分来自 *value*。"""
+    tz = get_timezone(timezone_name)
+    # 无 tzinfo 的 datetime 按站点本地墙钟解释，不依赖进程系统时区。
+    local_value = value.replace(tzinfo=tz) if value.tzinfo is None else value.astimezone(tz)
+    local_reference = (
+        reference.replace(tzinfo=tz) if reference.tzinfo is None else reference.astimezone(tz)
+    )
+    # 无年份日期可能是跨年的：列表日期在 1 月初、详情页写“12月28日”，
+    # 或列表日期在年末、详情页写次年“01月05日”。因此前后各一年都尝试，
+    # 取离基准最近的合法结果，避免把真实发布时间静默换成列表日期。
+    candidates: list[tuple[float, dt.datetime]] = []
+    for year in (
+        local_reference.year - 1,
+        local_reference.year,
+        local_reference.year + 1,
+    ):
+        candidate = (
+            f"{year:04d}-{local_value.month:02d}-{local_value.day:02d} "
+            f"{local_value.hour:02d}:{local_value.minute:02d}:{local_value.second:02d}"
+        )
+        parsed = parse_datetime(candidate, None, timezone_name, allow_year_adjust=False)
+        if parsed is None:
+            continue
+        distance = abs((parsed - local_reference).total_seconds())
+        candidates.append((distance, parsed))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])[1]
+
+
+def parse_yearless_around(
+    raw: str,
+    reference: dt.datetime,
+    timezone_name: str = "Asia/Shanghai",
+) -> dt.datetime | None:
+    """按基准日期前后年份解析无年份月日，取离基准最近的合法结果。
+
+    parse_datetime(..., reference_year=基准年) 遇到“列表日期在 1 月初、
+    详情写去年 12 月”时，会先构造出未来日期并返回 None；这里前后各一年都尝试，
+    取离基准最近的合法结果，避免详情时刻与来源被列表日期整体替代。
+    """
+    tz = get_timezone(timezone_name)
+    local_reference = (
+        reference.replace(tzinfo=tz) if reference.tzinfo is None else reference.astimezone(tz)
+    )
+    candidates: list[tuple[float, dt.datetime]] = []
+    for year in (
+        local_reference.year,
+        local_reference.year - 1,
+        local_reference.year + 1,
+    ):
+        parsed = parse_datetime(
+            raw,
+            None,
+            timezone_name,
+            allow_year_adjust=False,
+            reference_year=year,
+        )
+        if parsed is None:
+            continue
+        candidates.append((abs((parsed - local_reference).total_seconds()), parsed))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])[1]
 
 
 def format_publish_time(value: dt.datetime, timezone_name: str) -> str:
@@ -358,7 +501,17 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     required_indexes |= {"idx_articles_article_id", "idx_crawl_jobs_dedupe"}
     if (
         version >= SCHEMA_VERSION
-        and {"article_id", "timezone", "raw_content", "content_length", "publish_time_utc"} <= columns
+        and {
+            "article_id",
+            "timezone",
+            "raw_content",
+            "content_length",
+            "publish_time_utc",
+            "publish_time_source",
+            "publish_time_raw",
+            "list_publish_time",
+            "title_source",
+        } <= columns
         and required_indexes <= indexes
     ):
         return
@@ -376,6 +529,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     # v6：publish_time_utc 存真实时刻（UTC），修复混时区按墙钟过滤的错位。
     if "publish_time_utc" not in columns:
         conn.execute("ALTER TABLE articles ADD COLUMN publish_time_utc TEXT")
+    # v7：记录发布时间/标题来源，供站点质量统计与问题排查；老行保持 NULL。
+    for column in ("publish_time_source", "publish_time_raw", "list_publish_time", "title_source"):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE articles ADD COLUMN {column} TEXT")
 
     # 分批回填，避免大库一次性 fetchall 占满内存；仍在同一事务内，保证
     # article_id 全部回填后才会置位 user_version。用 rowid 键集分页而不是
@@ -501,20 +658,24 @@ def resolve_config_path(path: str) -> str:
     return path
 
 
-def _validate_title_xpath(name: object, value: object) -> str:
-    """校验手写的 article_title_xpath，把两类常见错误挡在启动期。
+def _validate_xpath_field(name: object, value: object, field_name: str) -> str:
+    """校验手写的 article_title_xpath / article_publish_time_xpath。
 
     - `string(...)` 开头的表达式一律忽略（统一改用元素节点或 /text()）；
-    - 非法 XPath 会在抽取时抛错。
-    元素节点写法（`//h1`）由 TitleExtractor 取 text_content，可拿到完整标题。
+    - 非法 XPath 或 count()/boolean()/string-length() 等标量表达式会被忽略；
+    - 运行时无效的表达式由各抽取器安全跳过，不会中断整篇抽取。
+    元素节点写法（`//h1`）由标题抽取器取 text_content，可拿到完整标题。
     """
     xpath = str(value or "").strip()
     if not xpath:
         return ""
-    if xpath.startswith("string("):
+    if xpath.startswith("string(") or xpath.startswith(
+        ("count(", "boolean(", "string-length(", "number(")
+    ):
         LOG.warning(
-            "站点 %r 的 article_title_xpath 不能写成 %r（请直接写标题元素，如 //h1），已忽略",
+            "站点 %r 的 %s 不能写成 %r（请直接写目标元素，如 //h1），已忽略",
             name,
+            field_name,
             xpath,
         )
         return ""
@@ -522,8 +683,9 @@ def _validate_title_xpath(name: object, value: object) -> str:
         etree.XPath(xpath)
     except Exception as exc:
         LOG.warning(
-            "站点 %r 的 article_title_xpath 不是合法 XPath（%s），已忽略: %r",
+            "站点 %r 的 %s 不是合法 XPath（%s），已忽略: %r",
             name,
+            field_name,
             exc,
             xpath,
         )
@@ -531,8 +693,13 @@ def _validate_title_xpath(name: object, value: object) -> str:
     return xpath
 
 
+def _validate_title_xpath(name: object, value: object) -> str:
+    """兼容旧调用：只校验 article_title_xpath。"""
+    return _validate_xpath_field(name, value, "article_title_xpath")
+
+
 def load_config(path: str) -> dict:
-    """读取 JSON 配置并补齐默认值，同时校验各站点的 article_title_xpath。"""
+    """读取 JSON 配置并补齐默认值，同时校验各站点的字段 XPath。"""
     if not Path(path).exists():
         raise FileNotFoundError(
             f"找不到配置文件 {path}。请参考 README 创建并填写配置文件。"
@@ -546,11 +713,28 @@ def load_config(path: str) -> dict:
     data.setdefault("days", 3)
     data.setdefault("timezone", "Asia/Shanghai")
     data.setdefault("delay", 0.3)
+    data.setdefault("date_skew_days", 7)
     for source in data.get("sources") or []:
-        if isinstance(source, dict) and "article_title_xpath" in source:
-            source["article_title_xpath"] = _validate_title_xpath(
-                source.get("name"), source.get("article_title_xpath")
+        if not isinstance(source, dict):
+            continue
+        for field_name in ("article_title_xpath", "article_publish_time_xpath"):
+            if field_name in source:
+                source[field_name] = _validate_xpath_field(
+                    source.get("name"), source.get(field_name), field_name
+                )
+        source.setdefault("date_skew_days", data["date_skew_days"])
+        try:
+            raw_skew = source["date_skew_days"]
+            if isinstance(raw_skew, bool):
+                raise ValueError("boolean is not a valid day count")
+            source["date_skew_days"] = max(0, min(365, int(raw_skew)))
+        except (TypeError, ValueError):
+            LOG.warning(
+                "站点 %r 的 date_skew_days 不是整数，回退为 7: %r",
+                source.get("name"),
+                source.get("date_skew_days"),
             )
+            source["date_skew_days"] = 7
     return data
 
 
@@ -570,12 +754,19 @@ def xpath_text(node, xpath: str | None) -> str:
         return clean_text(node.text_content())
     if isinstance(values, str):
         return clean_text(values)
+    # count()/number()/string-length() 等表达式返回标量，不能直接迭代。
+    if not isinstance(values, list):
+        values = [values]
     parts = []
     for value in values:
         if isinstance(value, str):
             parts.append(value)
-        elif hasattr(value, "text_content"):
-            parts.append(value.text_content() or "")
+        elif isinstance(getattr(value, "tag", None), str):
+            text_content = getattr(value, "text_content", None)
+            if callable(text_content):
+                parts.append(text_content() or "")
+            else:
+                parts.append("".join(value.itertext()))
     return clean_text(" ".join(parts))
 
 
@@ -586,7 +777,11 @@ def xpath_href(node, xpath: str | None) -> str:
         values = []
     if isinstance(values, str):
         return clean_text(values)
+    if not isinstance(values, list):
+        values = [values]
     for value in values:
+        if not isinstance(value, str):
+            continue
         href = clean_text(value)
         if href and not href.startswith("javascript:"):
             return href
@@ -655,39 +850,537 @@ def parse_list_items(html: str, source: dict, base_url: str) -> list[dict]:
     return items
 
 
-def fetch_list_html(url: str, render: bool) -> str | None:
+def fetch_list_html(
+    url: str,
+    render: bool,
+    *,
+    url_validator: Callable[[str], None] | None = None,
+) -> str | None:
     if render:
-        return fetch_html_with_browser(url)
+        return fetch_html_with_browser(url, url_validator=url_validator)
     try:
-        return fetch_html(url)
+        return fetch_html(url, url_validator=url_validator)
     except urllib.error.HTTPError as exc:
         # 与文章页同一套规则：404/410/500 渲染后仍是同样错误，不值得再启浏览器。
         if exc.code not in BROWSER_FALLBACK_HTTP_CODES:
             LOG.warning("直接抓取列表失败 %s (HTTP %s)，不回退浏览器。", url, exc.code)
             return None
         LOG.warning("直接抓取列表被拒绝 %s (HTTP %s)，尝试浏览器。", url, exc.code)
-        return fetch_html_with_browser(url)
+        return fetch_html_with_browser(url, url_validator=url_validator)
     except Exception as exc:
         LOG.warning("直接抓取列表失败 %s (%s)，尝试浏览器。", url, exc)
-        return fetch_html_with_browser(url)
+        return fetch_html_with_browser(url, url_validator=url_validator)
 
 
-def collect_list_entries(source: dict) -> list[dict]:
-    urls = source.get("list_urls") or [source["list_url"]]
+def _url_origin(value: str) -> tuple[str, str, int] | None:
+    """Return the (scheme, host, port) origin of a configured list URL."""
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower().strip("[]")
+    if scheme not in ("http", "https") or not host:
+        return None
+    try:
+        port = parts.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        return None
+    return scheme, host, port
+
+
+_TRUSTED_ENDPOINT_RETRY_SECONDS = 60.0
+
+
+def _pagination_url_validator(source: dict) -> Callable[[str], None]:
+    """Build an SSRF guard for a site's list pages and browser subrequests.
+
+    配置里的 list_url/list_urls 是唯一可信目标，且必须 scheme + host + port
+    完全一致才允许内网地址。其他目标必须是公网地址，并且只允许 http 80 /
+    https 443。这样攻击者即使改下一页链接，也不能借爬虫访问配置主机的其他
+    端口；同端口无法按路径区分，配置主机本身视为可信。连接层解析出的可信
+    主机 IP 只在与该主机的配置端口组合时放行，不构成独立的 URL 白名单。
+    """
+    configured: list[Any] = list(source.get("list_urls") or [])
+    if source.get("list_url"):
+        configured.append(source["list_url"])
+    trusted_origins: set[tuple[str, str, int]] = set()
+    trusted_ports: dict[str, set[int]] = {}
+    for raw in configured:
+        origin = _url_origin(str(raw))
+        if origin is None:
+            continue
+        _scheme, host, port = origin
+        trusted_origins.add(origin)
+        trusted_ports.setdefault(host, set()).add(port)
+
+    trusted_endpoints: set[tuple[str, int]] = set()
+    resolved = False
+    warned_hosts: set[str] = set()
+    retry_after: dict[str, float] = {}
+
+    def _resolve_trusted_endpoints() -> set[tuple[str, int]]:
+        nonlocal resolved
+        if resolved:
+            return trusted_endpoints
+        failed = False
+        now = time.monotonic()
+        for host, ports in trusted_ports.items():
+            if retry_after.get(host, 0.0) > now:
+                # 解析失败的 host 在冷却期内跳过，避免每个连接都重试并刷日志。
+                failed = True
+                continue
+            try:
+                infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            except OSError as exc:
+                # 解析失败不写入缓存，冷却期后重试；否则一次 DNS 抖动会让
+                # 本次抓取内所有连接层校验都拿不到可信端点。
+                if host not in warned_hosts:
+                    LOG.warning("无法解析可信站点主机 %r 的地址: %s", host, exc)
+                    warned_hosts.add(host)
+                else:
+                    LOG.debug("仍未解析可信站点主机 %r: %s", host, exc)
+                failed = True
+                retry_after[host] = now + _TRUSTED_ENDPOINT_RETRY_SECONDS
+                continue
+            retry_after.pop(host, None)
+            for info in infos:
+                address = str(info[4][0]).split("%", 1)[0]
+                try:
+                    ip = ipaddress.ip_address(address)
+                except ValueError:
+                    continue
+                if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+                    ip = ip.ipv4_mapped
+                for port in ports:
+                    trusted_endpoints.add((str(ip), port))
+        if not failed:
+            resolved = True
+        return trusted_endpoints
+
+    def _validator(target: str) -> None:
+        # allow_private=True 只做格式/凭据/控制字符校验；地址策略在下面自行判断。
+        ensure_url_allowed(target, allow_private=True)
+        try:
+            parts = urlsplit(target)
+        except ValueError as exc:
+            raise UnsafeUrlError(f"URL 格式不合法: {exc}") from exc
+        scheme = parts.scheme.lower()
+        host = (parts.hostname or "").lower().strip("[]")
+        if not host:
+            raise UnsafeUrlError("URL 缺少主机名")
+        try:
+            port = parts.port or (443 if scheme == "https" else 80)
+        except ValueError as exc:
+            raise UnsafeUrlError(f"URL 端口不合法: {exc}") from exc
+        if (scheme, host, port) in trusted_origins:
+            return
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            address = None
+        if address is not None:
+            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+                address = address.ipv4_mapped
+            # 连接层会把可信主机解析出的 IP 以字面量 URL 再校验一次；
+            # 只有与该主机配置端口组合时放行，不构成独立的 URL 白名单。
+            if (str(address), port) in _resolve_trusted_endpoints():
+                return
+        if port not in (80, 443):
+            raise UnsafeUrlError(f"非配置主机只允许 80/443 端口: {target}")
+        if address is not None:
+            if address.is_global:
+                return
+            raise UnsafeUrlError(f"拒绝访问非配置主机的内网地址: {target}")
+        ensure_url_allowed(target, allow_private=False)
+
+    return _validator
+
+
+def _pagination_int(
+    raw: dict[str, Any], name: str, default: int, minimum: int, maximum: int
+) -> int:
+    value = raw.get(name, default)
+    if isinstance(value, bool):
+        LOG.warning("pagination.%s 不能是布尔值，回退为 %d", name, default)
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        LOG.warning("pagination.%s 不是整数（%r），回退为 %d", name, value, default)
+        return default
+    if parsed < minimum or parsed > maximum:
+        LOG.warning(
+            "pagination.%s 超出范围 %d..%d（%r），回退为 %d",
+            name,
+            minimum,
+            maximum,
+            value,
+            default,
+        )
+        return default
+    return parsed
+
+
+def _pagination_bool(raw: dict[str, Any], name: str, default: bool) -> bool:
+    value = raw.get(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    LOG.warning("pagination.%s 不是布尔值（%r），回退为 %s", name, value, default)
+    return default
+
+
+def _pagination_settings(source: dict) -> dict[str, Any]:
+    """返回归一化后的分页配置。
+
+    兼容旧配置：未配置 pagination 时保持 list_urls/list_url 的原有行为。
+    """
+    defaults: dict[str, Any] = {
+        "mode": "none",
+        "url_template": "",
+        "last_url_xpath": "",
+        "next_url_xpath": "",
+        "total_pages_regex": r"(?:index_|page[=/])(\d+)",
+        "start": 1,
+        "max_pages": 50,
+        "stop_when_older_than_cutoff": True,
+        "stop_after_known_pages": 0,
+    }
+    raw = source.get("pagination")
+    if raw is None or source.get("list_urls"):
+        # list_urls 是固定地址列表，pagination 配置不生效；提前返回避免无意义告警。
+        return defaults
+    if not isinstance(raw, dict):
+        LOG.warning("站点 %r 的 pagination 不是对象，已忽略", source.get("name"))
+        return defaults
+
+    mode = str(raw.get("mode") or "none").strip().lower()
+    if mode not in {"auto", "next", "template", "none"}:
+        LOG.warning(
+            "站点 %r 的 pagination.mode=%r 非法（可选 auto/next/template/none），已回退为 none",
+            source.get("name"),
+            raw.get("mode"),
+        )
+        mode = "none"
+    defaults["mode"] = mode
+    defaults["url_template"] = str(raw.get("url_template") or "").strip()
+    if defaults["url_template"] and "{page}" not in defaults["url_template"]:
+        LOG.warning(
+            "站点 %r 的 pagination.url_template 缺少 {page} 占位符，已忽略：%r",
+            source.get("name"),
+            defaults["url_template"],
+        )
+        defaults["url_template"] = ""
+        if mode == "template":
+            defaults["mode"] = "none"
+    defaults["last_url_xpath"] = str(raw.get("last_url_xpath") or "").strip()
+    defaults["next_url_xpath"] = str(raw.get("next_url_xpath") or "").strip()
+    defaults["total_pages_regex"] = str(
+        raw.get("total_pages_regex") or defaults["total_pages_regex"]
+    ).strip()
+    defaults["start"] = _pagination_int(raw, "start", 1, 1, 1000)
+    defaults["max_pages"] = _pagination_int(raw, "max_pages", 50, 1, 500)
+    defaults["stop_when_older_than_cutoff"] = _pagination_bool(
+        raw, "stop_when_older_than_cutoff", True
+    )
+    defaults["stop_after_known_pages"] = _pagination_int(
+        raw, "stop_after_known_pages", 0, 0, 100
+    )
+    return defaults
+
+
+def _max_page_number(text: str, pattern: str) -> int | None:
+    """从 HTML/URL 文本中用正则提取最大的页码。"""
+    if not text or not pattern:
+        return None
+    try:
+        matches = re.findall(pattern, text)
+    except re.error as exc:
+        LOG.warning("total_pages_regex 非法：%s（%s）", pattern, exc)
+        return None
+    numbers: list[int] = []
+    for match in matches:
+        value = match[0] if isinstance(match, tuple) and match else match
+        if isinstance(value, str) and value.isdigit():
+            numbers.append(int(value))
+    return max(numbers) if numbers else None
+
+
+def _max_page_from_html(html: str, source: dict, settings: dict[str, Any]) -> int | None:
+    pattern = str(settings["total_pages_regex"])
+    doc = lxml.html.fromstring(html)
+    last_xpath = str(settings["last_url_xpath"] or "")
+    if last_xpath:
+        try:
+            values = doc.xpath(last_xpath)
+        except Exception as exc:
+            LOG.warning("站点 %r 的 last_url_xpath 无效：%s", source.get("name"), exc)
+            values = []
+        if not isinstance(values, list):
+            values = [values]
+        numbers: list[int] = []
+        for value in values:
+            candidates: list[str] = []
+            if isinstance(value, str):
+                candidates.append(value)
+            elif isinstance(getattr(value, "tag", None), str):
+                for attr in ("href", "onclick", "data-page", "value"):
+                    attr_value = value.get(attr)
+                    if attr_value:
+                        candidates.append(str(attr_value))
+                candidates.append(value.text_content() or "")
+            else:
+                continue
+            for candidate in candidates:
+                text = candidate.strip()
+                if text.isdigit():
+                    numbers.append(int(text))
+                    continue
+                number = _max_page_number(candidate, pattern)
+                if number is not None:
+                    numbers.append(number)
+        if numbers:
+            return max(numbers)
+    return _max_page_number(html, pattern)
+
+
+def _template_page_urls(
+    html: str, page_url: str, source: dict, settings: dict[str, Any]
+) -> list[str]:
+    template = str(settings["url_template"] or "")
+    if not template:
+        return []
+    max_pages = int(settings["max_pages"])
+    detected = _max_page_from_html(html, source, settings)
+    start = int(settings["start"])
+    # max_pages 是包含 list_url 在内的总页数：后续页最多 max_pages-1 个。
+    # 未探测到末页时以 max_pages 为总页数上限；探测到末页时再受末页页码限制。
+    page_limit = detected if detected is not None else start + max_pages
+    urls: list[str] = []
+    page = start
+    while len(urls) < max_pages - 1 and page <= page_limit:
+        try:
+            url = template.format(page=page)
+        except (KeyError, IndexError, ValueError) as exc:
+            LOG.warning(
+                "站点 %r 的 url_template 无法格式化（%s）：%r",
+                source.get("name"),
+                exc,
+                template,
+            )
+            return []
+        if url != page_url:
+            urls.append(url)
+        page += 1
+    return urls
+
+
+def _usable_href(value: Any) -> str:
+    """返回可用链接；空锚点、# 片段和 javascript: 链接都视为无效。"""
+    href = str(value or "").strip()
+    if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+        return ""
+    return href
+
+
+def _onclick_target(value: str) -> str:
+    """从 onclick 属性文本中取出 location.href=... 的目标地址。"""
+    match = re.search(
+        r"(?:window\.)?location(?:\.href)?\s*=\s*"
+        r"(?:encodeURI\()?['\"]([^'\"]+)['\"]",
+        str(value or ""),
+        re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _find_next_page_url(html: str, page_url: str, source: dict, settings: dict[str, Any]) -> str:
+    doc = lxml.html.fromstring(html)
+    next_xpath = str(settings["next_url_xpath"] or "")
+    if next_xpath:
+        try:
+            values = doc.xpath(next_xpath)
+        except Exception as exc:
+            LOG.warning("站点 %r 的 next_url_xpath 无效：%s", source.get("name"), exc)
+            values = []
+        if not isinstance(values, list):
+            values = [values]
+        for value in values:
+            if isinstance(value, str):
+                text = value.strip()
+                onclick_target = _onclick_target(text)
+                if onclick_target:
+                    return urljoin(page_url, onclick_target)
+                href = _usable_href(text)
+                if href and any(token in href for token in ("/", "?", ".html")):
+                    return urljoin(page_url, href)
+                continue
+            if not isinstance(getattr(value, "tag", None), str):
+                continue
+            href = _usable_href(value.get("href"))
+            if href:
+                return urljoin(page_url, href)
+            onclick_target = _onclick_target(str(value.get("onclick") or ""))
+            if onclick_target:
+                return urljoin(page_url, onclick_target)
+            text = clean_text(value.text_content())
+            onclick_target = _onclick_target(text)
+            if onclick_target:
+                return urljoin(page_url, onclick_target)
+            href = _usable_href(text)
+            if href and any(token in href for token in ("/", "?", ".html")):
+                return urljoin(page_url, href)
+
+    for anchor in doc.xpath("//a"):
+        rel = str(anchor.get("rel") or "").lower()
+        text = clean_text(anchor.text_content())
+        lower_text = text.lower()
+        if "next" not in rel and not any(
+            token in lower_text for token in ("下一页", "下页", "后一页", "next")
+        ):
+            continue
+        href = _usable_href(anchor.get("href"))
+        if href:
+            return urljoin(page_url, href)
+        onclick_target = _onclick_target(str(anchor.get("onclick") or ""))
+        if onclick_target:
+            return urljoin(page_url, onclick_target)
+    return ""
+
+
+def collect_list_entries_detailed(
+    source: dict,
+    *,
+    cutoff: dt.datetime | None = None,
+    known_urls: set[str] | None = None,
+) -> dict[str, Any]:
+    """抓取列表页并返回条目、页数与停止原因。
+
+    pagination.mode:
+    - none: 只抓 list_urls/list_url（旧行为）；
+    - template: 抓 list_url 后按 url_template 生成后续页；
+    - next: 按 next_url_xpath 或“下一页”链接跟随；
+    - auto: 有 url_template 时按模板，否则按下一页链接。
+    """
+    settings = _pagination_settings(source)
+    fixed_urls = [str(url) for url in (source.get("list_urls") or [source["list_url"]])]
+    fixed_mode = settings["mode"] == "none" or bool(source.get("list_urls"))
+    pending = list(fixed_urls)
     all_items: list[dict] = []
-    for list_url in urls:
-        render = bool(source.get("render"))
-        html = fetch_list_html(list_url, render)
-        if html:
-            items = parse_list_items(html, source, list_url)
-            if not items and not render:
-                LOG.info("列表解析为空，尝试 Chrome 渲染 %s", list_url)
-                rendered = fetch_html_with_browser(list_url)
-                if rendered:
-                    items = parse_list_items(rendered, source, list_url)
-            all_items.extend(items)
-        time.sleep(float(source.get("delay", 0)))
-    return all_items
+    seen_urls: set[str] = set()
+    visited_pages: set[str] = set()
+    page_urls: list[str] = []
+    pages = 0
+    known_streak = 0
+    fixed_failed = False
+    fixed_empty = False
+    stop_reason = "done"
+    render = bool(source.get("render"))
+    delay = float(source.get("delay", 0))
+    page_validator = _pagination_url_validator(source)
+
+    while pending:
+        page_url = pending.pop(0)
+        if page_url in visited_pages:
+            continue
+        if not fixed_mode and pages >= int(settings["max_pages"]):
+            stop_reason = "max_pages"
+            break
+        visited_pages.add(page_url)
+        html = fetch_list_html(page_url, render, url_validator=page_validator)
+        if not html:
+            if fixed_mode:
+                fixed_failed = True
+                LOG.warning("固定列表页抓取失败，继续下一页：%s", page_url)
+                continue
+            stop_reason = "fetch_failed"
+            break
+        items = parse_list_items(html, source, page_url)
+        if not items and not render:
+            LOG.info("列表解析为空，尝试 Chrome 渲染 %s", page_url)
+            rendered = fetch_html_with_browser(page_url, url_validator=page_validator)
+            if rendered:
+                # 后续找下一页/模板探测必须基于渲染后的 DOM。
+                html = rendered
+                items = parse_list_items(html, source, page_url)
+        pages += 1
+        page_urls.append(page_url)
+        if not items:
+            if fixed_mode:
+                fixed_empty = True
+                LOG.warning("固定列表页没有解析到条目，继续下一页：%s", page_url)
+                continue
+            stop_reason = "empty"
+            break
+        for item in items:
+            url = item["url"]
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            all_items.append(item)
+
+        parsed_dates = [item["parsed"] for item in items if item.get("parsed")]
+        if (
+            not fixed_mode
+            and cutoff is not None
+            and settings["stop_when_older_than_cutoff"]
+            and len(parsed_dates) == len(items)
+            and max(parsed_dates) < cutoff
+        ):
+            stop_reason = "cutoff"
+            break
+
+        if (
+            not fixed_mode
+            and known_urls is not None
+            and int(settings["stop_after_known_pages"]) > 0
+        ):
+            page_known = all(item["url"] in known_urls for item in items)
+            known_streak = known_streak + 1 if page_known else 0
+            if known_streak >= int(settings["stop_after_known_pages"]):
+                stop_reason = "known_pages"
+                break
+
+        if not fixed_mode and settings["mode"] in {"template", "auto"} and settings["url_template"]:
+            if pages == 1:
+                pending.extend(_template_page_urls(html, page_url, source, settings))
+        elif not fixed_mode and settings["mode"] in {"next", "auto"}:
+            next_url = _find_next_page_url(html, page_url, source, settings)
+            if next_url and next_url not in visited_pages:
+                pending.append(next_url)
+            else:
+                stop_reason = "no_next"
+        time.sleep(delay)
+
+    if fixed_mode and not all_items:
+        if fixed_failed:
+            stop_reason = "fetch_failed"
+        elif fixed_empty:
+            stop_reason = "empty"
+    return {
+        "items": all_items,
+        "pages": pages,
+        "page_urls": page_urls,
+        "stop_reason": stop_reason,
+    }
+
+
+def collect_list_entries(
+    source: dict,
+    *,
+    cutoff: dt.datetime | None = None,
+    known_urls: set[str] | None = None,
+) -> list[dict]:
+    """兼容旧调用：只返回条目列表。"""
+    return collect_list_entries_detailed(
+        source, cutoff=cutoff, known_urls=known_urls
+    )["items"]
 
 
 def fetch_article_html(url: str) -> tuple[str, bool] | None:
@@ -720,6 +1413,7 @@ def extract_article(
     *,
     already_rendered: bool = False,
     title_xpath: str = "",
+    publish_time_xpath: str = "",
 ) -> dict | None:
     """用已抓取的 HTML 抽取一篇文章（与 url_extract.extract_article 共用实现）。
 
@@ -736,6 +1430,7 @@ def extract_article(
         allow_browser=True,
         already_rendered=already_rendered,
         title_xpath=title_xpath,
+        publish_time_xpath=publish_time_xpath,
     )
 
 
@@ -747,6 +1442,10 @@ def save_article(
     list_title: str = "",
     title: str = "",
     publish_time: str = "",
+    publish_time_source: str = "",
+    publish_time_raw: str = "",
+    list_publish_time: str = "",
+    title_source: str = "",
     timezone: str = "",
     author: str = "",
     content: str = "",
@@ -778,15 +1477,35 @@ def save_article(
         """
         INSERT INTO articles (
             article_id, source, url, list_title, title, publish_time,
-            publish_time_utc, timezone, author, content, content_length,
-            raw_content, images, status, error, first_seen_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            publish_time_utc, publish_time_source, publish_time_raw,
+            list_publish_time, title_source, timezone, author, content,
+            content_length, raw_content, images, status, error,
+            first_seen_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source, url) DO UPDATE SET
             article_id = excluded.article_id,
             list_title = COALESCE(NULLIF(excluded.list_title, ''), articles.list_title),
             title = COALESCE(NULLIF(excluded.title, ''), articles.title),
             publish_time = COALESCE(NULLIF(excluded.publish_time, ''), articles.publish_time),
-            publish_time_utc = COALESCE(NULLIF(excluded.publish_time_utc, ''), articles.publish_time_utc),
+            publish_time_utc = CASE
+                WHEN excluded.publish_time <> '' THEN excluded.publish_time_utc
+                ELSE articles.publish_time_utc
+            END,
+            -- 来源必须与本次写入的时间绑定：本次没拿到时间（unknown_date）
+            -- 时不能改来源，否则旧时间会挂着新来源。
+            publish_time_source = CASE
+                WHEN excluded.publish_time <> ''
+                THEN COALESCE(NULLIF(excluded.publish_time_source, ''), articles.publish_time_source)
+                ELSE articles.publish_time_source
+            END,
+            -- 原始时间必须与本次写入的 publish_time 同步：回退到列表日期时
+            -- 要显式清掉旧详情原文，否则会出现 source=list 却挂详情原文。
+            publish_time_raw = CASE
+                WHEN excluded.publish_time <> '' THEN excluded.publish_time_raw
+                ELSE articles.publish_time_raw
+            END,
+            list_publish_time = COALESCE(NULLIF(excluded.list_publish_time, ''), articles.list_publish_time),
+            title_source = COALESCE(NULLIF(excluded.title_source, ''), articles.title_source),
             timezone = COALESCE(NULLIF(excluded.timezone, ''), articles.timezone),
             author = COALESCE(NULLIF(excluded.author, ''), articles.author),
             content = COALESCE(NULLIF(excluded.content, ''), articles.content),
@@ -807,6 +1526,10 @@ def save_article(
             title,
             publish_time,
             publish_time_utc,
+            publish_time_source,
+            publish_time_raw,
+            list_publish_time,
+            title_source,
             timezone,
             author,
             content,
@@ -876,6 +1599,12 @@ def process_entry(
         return "skip"
 
     list_date = entry.get("parsed")
+    list_publish_text = format_publish_time(list_date, tz_name) if list_date else ""
+    try:
+        date_skew_days = max(0, min(365, int(source.get("date_skew_days", 7))))
+    except (TypeError, ValueError):
+        date_skew_days = 7
+
     # --force 表示“忽略已抓记录、强制重抓”，因此窗口外条目也不应被直接标 old 短路，
     # 否则 force 对窗口外的历史条目并不生效。
     if list_date and list_date < cutoff and not force:
@@ -884,7 +1613,10 @@ def process_entry(
             source_name,
             url,
             list_title=entry.get("title", ""),
-            publish_time=format_publish_time(list_date, tz_name),
+            publish_time=list_publish_text,
+            publish_time_source="list",
+            publish_time_raw="",
+            list_publish_time=list_publish_text,
             timezone=tz_name,
             status="old",
         )
@@ -901,6 +1633,7 @@ def process_entry(
             source_name,
             url,
             list_title=entry.get("title", ""),
+            list_publish_time=list_publish_text,
             status="error",
             error="抓取 HTML 失败（直接抓取和浏览器回退均失败）",
         )
@@ -912,6 +1645,7 @@ def process_entry(
         url,
         already_rendered=already_rendered,
         title_xpath=source.get("article_title_xpath") or "",
+        publish_time_xpath=source.get("article_publish_time_xpath") or "",
     )
     if result is None:
         save_article(
@@ -919,6 +1653,7 @@ def process_entry(
             source_name,
             url,
             list_title=entry.get("title", ""),
+            list_publish_time=list_publish_text,
             status="no_content",
             error="无法提取正文",
         )
@@ -928,16 +1663,72 @@ def process_entry(
     # content 继续存归一化文本（搜索/摘要/既有下游语义不变），
     # raw_content 存原始换行版本，供正文展示与导出使用。
     raw_content = str(result.get("content") or "").strip()
-    publish_text = clean_text(result.get("publish_time"))
-    publish_dt = parse_datetime(
-        publish_text,
-        None,
-        tz_name,
-    )
-    if publish_dt is None:
-        publish_dt = list_date
-    if publish_dt is not None:
-        publish_text = format_publish_time(publish_dt, tz_name)
+    publish_raw = clean_text(result.get("publish_time"))
+    # 详情日期不允许“未来年份自动减一年”：那会把 2026 年的正文时间
+    # 改成 2025 年，从而错误命中 old。解析失败时交给列表日期兜底。
+    publish_dt = parse_datetime(publish_raw, None, tz_name, allow_year_adjust=False)
+    # 无年份月日按列表日期前后年份取最近结果：列表日期在 1 月初、详情写
+    # 去年 12 月时，只按列表年份解析会得到未来日期并返回 None。
+    around_applied = False
+    if list_date is not None and is_yearless_month_day(publish_raw):
+        around = parse_yearless_around(publish_raw, list_date, tz_name)
+        if around is not None:
+            publish_dt = around
+            around_applied = True
+    raw_publish_source = str(result.get("publish_time_source") or "")
+    publish_source = publish_source_for(raw_publish_source)
+    title_source = str(result.get("title_source") or "gne_default")
+    if title_source not in ("article_title_xpath", "gne_default"):
+        title_source = "gne_default"
+    # 无年份的“09月30日 09:30”先按列表日期补年份，再比较偏差：
+    # 否则 parse_datetime 用当前年生成 2026-09-30，与 2025-09-30 的列表
+    # 日期相差一年，偏差校验会直接换成列表日期并丢掉详情里的 09:30。
+    if (
+        list_date is not None
+        and publish_dt is not None
+        and publish_source != "list"
+        and is_yearless_month_day(publish_raw)
+        and not around_applied
+    ):
+        reconciled = align_yearless_datetime(publish_dt, list_date, tz_name)
+        if reconciled is not None:
+            publish_dt = reconciled
+        else:
+            publish_dt = list_date
+            publish_source = "list"
+    if list_date is not None:
+        if publish_dt is None:
+            publish_dt = list_date
+            publish_source = "list"
+        elif publish_source != "list" and abs(
+            (
+                publish_dt.astimezone(get_timezone(tz_name)).date()
+                - list_date.astimezone(get_timezone(tz_name)).date()
+            ).days
+        ) > date_skew_days:
+            LOG.warning(
+                "文章 %s 详情日期 %s 与列表日期 %s 相差超过 %d 天，改用列表日期",
+                url,
+                publish_dt.isoformat(),
+                list_date.isoformat(),
+                date_skew_days,
+            )
+            publish_dt = list_date
+            publish_source = "list"
+    # 没有可信列表日期时，真正缺少年份的月日不能按当前年猜测；
+    # 相对时间（昨天/3小时前）已经解析为完整日期，必须保留。
+    if (
+        publish_dt is not None
+        and publish_source != "list"
+        and list_date is None
+        and is_yearless_month_day(publish_raw)
+    ):
+        publish_dt = None
+        publish_source = ""
+    publish_text = format_publish_time(publish_dt, tz_name) if publish_dt else ""
+    # 回退到列表日期时，详情原文不再代表当前发布时间，必须清空；
+    # 否则下游会看到 source=list 却挂着一段详情页旧时间文本。
+    publish_raw_for_save = "" if publish_source == "list" else publish_raw
 
     if publish_dt and publish_dt < cutoff:
         save_article(
@@ -947,6 +1738,10 @@ def process_entry(
             list_title=entry.get("title", ""),
             title=clean_text(result.get("title")),
             publish_time=publish_text,
+            publish_time_source=publish_source,
+            publish_time_raw=publish_raw_for_save,
+            list_publish_time=list_publish_text,
+            title_source=title_source,
             timezone=tz_name,
             author=clean_text(result.get("author")),
             status="old",
@@ -960,6 +1755,10 @@ def process_entry(
             url,
             list_title=entry.get("title", ""),
             title=clean_text(result.get("title")),
+            publish_time_source="",
+            publish_time_raw=publish_raw_for_save,
+            list_publish_time=list_publish_text,
+            title_source=title_source,
             content=clean_text(raw_content),
             raw_content=raw_content,
             images=normalize_images_for_update(result.get("images"), url),
@@ -975,6 +1774,10 @@ def process_entry(
         list_title=entry.get("title", ""),
         title=clean_text(result.get("title")),
         publish_time=publish_text,
+        publish_time_source=publish_source,
+        publish_time_raw=publish_raw_for_save,
+        list_publish_time=list_publish_text,
+        title_source=title_source,
         timezone=tz_name,
         author=clean_text(result.get("author")),
         content=clean_text(raw_content),
@@ -1009,10 +1812,32 @@ def run_source(
     try:
         conn = sqlite3.connect(db_path, timeout=DB_BUSY_TIMEOUT_MS / 1000)
         conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
-        entries = collect_list_entries(source)
+        known_urls: set[str] | None = None
+        pagination = _pagination_settings(source)
+        if not force and pagination["mode"] != "none" and not source.get("list_urls"):
+            known_urls = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT url FROM articles WHERE source = ?", (source_name,)
+                )
+            }
+        collected = collect_list_entries_detailed(
+            source, cutoff=cutoff, known_urls=known_urls
+        )
+        entries = collected["items"]
+        LOG.info(
+            "[%s] 列表抓取 %d 页（停止原因：%s），解析 %d 条",
+            source_name,
+            collected["pages"],
+            collected["stop_reason"],
+            len(entries),
+        )
         if not entries:
             counts["list_empty"] = 1
-            LOG.warning("[%s] 列表页没有解析到任何条目。", source_name)
+            if collected["stop_reason"] == "cutoff":
+                LOG.info("[%s] 抓取窗口内没有新条目。", source_name)
+            else:
+                LOG.warning("[%s] 列表页没有解析到任何条目。", source_name)
         else:
             now = dt.datetime.now(get_timezone(source.get("timezone")))
             entries.sort(key=lambda item: item.get("parsed") or now, reverse=True)
@@ -1156,7 +1981,8 @@ def cmd_test(args: argparse.Namespace) -> None:
             source = {**config, **raw_source}
             print(f"\n===== {source['name']} =====")
             try:
-                entries = collect_list_entries(source)
+                collected = collect_list_entries_detailed(source)
+                entries = collected["items"]
                 for entry in entries[: args.limit]:
                     parsed = entry.get("parsed")
                     date_show = (
@@ -1167,7 +1993,10 @@ def cmd_test(args: argparse.Namespace) -> None:
                     title = entry["title"]
                     url = entry["url"]
                     print(f"{date_show:<20} {title[:50]:<52} {url}")
-                print(f"共解析到 {len(entries)} 条")
+                print(
+                    f"共解析到 {len(entries)} 条（{collected['pages']} 页，"
+                    f"停止原因：{collected['stop_reason']}）"
+                )
             except Exception as exc:
                 LOG.exception("测试站点失败：%s", exc)
     finally:

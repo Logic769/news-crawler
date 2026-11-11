@@ -118,9 +118,15 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _ip_literal_url(ip: str) -> str:
+def _ip_literal_url(ip: str, *, port: int | None = None, scheme: str = "https") -> str:
+    """构造仅用于地址校验的 IP 字面量 URL。
+
+    连接层校验必须带上真实 scheme 与 port：可信端点按 (IP, 配置端口) 登记，
+    固定成 https:443 会让 http 或非 443 端口的内网列表站点被误拒。
+    """
     host = f"[{ip}]" if ":" in ip else ip
-    return f"https://{host}/"
+    suffix = "" if port is None else f":{port}"
+    return f"{scheme}://{host}{suffix}/"
 
 
 def _validated_create_connection(
@@ -131,6 +137,7 @@ def _validated_create_connection(
     *,
     ssl_context: ssl.SSLContext | None = None,
     server_hostname: str | None = None,
+    scheme: str = "https",
 ):
     """解析一次主机并在连接前校验「即将连接的那个 IP」。
 
@@ -144,8 +151,8 @@ def _validated_create_connection(
     last_error: Exception | None = None
     for family, socktype, proto, _canon, sockaddr in infos:
         ip = str(sockaddr[0]).split("%", 1)[0]
-        # 用 IP 字面量 URL 复用同一套地址策略校验该 IP 是否为公网地址。
-        url_validator(_ip_literal_url(ip))
+        # 用带真实 scheme/port 的 IP 字面量 URL 复用同一套地址策略校验该 IP。
+        url_validator(_ip_literal_url(ip, port=port, scheme=scheme))
         sock = socket.socket(family, socktype, proto)
         sock.settimeout(timeout)
         try:
@@ -181,7 +188,7 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
 
     def connect(self) -> None:
         self.sock = _validated_create_connection(
-            self.host, self.port, self.timeout, self._url_validator
+            self.host, self.port, self.timeout, self._url_validator, scheme="http"
         )
 
 
@@ -199,6 +206,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             self._url_validator,
             ssl_context=context,
             server_hostname=self.host,
+            scheme="https",
         )
 
 
@@ -429,6 +437,7 @@ def extract_video_meta(html_text: str, url: str) -> dict | None:
         "title": title,
         "author": author,
         "publish_time": publish,
+        "publish_time_source": "video_meta" if publish else "",
         "content": content,
         "images": normalize_images([image], url) if image else [],
         "is_video": True,
@@ -538,12 +547,11 @@ def fetch_html_with_browser(
         )
         page = context.new_page()
         if url_validator is not None:
-            # 浏览器自行导航、跟随重定向，绕过 fetch_html 的校验；在请求级别
-            # 再校验所有 http(s) 请求（含图片/XHR/fetch），拦截 3xx/JS 跳转或
-            # 页面子资源指向内网/云元数据地址造成的 SSRF。按 host 缓存校验结果，
-            # 避免同一页面的大量子资源重复做 DNS 解析。
-            _host_ok: dict[str, bool] = {}
-
+            # 浏览器自行导航、跟随重定向，绕过 fetch_html 的连接级校验；在请求
+            # 级别逐个 http(s) 请求（含图片/XHR/fetch）调用 url_validator，拦截
+            # 3xx/JS 跳转或子资源指向内网/云元数据地址。这里刻意不做 host 级
+            # 布尔缓存：DNS 答案可能在页面生命周期内变化，缓存会让后续请求
+            # 继续复用旧的放行结果，扩大 DNS rebinding 窗口。
             def _guard(route):  # noqa: ANN001
                 request = route.request
                 try:
@@ -555,21 +563,10 @@ def fetch_html_with_browser(
                     # data:/blob:/about: 等本地资源不会发起网络请求，直接放行。
                     route.continue_()
                     return
-                host = (parts.hostname or "").lower()
-                if not host:
-                    route.abort()
-                    return
-                if host not in _host_ok:
-                    try:
-                        url_validator(request.url)
-                    except Exception as exc:
-                        LOG.warning(
-                            "浏览器请求目标被拒绝（%s）：%s", exc, request.url
-                        )
-                        _host_ok[host] = False
-                    else:
-                        _host_ok[host] = True
-                if not _host_ok[host]:
+                try:
+                    url_validator(request.url)
+                except Exception as exc:
+                    LOG.warning("浏览器请求目标被拒绝（%s）：%s", exc, request.url)
                     route.abort()
                     return
                 route.continue_()
@@ -878,6 +875,7 @@ def extract_from_html(
     url_validator: Callable[[str], None] | None = None,
     already_rendered: bool = False,
     title_xpath: str = "",
+    publish_time_xpath: str = "",
 ) -> dict | None:
     """Extract one article already-fetched HTML (shared by CLI and crawler).
 
@@ -892,7 +890,11 @@ def extract_from_html(
             return video
 
     try:
-        result = extractor.extract(html, title_xpath=title_xpath)
+        result = extractor.extract(
+            html,
+            title_xpath=title_xpath,
+            publish_time_xpath=publish_time_xpath,
+        )
     except NoContentException:
         result = None
 
@@ -919,7 +921,11 @@ def extract_from_html(
                 return None
             html = rendered
             try:
-                result = extractor.extract(html, title_xpath=title_xpath)
+                result = extractor.extract(
+                    html,
+                    title_xpath=title_xpath,
+                    publish_time_xpath=publish_time_xpath,
+                )
             except NoContentException:
                 result = None
             if result is None:
@@ -943,6 +949,7 @@ def extract_article(
     allow_browser: bool = True,
     url_validator: Callable[[str], None] | None = None,
     title_xpath: str = "",
+    publish_time_xpath: str = "",
 ) -> dict | None:
     """抓取单个 URL 并抽取正文；必要时回退浏览器，失败或正文为空时返回 None。"""
     LOG.info("正在抓取: %s", url)
@@ -981,6 +988,7 @@ def extract_article(
         url_validator=url_validator,
         already_rendered=already_rendered,
         title_xpath=title_xpath,
+        publish_time_xpath=publish_time_xpath,
     )
 
 

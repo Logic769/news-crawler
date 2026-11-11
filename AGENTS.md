@@ -257,16 +257,51 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | --- | --- | --- |
 | `name` | 是 | 站点唯一标识，同时作为数据库 `source` 字段 |
 | `list_url` | 二选一 | 列表页地址 |
-| `list_urls` | 二选一 | 多个列表页地址（分页场景） |
+| `list_urls` | 二选一 | 多个固定列表页地址（旧版分页方式；单 `list_url` 站点优先用 `pagination`） |
 | `item_xpath` | 是 | 每条新闻节点的 XPath |
 | `title_xpath` | 否 | 默认第一个 `a` 的文本 |
 | `url_xpath` | 否 | 默认第一个 `a` 的 `href` |
 | `date_xpath` | 否 | 默认从整条节点文本中自动识别日期 |
 | `date_format` | 否 | 指定 `strptime` 格式 |
 | `article_title_xpath` | 否 | 详情页标题 XPath（`<title>` 是站点名、真标题在正文 h1 时使用）；推荐直接写标题元素（如 `//h1`），会取其全部文本（含 `<em>` 等子元素）；`/text()` 只取第一个直接文本节点，标题含子标签时会截断；以 `string(` 开头的表达式会被忽略 |
+| `article_publish_time_xpath` | 否 | 详情页发布时间 XPath；推荐直接写日期元素（如 `//p[contains(@class,'article__subTitle')]/span[1]`）；以 `string(` 开头或非法表达式会被忽略 |
+| `date_skew_days` | 否 | 详情日期与列表日期允许相差的天数，默认 7，范围 0–365；超过时改用列表日期 |
+| `pagination` | 否 | 自动分页配置对象，见下方“自动分页”；只对单个 `list_url` 生效，配置 `list_urls` 时仍按固定地址列表抓取 |
 | `timezone` | 否 | 默认 `Asia/Shanghai` |
 | `render` | 否 | 列表页是否强制 Chrome 渲染 |
 | `delay` | 否 | 请求间隔秒数，默认 0.3；列表页与文章详情页请求前都会等待 |
+
+### 自动分页
+
+`pagination` 仅作用于单个 `list_url`；配置了 `list_urls` 的站点保持旧的固定地址列表行为（不受 `max_pages`/`stop_when_older_than_cutoff` 影响）。默认 `mode=none`。
+
+```json
+"pagination": {
+  "mode": "template",
+  "url_template": "https://example.com/news/index_{page}.html",
+  "total_pages_regex": "index_(\\d+)\\.html",
+  "start": 2,
+  "max_pages": 50,
+  "stop_when_older_than_cutoff": true,
+  "stop_after_known_pages": 0
+}
+```
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `mode` | `none` | `none` 只抓 `list_url`；`template` 按 `url_template` 生成后续页；`next` 跟随“下一页”链接；`auto` 有模板用模板，否则跟随下一页 |
+| `url_template` | 空 | 页码模板，必须包含 `{page}`；缺少占位符时 `template` 模式回退为只抓首页，`auto` 模式改走下一页 |
+| `last_url_xpath` | 空 | 尾页链接 XPath；命中元素时读取 href/onclick/data-page/value 和文本作为候选，最终取最大页码（`data-page="12"` 这类纯数字直接作为页码）；不填时从整页 HTML 用 `total_pages_regex` 探测 |
+| `next_url_xpath` | 空 | “下一页”链接 XPath；支持相对地址与常见 `onclick=location.href=...` 写法 |
+| `total_pages_regex` | `(?:index_\|page[=/])(\\d+)` | 提取最大页码的正则，捕获组必须是数字（表格中 `\\|` 表示正则里的或） |
+| `start` | `1` | 模板模式从第几页开始生成后续页（第 1 页始终是 `list_url`，通常设 2）；范围 1–1000 |
+| `max_pages` | `50` | 最多抓取页数（含 `list_url` 计 1 页，后续页最多 `max_pages-1` 个）；范围 1–500 |
+| `stop_when_older_than_cutoff` | `true` | 当前页最晚日期早于抓取窗口起点时停止翻页（整页每条都能解析出日期且都早于窗口才停，避免置顶旧文或缺失日期导致漏抓） |
+| `stop_after_known_pages` | `0` | 连续 N 页链接都已入库时停止（增量运行）；范围 0–100，默认 0 关闭；仅 template/next/auto 模式生效。开启后若上次运行更后页失败，可能提前停止，建议确认完整抓取后再开 |
+
+未配置 `render: true` 时，列表页解析为空会自动用 Chrome 渲染一次，并基于渲染后的 DOM 重新解析与继续翻页。自动分页在页内按 URL 去重；`test` 命令输出页数与停止原因（`cutoff`/`known_pages`/`no_next`/`max_pages`/`empty`/`fetch_failed`/`done`）。实现入口：`collect_list_entries_detailed(source, *, cutoff=None, known_urls=None) -> dict`，返回 `items/pages/page_urls/stop_reason`；`collect_list_entries` 保留旧返回类型。
+
+自动分页会为列表页启用 SSRF 地址白名单：配置的 `list_url`/`list_urls` 是唯一可信目标，且要求 scheme + host + port 完全一致；其他目标必须是公网地址，并且只允许 http 80 / https 443 端口。指向配置主机其他端口的链接会被拒绝；同端口无法按路径区分，配置主机本身视为可信。带地址校验的列表页请求为直连（不读取 `HTTP(S)_PROXY`），文章详情页保持原有代理行为。浏览器回退时每个请求都会重新校验，但 Playwright 自行解析 DNS，无法像 HTTP 路径那样在连接层钉扎 IP，残余 DNS rebinding 风险需由出口网络策略兜底。
 
 ### XPath 编写约定
 
@@ -304,6 +339,10 @@ CREATE TABLE IF NOT EXISTS articles (
     title         TEXT,            -- GNE 抽取标题
     publish_time  TEXT,            -- 统一为 YYYY-MM-DD HH:MM:SS（站点本地墙钟，供展示/排序）
     publish_time_utc TEXT,         -- 真实时刻 UTC 墙钟串，供跨时区时间过滤；缺 timezone 的历史行为 NULL
+    publish_time_source TEXT,      -- 发布时间来源：xpath/labeled_text/meta/text/video_meta/detail/list
+    publish_time_raw TEXT,         -- 详情页抽取到的发布时间文本（XPath 场景可能是日期子串）
+    list_publish_time TEXT,        -- 列表页给出的日期，用于与详情日期交叉校验
+    title_source TEXT,             -- 标题来源：实际命中 article_title_xpath，否则 gne_default
     timezone      TEXT,            -- 写入时的站点时区，历史行可能为空
     author        TEXT,
     content       TEXT,            -- 正文纯文本（clean_text 归一化，段落换行被压成空格）
@@ -332,7 +371,7 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 
 索引：`source`、`status`、`publish_time`、`article_id`（唯一），以及四条查询性能覆盖索引：`(status, publish_time DESC, source, url)`、`(status, updated_at DESC, source, url)` 供列表分页、`(source, publish_time DESC, updated_at DESC, timezone, status)` 供 `/v1/sources` 聚合、`publish_time_utc` 供真实时刻过滤；`crawl_jobs` 的 `status`、`created_at`、`(type, payload, status)` 去重索引。
 
-旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 6`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、`timezone`、v4 的 `raw_content`（只补列，原文已不可得，历史行不回填）、v5 的 `content_length`（补列后按 `length(content)` 回填 NULL 行）与 v6 的 `publish_time_utc`（补列后按每行 `timezone` 换算 UTC 回填，供混时区按真实时刻过滤），按 rowid 键集分页（每批 2000 行）回填 `article_id`，不边读游标边 UPDATE 同表；再补建唯一索引、去重索引与四条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这些，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外）。迁移早退条件校验五列齐全且 `required_indexes`（四条性能索引 + `idx_articles_article_id` + `idx_crawl_jobs_dedupe`）齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
+旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 7`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、`timezone`、v4 的 `raw_content`（只补列，原文已不可得，历史行不回填）、v5 的 `content_length`（补列后按 `length(content)` 回填 NULL 行）、v6 的 `publish_time_utc`（补列后按每行 `timezone` 换算 UTC 回填，供混时区按真实时刻过滤）与 v7 的 `publish_time_source`/`publish_time_raw`/`list_publish_time`/`title_source`（只补列，历史行为 NULL），按 rowid 键集分页（每批 2000 行）回填 `article_id`，不边读游标边 UPDATE 同表；再补建唯一索引、去重索引与四条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这些，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外）。迁移早退条件校验九列齐全且 `required_indexes`（四条性能索引 + `idx_articles_article_id` + `idx_crawl_jobs_dedupe`）齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
 
 ### 7.2 status 语义
 
@@ -352,6 +391,8 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 - 同一 `(source, url)` 使用 upsert，不会产生重复记录；
 - `save_article()` 是**部分更新**：空字符串表示“这次没拿到”，不会覆盖库中已有值，因此抓取失败或重新分类时只更新 `status`/`error`，已成功入库的正文不会被清空；`images` 例外地区分三态：`None` 保留旧值、`[]` 明确清空、非空列表覆盖；抓取流程用 `normalize_images_for_update` 把"抽取不到图"归一为 `None`（保留旧值），只有显式传 `[]` 才清空，避免成功重抓因抽取失败抹掉历史图片；
 - `timezone` 随文章落库，读取时优先使用该列，旧行（NULL）才回落到当前配置推断；`publish_time_utc` 存真实时刻（UTC），`published_from`/`published_to` 按它过滤以消除混时区偏差，`publish_time_utc` 为 NULL/空串的历史行回退旧的 `publish_time` 墙钟比较；列表排序仍按 `publish_time` 墙钟；
+- 详情页日期晚于当前时间超过 1 天时视为不可信（不再自动减一年），回退列表日期；列表日期也缺失时记 `unknown_date`；`date_skew_days` 范围为 0–365；GNE 文本扫描可能只抽到“09月30日”这类无年份日期：主抓取路径优先用列表日期的年份补齐，列表日期也缺失时记 `unknown_date`；API 单 URL extract 无列表日期可交叉校验时同样记 `unknown_date`，不按当前年猜测；
+- `old` 分支的 `publish_time_source` 取决于判定时机：列表阶段就确认超出窗口时记 `list`；详情抓取后才发现超出窗口时保留详情来源（`xpath`/`labeled_text`/`meta`/`text`）。`publish_time_raw` 与当前 `publish_time` 同步：回退到列表日期时清空，不再保留旧详情原文；`unknown_date` 本次没有可信发布时间，新插入行会保留本次抽取文本便于排查，已有行则保留旧值与旧时间配对；新行的 `publish_time_source` 为空字符串，已有行保留旧来源，避免旧时间挂新来源；
 - `article_id` 由 `sha256(source + \x1f + url)` 派生，不随数据库重建变化，可安全作为下游引用；
 - SQLite 启用 WAL 与 `busy_timeout=30000`（`DB_BUSY_TIMEOUT_MS`，与连接 timeout 一致，不用 5s 覆盖 30s 连接超时），API 作业默认单 worker 写入；只读查询使用 `file:...?mode=ro` URI（路径会转义），WAL 库仍要求目录可写（需要 -shm/-wal）。
 
@@ -504,9 +545,15 @@ curl http://localhost:8000/v1/health
 | `regression/baseline_utils.py` | 抽取单个样本的稳定指纹（正文取 sha1 而非全文；meta 存键列表 + 排序后 JSON 的 sha1，避免基线文件膨胀） |
 | `regression/generate_baseline.py` | 重新生成基线：`python -X utf8 -m regression.generate_baseline`（必须用 `-m`；直接跑脚本时 `sys.path` 指向 `regression/`，`from regression.baseline_utils import ...` 会失败） |
 | `regression/test_gne_regression.py` | 3 个用例：全部样本与基线一致、基线可复现、样本集合与基线匹配 |
-| `regression/test_list_page.py` | 3 个用例：列表页解析的条目定位、feature 缺失、少于 4 条时不回退 |
-| `regression/test_video_detection.py` | 5 个用例：路径规则、`og:type`、JSON-LD `VideoObject`、文章内嵌视频不误判 |
-| `regression/test_backfill.py` | 14 个用例：候选 skip/limit（含真实 SQLite）、LIMIT 下推与游标提前停止、游标异常关闭、失败清单列清洗、BOM 跳过清单、`--skip-file` 条目在下次失败清单中保留、`--failed-list` 指向数据库/目录/硬链接/符号链接/未创建的 WAL·SHM 侧车路径时抓取前返回 2、正常清单文件不误杀 |
+| `regression/test_list_page.py` | 7 个用例：列表页解析的条目定位、feature 缺失、少于 4 条时不回退、`count()`/`number()`/`boolean()` 等标量 XPath 在 `xpath_text`/`xpath_href` 中返回空而不崩溃 |
+| `regression/test_video_detection.py` | 7 个用例：路径规则、`og:type`、JSON-LD `VideoObject`、文章内嵌视频不误判 |
+| `regression/test_backfill.py` | 15 个用例：候选 skip/limit（含真实 SQLite）、LIMIT 下推与游标提前停止、游标异常关闭、失败清单列清洗、BOM 跳过清单、`--skip-file` 条目在下次失败清单中保留、`--failed-list` 指向数据库/目录/硬链接/符号链接/未创建的 WAL·SHM 侧车路径时抓取前返回 2、正常清单文件不误杀 |
+| `regression/test_time_extractor.py` | 34 个用例：标签日期优先于正文、XPath 元素/字符串/多值、多日期按文本位置取最早、无效 ISO 候选跳过、脚本与页脚排除、兄弟/嵌套行内节点拼接、块级边界、表格单元格（`td`/`th`）标签日期与不跨 `<tr>`、停止词、dateUpdate 兜底、拆分年份重建 |
+| `regression/test_parse_datetime.py` | 16 个用例：中文/数字/相对日期、ISO 偏移、未来日期与年份调整、reference_year 指定年份、无年份日期按基准年补齐、跨年无年份日期取最近合法年份、闰日落非闰年返回 None |
+| `regression/test_publish_source.py` | 2 个用例：GNE 内部来源映射到落库值、视频页 meta 来源标记 |
+| `regression/test_process_entry_dates.py` | 17 个用例：未来/超 skew 详情日期回退列表、跨 UTC 日期边界、无年份按列表年补齐、跨年无年份日期取上一年并保留时刻、跨年正方向（列表年末+详情次年）保留时刻、未来无年份日期按列表年补齐、无列表日期记 unknown_date、title_source 归一、skew 钳制、unknown_date 不覆盖旧来源 |
+| `regression/test_extract_job_dates.py` | 7 个用例：API extract 作业超 skew 回退库内列表日期、无年份兜底、跨年无年份取上一年、跨年正方向保留时刻、详情不可解析兜底、无列表日期记 unknown_date |
+| `regression/test_pagination.py` | 39 个用例：模板分页按截止日期停止、模板生成后续页、max_pages 含首页语义、last_url_xpath 多候选取最大页码、跟随 onclick/忽略 # 锚点、渲染后 DOM 找下一页、未知日期不触发 cutoff、已入库页连续早停、旧 list_urls 行为、非法 mode 回退、固定列表忽略 max_pages/分页配置/cutoff、固定页抓取失败不误报、固定列表全空报 empty、置顶旧文不提前停、next XPath 无 href 文本忽略、next XPath 属性 onclick 解析（含 JavaScript: 前缀）、模板缺 {page} 回退、collect_list_entries 包装、分页 URL SSRF 校验（可信内网主机/可信主机 DNS 解析出的内网 IP/公网 IP/未信任私网拒绝）、连接层 IP 字面量保留 scheme+port（`_PinnedHTTPConnection`/`_PinnedHTTPSConnection` 的 `connect` 真实路径）、可信端点 DNS 失败冷却后重试、列表抓取确实收到 validator |
 
 运行方式：`python -X utf8 -m unittest discover -s regression -t . -p "test_*.py" -v`（约 15 秒，无需网络）。
 
@@ -616,7 +663,16 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 - `fetch_html_with_browser(url) -> str | None`：失败返回 `None`；
 - `content_needs_render(content: str) -> bool`：True 表示需要浏览器渲染（空、短于 100 字、或含加载占位词）；
 - `content_is_too_short(content: str) -> bool`：True 表示正文短于 `MIN_CONTENT_LENGTH`（100 字）；
-- `extract_article(url, extractor, *, allow_browser: bool = True, url_validator=None, title_xpath: str = "") -> dict | None`：单 URL 完整流程；`allow_browser=False` 时禁用浏览器渲染回退（API 的 extract 默认如此）；`title_xpath` 透传给 GNE 标题抽取（crawler 与 API extract 作业共用）；
+- `extract_article(url, extractor, *, allow_browser: bool = True, url_validator=None, title_xpath: str = "", publish_time_xpath: str = "") -> dict | None`：单 URL 完整流程；`allow_browser=False` 时禁用浏览器渲染回退（API 的 extract 默认如此）；`title_xpath`/`publish_time_xpath` 透传给 GNE 抽取（crawler 与 API extract 作业共用）；
+- `TitleExtractor.extract_with_source(element, title_xpath: str = "") -> tuple[str, str]`：返回 `(title, title_source)`，`title_source` 为 `article_title_xpath`（配置的 XPath 实际命中）或 `gne_default`；
+- `TimeExtractor.extract_with_source(element, publish_time_xpath: str = "") -> tuple[str, str]`：返回 `(publish_time, source)`，`source` 为 `xpath`/`labeled_text`/`meta`/`json_ld`/`time_tag`/`text` 等内部来源；
+- `publish_source_for(raw: str) -> str`：把 GNE 内部来源映射为落库值 `xpath`/`labeled_text`/`meta`/`text`/`video_meta`/`detail`/`list`，未知值记 `detail`；
+- `parse_datetime(value, fmt=None, timezone_name="Asia/Shanghai", *, allow_year_adjust: bool = True, reference_year: int | None = None) -> dt.datetime | None`：解析中文/数字/相对/ISO 日期；`reference_year` 用于无年份月日按指定年份补齐，避免当前年构造出未来日期；
+- `collect_list_entries_detailed(source, *, cutoff: dt.datetime | None = None, known_urls: set[str] | None = None) -> dict[str, Any]`：抓取列表页并返回 `items/pages/page_urls/stop_reason`，支持 `pagination` 的 template/next/auto 模式；`collect_list_entries` 保留只返回条目的旧签名；
+- `has_explicit_year(value: Any) -> bool`：日期文本是否自带年份（19xx/20xx 四位或 `18-03-08` 这类两位年份）；用于判断能否安全按当前年或列表日期年份补齐；
+- `is_yearless_month_day(value: Any) -> bool`：是否是需要按基准年份补齐的“月日”文本；排除“昨天/前天/N 分钟前/小时前/天前”等相对时间与自带年份的日期；
+- `parse_yearless_around(raw: str, reference: dt.datetime, timezone_name: str = "Asia/Shanghai") -> dt.datetime | None`：按基准日期的前一年、当年与下一年分别解析无年份月日，取离基准最近的合法结果（覆盖列表日期在 1 月初/年末两个方向的跨年场景；`parse_datetime(reference_year=当年)` 会因未来日期返回 None）；
+- `align_yearless_datetime(value: dt.datetime, reference: dt.datetime, timezone_name: str = "Asia/Shanghai") -> dt.datetime | None`：用 `reference` 前一年、当年与下一年重建无年份日期的月日时分并复算，取离基准最近的合法结果（支持列表日期在 1 月初或年末两个方向的跨年场景）；非法日期（如 2 月 29 日遇上非闰年）返回 `None`；
 - `GeneralNewsExtractor.extract(html, **kwargs) -> dict`：正文抽取入口；实例无跨调用可变状态，可跨线程复用（每次 extract 内部新建 ContentExtractor）；
 - `create_app(settings=None) -> FastAPI`：API 应用工厂，测试可注入独立设置；
 - `article_id_for(source, url) -> str`：稳定文章 ID，改动会破坏下游引用；

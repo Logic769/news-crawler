@@ -85,6 +85,10 @@ class ArticleOut(BaseModel):
     published_at: str | None = None
     published_at_utc: str | None = None
     published_raw: str
+    publish_time_source: str = ""
+    publish_time_raw: str = ""
+    list_publish_time: str = ""
+    title_source: str = ""
     timezone: str
     content: str | None = None
     # 保留段落换行的原始正文：只在详情返回，列表接口（include_content=false）为 null。

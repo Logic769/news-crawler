@@ -140,6 +140,16 @@ def row_to_article(
         "published_at": iso_or_none(row["publish_time"], tz_name),
         "published_at_utc": utc_iso_or_none(row["publish_time"], tz_name),
         "published_raw": row["publish_time"] or "",
+        "publish_time_source": (row["publish_time_source"] or "")
+        if "publish_time_source" in keys
+        else "",
+        "publish_time_raw": (row["publish_time_raw"] or "")
+        if "publish_time_raw" in keys
+        else "",
+        "list_publish_time": (row["list_publish_time"] or "")
+        if "list_publish_time" in keys
+        else "",
+        "title_source": (row["title_source"] or "") if "title_source" in keys else "",
         "timezone": tz_name,
         "content": content if include_content else None,
         # 保留段落换行的原始正文；与 content 一样只在详情（include_content）中返回。
@@ -229,12 +239,14 @@ def query_articles(
         if include_content:
             columns = (
                 "article_id, source, url, list_title, title, publish_time, timezone, "
+                "publish_time_source, publish_time_raw, list_publish_time, title_source, "
                 "author, content, COALESCE(content_length, length(content)) AS content_length, "
                 "images, status, error, first_seen_at, updated_at"
             )
         else:
             columns = (
                 "article_id, source, url, list_title, title, publish_time, timezone, "
+                "publish_time_source, publish_time_raw, list_publish_time, title_source, "
                 "author, COALESCE(content_length, length(content)) AS content_length, "
                 "images, status, error, first_seen_at, updated_at"
             )
@@ -279,7 +291,8 @@ def get_article(
     with read_connection(db_path) as conn:
         row = conn.execute(
             "SELECT article_id, source, url, list_title, title, publish_time, "
-            "timezone, author, content, content_length, raw_content, images, "
+            "timezone, publish_time_source, publish_time_raw, list_publish_time, "
+            "title_source, author, content, content_length, raw_content, images, "
             "status, error, first_seen_at, updated_at "
             "FROM articles WHERE article_id = ?",
             (article_id,),

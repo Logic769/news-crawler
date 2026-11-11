@@ -266,13 +266,30 @@ def main() -> None:
                 "idx_articles_status_updated",
             }
             if not required_upgraded <= upgraded:
-                raise AssertionError(f"v2 -> v5 upgrade missed indexes: {upgraded}")
+                raise AssertionError(f"v2 -> v7 upgrade missed indexes: {upgraded}")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(articles)")}
-            for required_column in ("raw_content", "content_length"):
+            for required_column in (
+                "raw_content",
+                "content_length",
+                "publish_time_source",
+                "publish_time_raw",
+                "list_publish_time",
+                "title_source",
+            ):
                 if required_column not in columns:
                     raise AssertionError(
-                        f"v2 -> v5 upgrade missed {required_column}: {columns}"
+                        f"v2 -> v7 upgrade missed {required_column}: {columns}"
                     )
+            legacy_row = conn.execute(
+                "SELECT publish_time_source, publish_time_raw, "
+                "list_publish_time, title_source FROM articles LIMIT 1"
+            ).fetchone()
+            if legacy_row is None:
+                raise AssertionError("v2 -> v7 upgrade lost legacy article row")
+            if any(value is not None for value in legacy_row):
+                raise AssertionError(
+                    f"v2 -> v7 upgrade should leave new columns NULL: {legacy_row}"
+                )
             current = int(conn.execute("PRAGMA user_version").fetchone()[0])
             if current != SCHEMA_VERSION:
                 raise AssertionError(

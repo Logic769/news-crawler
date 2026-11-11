@@ -258,13 +258,23 @@ curl "http://localhost:8000/v1/articles?status=all&page_size=50"
 | `published_at` | 带时区的 ISO 8601 发布时间，例如 `2026-10-30T10:00:00+08:00` |
 | `published_at_utc` | 同一时间的 UTC 表示，以 `Z` 结尾 |
 | `published_raw` | 数据库里的原始发布时间字符串 |
-| `timezone` | 该文章写入时使用的站点时区（落库保存，站点配置变化不影响历史数据；`unknown_date` 等没有发布时间的结果不会写入该列） |
+| `publish_time_source` | 发布时间来源：`xpath`（详情页配置的 XPath）、`labeled_text`（“发布时间：…”标签）、`meta`（meta/JSON-LD/time 标签）、`text`（正文扫描）、`video_meta`（视频页 meta）、`detail`（其他详情页来源）、`list`（回退列表页日期）；历史行或无法判定时可能为空字符串 |
+| `publish_time_raw` | 详情页抽取到的发布时间文本（XPath 场景可能是匹配出的日期子串；文本扫描可能只有“09月30日”这类无年份日期），便于核对日期为什么被回退 |
+| `list_publish_time` | 列表页解析出的日期；详情日期缺失或与列表相差过大时用于交叉校验 |
+| `title_source` | 标题来源：`article_title_xpath`（配置的标题 XPath **实际命中**）或 `gne_default`（未命中时回退 GNE 自动识别） |
+| `timezone` | 该文章写入时使用的站点时区（落库保存，站点配置变化不影响历史数据；`unknown_date` 等没有发布时间的结果不会写入该列，API extract 路径同样如此） |
 | `content` / `content_length` | 正文与字数（已归一化为单行；列表默认不返回，详情始终返回） |
 | `raw_content` | GNE 原始正文，保留段落换行；只在 `GET /v1/articles/{id}` 详情返回，列表（含 `include_content=true`）为 `null`；v4 之前入库的历史行为空，需 `--force` 重抓，或用 `backfill_raw_content.py` 回填（先 `--dry-run` 看候选数，再 `--limit 50` 小批试跑；容器内必须显式传 `--db /app/data/news.db`，命令见 AGENTS.md §8） |
 | `images` | 图片 URL 数组 |
 | `status` / `error` | 抓取状态与错误信息 |
 
 > 时间排序与过滤基于数据库内的站点本地时间字符串。若同时接入不同时区的来源，分页排序与 `published_from`/`published_to` 区间可能存在偏差：建议统一各站点的 `timezone`，或在展示层用 `published_at_utc` 做二次校准。升级前写入的老数据没有 `timezone` 列，会回落到当前配置推断。
+>
+> 详情页日期若晚于当前时间超过 1 天，视为不可信：不会再自动减一年，而是回退到列表页日期；列表日期也缺失时记 `unknown_date`。
+>
+> GNE 的文本扫描可能只抽到 `09月30日` 这类无年份日期：主抓取路径会优先用列表日期的年份补齐；列表日期也缺失时，以及 API 单 URL extract 没有列表日期可交叉校验时，这类日期会记 `unknown_date`，不会按当前年猜测。
+>
+> `old` 分支的 `publish_time_source` 取决于判定时机：列表阶段就确认超出窗口时记 `list`；详情抓取后才发现超出窗口时保留详情来源（`xpath`/`labeled_text`/`meta`/`text`）。`publish_time_raw` 与当前 `publish_time` 同步：回退到列表日期时清空，不再保留旧详情原文；`unknown_date` 本次没有可信发布时间，新插入行会保留本次抽取文本便于排查，已有行则保留旧值与旧时间配对，避免“旧时间挂新来源”；新行的 `publish_time_source` 为空字符串，已有行保留旧来源。
 
 详情示例：
 
@@ -365,7 +375,8 @@ cp sources.json sources.local.json
       "url_xpath": ".//a/@href",
       "date_xpath": ".//*[contains(@class,'time')]",
       "date_format": "%Y-%m-%d",
-      "timezone": "Asia/Shanghai"
+      "timezone": "Asia/Shanghai",
+      "date_skew_days": 7
     }
   ]
 }
@@ -377,7 +388,7 @@ cp sources.json sources.local.json
 | --- | --- | --- |
 | `name` | 必填 | 站点唯一标识，例如 `ncu_news` |
 | `list_url` | 二选一 | 新闻列表页地址 |
-| `list_urls` | 二选一 | 多个列表页地址组成的数组，用于分页等情况 |
+| `list_urls` | 二选一 | 多个固定列表页地址组成的数组（旧版分页方式；单 `list_url` 站点请优先用 `pagination`） |
 | `item_xpath` | 必填 | 定位每条新闻节点的 XPath |
 | `title_xpath` | 可选 | 标题 XPath，不填默认取第一个 `a` 标签 |
 | `url_xpath` | 可选 | 详情页链接 XPath，不填默认取第一个 `a` 标签的 `href` |
@@ -385,12 +396,47 @@ cp sources.json sources.local.json
 | `date_format` | 可选 | 日期格式，例如 `%Y-%m-%d`、`%Y-%m-%d %H:%M` |
 | `timezone` | 可选 | 站点时区，默认 `Asia/Shanghai` |
 | `article_title_xpath` | 可选 | 详情页标题 XPath。用于 `<title>` 写的是站点名、真标题在正文 `h1` 的站点。推荐直接写标题元素（如 `//h1[@class='article-title']`），会取其全部文本（含 `<em>` 等子元素）；写成 `//h1/text()` 只能取第一个直接文本节点，标题含子标签时会截断。以 `string(` 开头的表达式会被忽略 |
+| `article_publish_time_xpath` | 可选 | 详情页发布时间 XPath。用于正文里更早出现无关时间、页头日期才是真发布时间的站点；推荐写包含日期的元素（如 `//p[contains(@class,'article__subTitle')]/span[1]`）。以 `string(` 开头或非法表达式会被忽略 |
+| `date_skew_days` | 可选 | 详情日期与列表日期允许相差的天数，默认 7，范围 0–365；超过时改用列表日期，避免正文里的未来时间或站内推荐日期污染发布时间 |
+| `pagination` | 可选 | 自动分页配置对象，见下方“自动分页（可选）”；只对单个 `list_url` 生效，配置 `list_urls` 时仍按固定地址列表抓取（不受 `max_pages`/`stop_when_older_than_cutoff` 影响） |
 | `render` | 可选 | 设为 `true` 表示列表页需要用 Chrome 渲染后再解析 |
 | `delay` | 可选 | 每个请求之间的等待秒数，默认 0.3 |
 
 > 顶层还可以配置 `workers`（同时处理几个站点，默认 16）和 `days`（默认抓取天数）。
 >
 > **内存提示**：`workers` 是站点级线程数；开启浏览器回退时，每个线程可能各自启动一个 Chromium（约 200–300 MB）。`workers=16` 建议至少 4 GB 可用内存；小内存机器或 JS 站点较多时请调低 `--workers`，否则可能被 OOM Kill。
+
+#### 自动分页（可选）
+
+列表页是 `index_2.html` 这类固定模板时，不必再手写 `list_urls`：
+
+```json
+"pagination": {
+  "mode": "template",
+  "url_template": "https://example.com/news/index_{page}.html",
+  "total_pages_regex": "index_(\\d+)\\.html",
+  "start": 2,
+  "max_pages": 50,
+  "stop_when_older_than_cutoff": true,
+  "stop_after_known_pages": 0
+}
+```
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `mode` | `none` | `none` 只抓 `list_url`；`template` 按 `url_template` 生成后续页；`next` 跟随“下一页”链接；`auto` 有模板用模板，否则跟随下一页 |
+| `url_template` | 空 | 页码模板，必须包含 `{page}`；缺少占位符时 `template` 模式回退为只抓首页，`auto` 模式改走下一页 |
+| `last_url_xpath` | 空 | 尾页链接 XPath；命中元素时读取 href/onclick/data-page/value 和文本作为候选，最终取最大页码（`data-page="12"` 这类纯数字直接作为页码）。不填时从整页 HTML 用 `total_pages_regex` 探测 |
+| `next_url_xpath` | 空 | “下一页”链接 XPath；支持相对地址，也兼容常见 `onclick=location.href=...` 写法 |
+| `total_pages_regex` | `(?:index_\|page[=/])(\\d+)` | 从 HTML 提取最大页码的正则，捕获组必须是数字（表格中 `\\|` 表示正则里的或） |
+| `start` | `1` | 模板模式从第几页开始生成（第 1 页始终是 `list_url`，通常设为 2）；范围 1–1000 |
+| `max_pages` | `50` | 最多抓取页数（含 `list_url` 计 1 页，后续页最多 `max_pages-1` 个）；范围 1–500 |
+| `stop_when_older_than_cutoff` | `true` | 当前页最晚日期早于抓取窗口起点时停止翻页（整页每条都能解析出日期且都早于窗口才停，避免置顶旧文或缺失日期导致漏抓） |
+| `stop_after_known_pages` | `0` | 连续 N 页链接都已入库时停止（增量运行）；范围 0–100，默认 0 关闭；仅 template/next/auto 模式生效。开启后若上次运行更后页失败，可能提前停止，建议确认完整抓取后再开 |
+
+未配置 `render: true` 时，列表页解析为空会自动用 Chrome 渲染一次，并基于渲染后的 DOM 重新解析与继续翻页。自动分页会在页内按 URL 去重，并在 `test` 命令输出页数与停止原因（如 `cutoff`、`known_pages`、`no_next`、`max_pages`、`empty`、`fetch_failed`、`done`）。
+
+自动分页会为列表页启用 SSRF 地址白名单：配置的 `list_url`/`list_urls` 是唯一可信目标，且要求 scheme + host + port 完全一致；其他目标必须是公网地址，并且只允许 http 80 / https 443 端口。指向配置主机其他端口的链接会被拒绝；同端口无法按路径区分，配置主机本身视为可信。带地址校验的列表页请求为直连（不读取 `HTTP(S)_PROXY`），文章详情页保持原有代理行为。浏览器回退时每个请求都会重新校验，但 Playwright 自行解析 DNS，无法像 HTTP 路径那样在连接层钉扎 IP，残余 DNS rebinding 风险需由出口网络策略兜底。
 
 ### 第 3 步：测试列表解析
 
