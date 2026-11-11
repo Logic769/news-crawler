@@ -877,6 +877,7 @@ def extract_from_html(
     allow_browser: bool = True,
     url_validator: Callable[[str], None] | None = None,
     already_rendered: bool = False,
+    title_xpath: str = "",
 ) -> dict | None:
     """Extract one article already-fetched HTML (shared by CLI and crawler).
 
@@ -891,7 +892,7 @@ def extract_from_html(
             return video
 
     try:
-        result = extractor.extract(html)
+        result = extractor.extract(html, title_xpath=title_xpath)
     except NoContentException:
         result = None
 
@@ -918,7 +919,7 @@ def extract_from_html(
                 return None
             html = rendered
             try:
-                result = extractor.extract(html)
+                result = extractor.extract(html, title_xpath=title_xpath)
             except NoContentException:
                 result = None
             if result is None:
@@ -941,7 +942,9 @@ def extract_article(
     *,
     allow_browser: bool = True,
     url_validator: Callable[[str], None] | None = None,
+    title_xpath: str = "",
 ) -> dict | None:
+    """抓取单个 URL 并抽取正文；必要时回退浏览器，失败或正文为空时返回 None。"""
     LOG.info("正在抓取: %s", url)
     already_rendered = False
     try:
@@ -977,6 +980,7 @@ def extract_article(
         allow_browser=allow_browser,
         url_validator=url_validator,
         already_rendered=already_rendered,
+        title_xpath=title_xpath,
     )
 
 

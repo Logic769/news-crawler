@@ -384,6 +384,7 @@ cp sources.json sources.local.json
 | `date_xpath` | 可选 | 发布日期 XPath，不填则从整条节点文本中自动识别 |
 | `date_format` | 可选 | 日期格式，例如 `%Y-%m-%d`、`%Y-%m-%d %H:%M` |
 | `timezone` | 可选 | 站点时区，默认 `Asia/Shanghai` |
+| `article_title_xpath` | 可选 | 详情页标题 XPath。用于 `<title>` 写的是站点名、真标题在正文 `h1` 的站点。推荐直接写标题元素（如 `//h1[@class='article-title']`），会取其全部文本（含 `<em>` 等子元素）；写成 `//h1/text()` 只能取第一个直接文本节点，标题含子标签时会截断。以 `string(` 开头的表达式会被忽略 |
 | `render` | 可选 | 设为 `true` 表示列表页需要用 Chrome 渲染后再解析 |
 | `delay` | 可选 | 每个请求之间的等待秒数，默认 0.5 |
 

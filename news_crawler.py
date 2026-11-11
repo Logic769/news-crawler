@@ -501,7 +501,38 @@ def resolve_config_path(path: str) -> str:
     return path
 
 
+def _validate_title_xpath(name: object, value: object) -> str:
+    """校验手写的 article_title_xpath，把两类常见错误挡在启动期。
+
+    - `string(...)` 开头的表达式一律忽略（统一改用元素节点或 /text()）；
+    - 非法 XPath 会在抽取时抛错。
+    元素节点写法（`//h1`）由 TitleExtractor 取 text_content，可拿到完整标题。
+    """
+    xpath = str(value or "").strip()
+    if not xpath:
+        return ""
+    if xpath.startswith("string("):
+        LOG.warning(
+            "站点 %r 的 article_title_xpath 不能写成 %r（请直接写标题元素，如 //h1），已忽略",
+            name,
+            xpath,
+        )
+        return ""
+    try:
+        etree.XPath(xpath)
+    except Exception as exc:
+        LOG.warning(
+            "站点 %r 的 article_title_xpath 不是合法 XPath（%s），已忽略: %r",
+            name,
+            exc,
+            xpath,
+        )
+        return ""
+    return xpath
+
+
 def load_config(path: str) -> dict:
+    """读取 JSON 配置并补齐默认值，同时校验各站点的 article_title_xpath。"""
     if not Path(path).exists():
         raise FileNotFoundError(
             f"找不到配置文件 {path}。请参考 README 创建并填写配置文件。"
@@ -515,6 +546,11 @@ def load_config(path: str) -> dict:
     data.setdefault("days", 3)
     data.setdefault("timezone", "Asia/Shanghai")
     data.setdefault("delay", 0.5)
+    for source in data.get("sources") or []:
+        if isinstance(source, dict) and "article_title_xpath" in source:
+            source["article_title_xpath"] = _validate_title_xpath(
+                source.get("name"), source.get("article_title_xpath")
+            )
     return data
 
 
@@ -679,7 +715,11 @@ def fetch_article_html(url: str) -> tuple[str, bool] | None:
 
 
 def extract_article(
-    html: str, url: str, *, already_rendered: bool = False
+    html: str,
+    url: str,
+    *,
+    already_rendered: bool = False,
+    title_xpath: str = "",
 ) -> dict | None:
     """用已抓取的 HTML 抽取一篇文章（与 url_extract.extract_article 共用实现）。
 
@@ -690,7 +730,12 @@ def extract_article(
     """
     extractor = GeneralNewsExtractor()
     return extract_from_html(
-        html, url, extractor, allow_browser=True, already_rendered=already_rendered
+        html,
+        url,
+        extractor,
+        allow_browser=True,
+        already_rendered=already_rendered,
+        title_xpath=title_xpath,
     )
 
 
@@ -822,6 +867,7 @@ def process_entry(
     force: bool,
     delay: float = 0.0,
 ) -> str:
+    """处理单篇文章：去重、时间过滤、抓取、抽取并入库，返回处理结果标签。"""
     url = entry["url"]
     source_name = source["name"]
     tz_name = source.get("timezone", "Asia/Shanghai")
@@ -861,7 +907,12 @@ def process_entry(
         return "error"
     html, already_rendered = fetched
 
-    result = extract_article(html, url, already_rendered=already_rendered)
+    result = extract_article(
+        html,
+        url,
+        already_rendered=already_rendered,
+        title_xpath=source.get("article_title_xpath") or "",
+    )
     if result is None:
         save_article(
             conn,
