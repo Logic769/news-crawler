@@ -239,6 +239,27 @@ class TimeExtractorTest(unittest.TestCase):
         self.assertEqual(value, "2026-11-10T23:30:00Z")
         self.assertEqual(source, "xpath")
 
+    def test_user_xpath_skips_invalid_iso_candidate(self) -> None:
+        html = (
+            "<html><body><p class='pub'>2026-13-01T10:00</p>"
+            "<p class='pub'>2026-11-11T09:30:00+08:00</p></body></html>"
+        )
+        value, source = TimeExtractor().extract_with_source(
+            fromstring(html), publish_time_xpath="//p[@class='pub']/text()"
+        )
+        self.assertEqual(value, "2026-11-11T09:30:00+08:00")
+        self.assertEqual(source, "xpath")
+
+    def test_adjacent_sibling_script_date_is_skipped(self) -> None:
+        html = (
+            "<html><body><div>发布时间：</div>"
+            "<span><script>var d='2010-01-01';</script>2026-11-11</span>"
+            "<div>会议于2020-01-01举行</div></body></html>"
+        )
+        value, source = TimeExtractor().extract_with_source(fromstring(html))
+        self.assertEqual(value, "2026-11-11")
+        self.assertEqual(source, "labeled_text")
+
     def test_labeled_date_in_separate_adjacent_spans(self) -> None:
         html = (
             "<html><body><div class='meta'>"

@@ -262,7 +262,9 @@ class ExtractJobDatesTest(unittest.TestCase):
                 encoding="utf-8",
             )
             today = dt.datetime.now(ZoneInfo("Asia/Shanghai")).date()
-            reference = today.replace(year=today.year - 1, month=9, day=30)
+            future = today + dt.timedelta(days=20)
+            reference = future.replace(year=future.year - 1)
+            detail_raw = f"{future.month:02d}月{future.day:02d}日 09:30"
             list_time = f"{reference.isoformat()} 00:00:00"
             conn = news_crawler.init_db(db_path)
             try:
@@ -288,7 +290,7 @@ class ExtractJobDatesTest(unittest.TestCase):
             result = {
                 "title": "详情标题",
                 "content": "正文内容。" * 80,
-                "publish_time": "09月30日 09:30",
+                "publish_time": detail_raw,
                 "publish_time_source": "text",
                 "title_source": "gne_default",
                 "author": "",
@@ -317,7 +319,183 @@ class ExtractJobDatesTest(unittest.TestCase):
                 assert row is not None
                 self.assertEqual(row["publish_time"], f"{reference.isoformat()} 09:30:00")
                 self.assertEqual(row["publish_time_source"], "text")
-                self.assertEqual(row["publish_time_raw"], "09月30日 09:30")
+                self.assertEqual(row["publish_time_raw"], detail_raw)
+            finally:
+                conn.close()
+
+    def test_extract_job_cross_year_yearless_detail_keeps_clock(self) -> None:
+        # 库内列表日期在 1 月初、详情写去年 12 月：按列表年份会得到未来日期，
+        # 必须回退上一年并保留详情时刻与来源。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = str(root / "news.db")
+            config_file = root / "sources.json"
+            config_path = str(config_file)
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "name": "example",
+                                "timezone": "Asia/Shanghai",
+                                "date_skew_days": 7,
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            today = dt.datetime.now(ZoneInfo("Asia/Shanghai")).date()
+            reference = today.replace(month=1, day=3)
+            detail_date = reference.replace(year=reference.year - 1, month=12, day=28)
+            detail_raw = f"{detail_date.month:02d}月{detail_date.day:02d}日 09:30"
+            list_time = f"{reference.isoformat()} 00:00:00"
+            conn = news_crawler.init_db(db_path)
+            try:
+                news_crawler.save_article(
+                    conn,
+                    "example",
+                    "https://example.com/cross-year",
+                    publish_time=list_time,
+                    publish_time_source="list",
+                    list_publish_time=list_time,
+                    title_source="gne_default",
+                    status="ok",
+                )
+            finally:
+                conn.close()
+
+            settings = Settings(
+                db_path=db_path,
+                config_path=config_path,
+                timezone="Asia/Shanghai",
+                allow_private_urls=True,
+            )
+            result = {
+                "title": "详情标题",
+                "content": "正文内容。" * 80,
+                "publish_time": detail_raw,
+                "publish_time_source": "text",
+                "title_source": "gne_default",
+                "author": "",
+                "images": [],
+            }
+            with mock.patch.object(
+                tasks.url_extract, "extract_article", return_value=result
+            ), mock.patch.object(tasks, "close_thread_browser"):
+                summary = tasks.execute_extract(
+                    {"url": "https://example.com/cross-year", "source": "example"},
+                    settings,
+                )
+
+            self.assertEqual(summary["status"], "ok")
+            self.assertEqual(
+                summary["published_at"], f"{detail_date.isoformat()}T09:30:00+08:00"
+            )
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    "SELECT publish_time, publish_time_source, publish_time_raw "
+                    "FROM articles WHERE source = ? AND url = ?",
+                    ("example", "https://example.com/cross-year"),
+                ).fetchone()
+                assert row is not None
+                self.assertEqual(
+                    row["publish_time"], f"{detail_date.isoformat()} 09:30:00"
+                )
+                self.assertEqual(row["publish_time_source"], "text")
+                self.assertEqual(row["publish_time_raw"], detail_raw)
+            finally:
+                conn.close()
+
+    def test_extract_job_cross_year_forward_yearless_detail_keeps_clock(self) -> None:
+        # 库内列表日期在年末、详情写次年 1 月初：年份候选必须包含下一年。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = str(root / "news.db")
+            config_file = root / "sources.json"
+            config_path = str(config_file)
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "name": "example",
+                                "timezone": "Asia/Shanghai",
+                                "date_skew_days": 30,
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            today = dt.datetime.now(ZoneInfo("Asia/Shanghai")).date()
+            reference = today.replace(year=today.year - 2, month=12, day=28)
+            detail_date = reference.replace(year=reference.year + 1, month=1, day=5)
+            detail_raw = f"{detail_date.month:02d}月{detail_date.day:02d}日 09:30"
+            list_time = f"{reference.isoformat()} 00:00:00"
+            conn = news_crawler.init_db(db_path)
+            try:
+                news_crawler.save_article(
+                    conn,
+                    "example",
+                    "https://example.com/cross-year-forward",
+                    publish_time=list_time,
+                    publish_time_source="list",
+                    list_publish_time=list_time,
+                    title_source="gne_default",
+                    status="ok",
+                )
+            finally:
+                conn.close()
+
+            settings = Settings(
+                db_path=db_path,
+                config_path=config_path,
+                timezone="Asia/Shanghai",
+                allow_private_urls=True,
+            )
+            result = {
+                "title": "详情标题",
+                "content": "正文内容。" * 80,
+                "publish_time": detail_raw,
+                "publish_time_source": "text",
+                "title_source": "gne_default",
+                "author": "",
+                "images": [],
+            }
+            with mock.patch.object(
+                tasks.url_extract, "extract_article", return_value=result
+            ), mock.patch.object(tasks, "close_thread_browser"):
+                summary = tasks.execute_extract(
+                    {
+                        "url": "https://example.com/cross-year-forward",
+                        "source": "example",
+                    },
+                    settings,
+                )
+
+            self.assertEqual(summary["status"], "ok")
+            self.assertEqual(
+                summary["published_at"], f"{detail_date.isoformat()}T09:30:00+08:00"
+            )
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    "SELECT publish_time, publish_time_source, publish_time_raw "
+                    "FROM articles WHERE source = ? AND url = ?",
+                    ("example", "https://example.com/cross-year-forward"),
+                ).fetchone()
+                assert row is not None
+                self.assertEqual(
+                    row["publish_time"], f"{detail_date.isoformat()} 09:30:00"
+                )
+                self.assertEqual(row["publish_time_source"], "text")
+                self.assertEqual(row["publish_time_raw"], detail_raw)
             finally:
                 conn.close()
 

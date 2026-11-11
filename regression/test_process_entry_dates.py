@@ -215,6 +215,58 @@ class ProcessEntryDatesTest(unittest.TestCase):
         )
         self.assertEqual(row["publish_time_source"], "text")
 
+    def test_cross_year_yearless_detail_keeps_detail_clock(self) -> None:
+        # 列表日期在 1 月初、详情写“12月28日”：按列表年份会得到未来日期，
+        # 必须回退到上一年并保留详情时刻与来源，而不是整体换成列表日期。
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        reference = today.replace(month=1, day=3)
+        detail = reference.replace(year=reference.year - 1, month=12, day=28)
+        row = self._run(
+            f"{detail.month:02d}月{detail.day:02d}日 09:30",
+            reference.strftime("%Y-%m-%d 00:00:00"),
+            publish_time_source="text",
+            cutoff_text=detail.strftime("%Y-%m-%d 00:00:00"),
+        )
+        self.assertEqual(
+            row["publish_time"], detail.strftime("%Y-%m-%d 09:30:00")
+        )
+        self.assertEqual(row["publish_time_source"], "text")
+
+    def test_cross_year_forward_yearless_detail_keeps_detail_clock(self) -> None:
+        # 列表日期在年末、详情写次年“01月05日”：年份候选必须包含下一年，
+        # 否则偏差校验会把详情时刻和来源整体换成列表日期。
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        reference = today.replace(year=today.year - 2, month=12, day=28)
+        detail = reference.replace(year=reference.year + 1, month=1, day=5)
+        row = self._run(
+            f"{detail.month:02d}月{detail.day:02d}日 09:30",
+            reference.strftime("%Y-%m-%d 00:00:00"),
+            date_skew_days=30,
+            publish_time_source="text",
+            cutoff_text=detail.strftime("%Y-%m-%d 00:00:00"),
+        )
+        self.assertEqual(
+            row["publish_time"], detail.strftime("%Y-%m-%d 09:30:00")
+        )
+        self.assertEqual(row["publish_time_source"], "text")
+
+    def test_future_yearless_detail_uses_list_year_and_keeps_clock(self) -> None:
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        future = today + timedelta(days=20)
+        reference = future.replace(year=future.year - 1)
+        detail = f"{future.month:02d}月{future.day:02d}日 09:30"
+        row = self._run(
+            detail,
+            reference.strftime("%Y-%m-%d 00:00:00"),
+            date_skew_days=400,
+            publish_time_source="text",
+            cutoff_text=reference.strftime("%Y-%m-%d 00:00:00"),
+        )
+        self.assertEqual(
+            row["publish_time"], reference.strftime("%Y-%m-%d 09:30:00")
+        )
+        self.assertEqual(row["publish_time_source"], "text")
+
     def test_relative_yesterday_without_list_date_is_preserved(self) -> None:
         row = self._run("昨天", None, publish_time_source="text")
         self.assertTrue(row["publish_time"])

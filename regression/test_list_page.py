@@ -10,6 +10,9 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+import lxml.html
+
+import news_crawler
 from gne import ListPageExtractor
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "list_page.html"
@@ -41,6 +44,28 @@ class ListPageExtractorTest(unittest.TestCase):
             "</ul></body></html>"
         )
         self.assertEqual(self.extractor.extract(html, "只有三条一"), [])
+
+
+class XpathScalarTest(unittest.TestCase):
+    """xpath_text/xpath_href 遇到 count()/number()/boolean() 标量表达式时不能崩溃。"""
+
+    def setUp(self) -> None:
+        self.doc = lxml.html.fromstring(
+            '<html><body><div class="item"><span>2026-11-11</span></div></body></html>'
+        )
+        self.node = self.doc.xpath('//div[@class="item"]')[0]
+
+    def test_scalar_xpath_returns_empty_text(self) -> None:
+        self.assertEqual(news_crawler.xpath_text(self.node, "count(.//span)"), "")
+
+    def test_scalar_xpath_returns_empty_href(self) -> None:
+        self.assertEqual(news_crawler.xpath_href(self.node, "count(.//span)"), "")
+
+    def test_boolean_xpath_returns_empty_text(self) -> None:
+        self.assertEqual(news_crawler.xpath_text(self.node, "boolean(.//span)"), "")
+
+    def test_number_xpath_returns_empty_href(self) -> None:
+        self.assertEqual(news_crawler.xpath_href(self.node, "number(.//span)"), "")
 
 
 if __name__ == "__main__":

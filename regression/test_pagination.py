@@ -52,7 +52,7 @@ class PaginationTest(unittest.TestCase):
         cutoff = datetime(2023, 11, 11, tzinfo=ZoneInfo("Asia/Shanghai"))
         calls: list[str] = []
 
-        def fake_fetch(url: str, render: bool) -> str:
+        def fake_fetch(url: str, render: bool, url_validator=None) -> str:
             calls.append(url)
             return html
 
@@ -84,7 +84,7 @@ class PaginationTest(unittest.TestCase):
         }
         calls: list[str] = []
 
-        def fake_fetch(url: str, render: bool) -> str:
+        def fake_fetch(url: str, render: bool, url_validator=None) -> str:
             calls.append(url)
             return pages[url]
 
@@ -118,7 +118,7 @@ class PaginationTest(unittest.TestCase):
         }
         calls: list[str] = []
 
-        def fake_fetch(url: str, render: bool) -> str:
+        def fake_fetch(url: str, render: bool, url_validator=None) -> str:
             calls.append(url)
             return pages[url]
 
@@ -141,7 +141,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source)
 
@@ -174,7 +174,7 @@ class PaginationTest(unittest.TestCase):
         }
         calls: list[str] = []
 
-        def fake_fetch(url: str, render: bool) -> str:
+        def fake_fetch(url: str, render: bool, url_validator=None) -> str:
             calls.append(url)
             return pages[url]
 
@@ -216,7 +216,7 @@ class PaginationTest(unittest.TestCase):
         }
         calls: list[str] = []
 
-        def fake_fetch(url: str, render: bool) -> str:
+        def fake_fetch(url: str, render: bool, url_validator=None) -> str:
             calls.append(url)
             return pages[url]
 
@@ -244,7 +244,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source)
 
@@ -268,7 +268,7 @@ class PaginationTest(unittest.TestCase):
         }
         calls: list[str] = []
 
-        def fake_fetch(url: str, render: bool) -> str:
+        def fake_fetch(url: str, render: bool, url_validator=None) -> str:
             calls.append(url)
             return pages[url]
 
@@ -297,7 +297,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source, cutoff=cutoff)
 
@@ -320,7 +320,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source)
 
@@ -371,7 +371,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source, cutoff=cutoff)
 
@@ -406,7 +406,7 @@ class PaginationTest(unittest.TestCase):
         )
         calls: list[str] = []
 
-        def fake_fetch(url: str, render: bool) -> str:
+        def fake_fetch(url: str, render: bool, url_validator=None) -> str:
             calls.append(url)
             return _page(("一", "2026-01-01", "a1.html"))
 
@@ -441,7 +441,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source)
 
@@ -474,7 +474,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source)
 
@@ -493,7 +493,8 @@ class PaginationTest(unittest.TestCase):
         first = _page(("第一页", "2026-01-01", "a1.html")).replace(
             "</ul>",
             '</ul><a class="last" href="index_3.html">尾页</a>'
-            '<a class="last" href="index_7.html">末页</a>',
+            '<a class="last" href="index_7.html">末页</a>'
+            '<a href="index_9.html">普通链接</a>',
         )
         pages = {"https://example.com/list/": first}
         for page in range(2, 8):
@@ -504,7 +505,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source)
 
@@ -525,8 +526,8 @@ class PaginationTest(unittest.TestCase):
         )
         first = _page(("第一页", "2026-01-01", "a1.html")).replace(
             "</ul>",
-            '</ul><a class="last" data-page="12">12</a>'
-            '<a class="last" href="index_4.html">尾页</a>',
+            '</ul><a class="last" data-page="12">尾页</a>'
+            '<a class="last" href="index_4.html">末页</a>',
         )
         pages = {"https://example.com/list/": first}
         for page in range(2, 13):
@@ -537,7 +538,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source)
 
@@ -569,7 +570,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source)
 
@@ -595,7 +596,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source)
 
@@ -622,7 +623,7 @@ class PaginationTest(unittest.TestCase):
         }
         calls: list[str] = []
 
-        def fake_fetch(url: str, render: bool) -> str:
+        def fake_fetch(url: str, render: bool, url_validator=None) -> str:
             calls.append(url)
             return pages[url]
 
@@ -660,7 +661,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source)
 
@@ -686,7 +687,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source)
 
@@ -716,7 +717,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source)
 
@@ -746,7 +747,7 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source)
 
@@ -765,7 +766,7 @@ class PaginationTest(unittest.TestCase):
         )
         second = _page(("第二页", "2026-01-02", "a2.html"))
 
-        def fake_fetch(url: str, render: bool) -> str:
+        def fake_fetch(url: str, render: bool, url_validator=None) -> str:
             if url == "https://example.com/list/":
                 return raw
             return second
@@ -783,7 +784,9 @@ class PaginationTest(unittest.TestCase):
             result["page_urls"][-1],
             "https://example.com/list/index_2.html",
         )
-        browser.assert_called_once_with("https://example.com/list/")
+        browser.assert_called_once_with(
+            "https://example.com/list/", url_validator=mock.ANY
+        )
 
     def test_page_with_unknown_date_does_not_trigger_cutoff(self) -> None:
         source = _source(
@@ -809,13 +812,72 @@ class PaginationTest(unittest.TestCase):
         with mock.patch.object(
             news_crawler,
             "fetch_list_html",
-            side_effect=lambda url, render: pages[url],
+            side_effect=lambda url, render, url_validator=None: pages[url],
         ):
             result = news_crawler.collect_list_entries_detailed(source, cutoff=cutoff)
 
         self.assertEqual(result["pages"], 2)
         self.assertEqual(len(result["items"]), 3)
         self.assertEqual(result["stop_reason"], "done")
+
+    def test_pagination_validator_allows_configured_private_host(self) -> None:
+        source = _source()
+        source["list_url"] = "http://127.0.0.1/list/"
+        validator = news_crawler._pagination_url_validator(source)
+        validator("http://127.0.0.1/list/index_2.html")
+
+    def test_pagination_validator_rejects_untrusted_private_ip(self) -> None:
+        source = _source()
+        validator = news_crawler._pagination_url_validator(source)
+        with mock.patch.object(
+            news_crawler.socket,
+            "getaddrinfo",
+            side_effect=OSError("dns blocked in test"),
+        ):
+            with self.assertRaises(ValueError):
+                validator("http://127.0.0.1/admin")
+
+    def test_pagination_validator_allows_public_ip_literal(self) -> None:
+        source = _source()
+        validator = news_crawler._pagination_url_validator(source)
+        validator("https://8.8.8.8/list/index_2.html")
+
+    def test_pagination_validator_allows_ip_resolved_from_trusted_host(self) -> None:
+        # 可信主机名被 DNS 解析到内网 IP 时，直接写该 IP 的下一页 URL 也应放行。
+        source = _source()
+        source["list_url"] = "http://intranet.example/list/"
+        validator = news_crawler._pagination_url_validator(source)
+        fake_infos = [(2, 1, 6, "", ("10.1.2.3", 0))]
+        with mock.patch.object(
+            news_crawler.socket, "getaddrinfo", return_value=fake_infos
+        ) as resolver:
+            validator("http://10.1.2.3/list/index_2.html")
+        resolver.assert_called()
+
+    def test_collect_passes_validator_to_list_fetch(self) -> None:
+        source = _source(mode="next", stop_after_known_pages=0)
+        first = _page(("第一页", "2026-01-01", "a1.html")).replace(
+            "</ul>",
+            '</ul><a href="index_2.html">下一页</a>',
+        )
+        second = _page(("第二页", "2026-01-02", "a2.html"))
+        pages = {
+            "https://example.com/list/": first,
+            "https://example.com/list/index_2.html": second,
+        }
+        seen: list[object] = []
+
+        def fake_fetch(url: str, render: bool, url_validator=None) -> str:
+            seen.append(url_validator)
+            return pages[url]
+
+        with mock.patch.object(news_crawler, "fetch_list_html", side_effect=fake_fetch):
+            result = news_crawler.collect_list_entries_detailed(source)
+
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(len(seen), 2)
+        for validator in seen:
+            self.assertTrue(callable(validator))
 
     def test_invalid_pagination_mode_falls_back_to_none(self) -> None:
         source = _source(mode="unexpected")

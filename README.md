@@ -436,6 +436,8 @@ cp sources.json sources.local.json
 
 未配置 `render: true` 时，列表页解析为空会自动用 Chrome 渲染一次，并基于渲染后的 DOM 重新解析与继续翻页。自动分页会在页内按 URL 去重，并在 `test` 命令输出页数与停止原因（如 `cutoff`、`known_pages`、`no_next`、`max_pages`、`empty`、`fetch_failed`、`done`）。
 
+自动分页会为列表页启用 SSRF 地址白名单：配置的 `list_url`/`list_urls` 主机可信，其余主机必须是公网地址；带地址校验的列表页请求为直连（不读取 `HTTP(S)_PROXY`），文章详情页保持原有代理行为。
+
 ### 第 3 步：测试列表解析
 
 先只测试一个站点，确认标题、链接、日期能正确解析：

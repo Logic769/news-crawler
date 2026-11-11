@@ -15,22 +15,25 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import hashlib
+import ipaddress
 import json
 import logging
 import re
+import socket
 import sqlite3
 import sys
 import time
 import urllib.error
 from pathlib import Path
-from typing import Any
-from urllib.parse import urljoin
+from typing import Any, Callable
+from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 import lxml.html
 from lxml import etree
 
 from gne import GeneralNewsExtractor
+from gne.netguard import UnsafeUrlError, ensure_url_allowed
 from url_extract import (
     BROWSER_FALLBACK_HTTP_CODES,
     close_thread_browser,
@@ -213,6 +216,7 @@ def parse_datetime(
     timezone_name: str = "Asia/Shanghai",
     *,
     allow_year_adjust: bool = True,
+    reference_year: int | None = None,
 ) -> dt.datetime | None:
     """Parse common Chinese news date strings into an aware datetime."""
     text = clean_text(value)
@@ -356,7 +360,7 @@ def parse_datetime(
         text,
     )
     if short:
-        year = now.year
+        year = reference_year if reference_year is not None else now.year
         try:
             parsed = dt.datetime(
                 year,
@@ -382,18 +386,70 @@ def align_yearless_datetime(
     reference: dt.datetime,
     timezone_name: str = "Asia/Shanghai",
 ) -> dt.datetime | None:
-    """用可信基准日期的年份补齐无年份日期，月日与时分来自 *value*。"""
+    """用可信基准日期的前后年份补齐无年份日期，月日与时分来自 *value*。"""
     tz = get_timezone(timezone_name)
     # 无 tzinfo 的 datetime 按站点本地墙钟解释，不依赖进程系统时区。
     local_value = value.replace(tzinfo=tz) if value.tzinfo is None else value.astimezone(tz)
     local_reference = (
         reference.replace(tzinfo=tz) if reference.tzinfo is None else reference.astimezone(tz)
     )
-    candidate = (
-        f"{local_reference.year:04d}-{local_value.month:02d}-{local_value.day:02d} "
-        f"{local_value.hour:02d}:{local_value.minute:02d}:{local_value.second:02d}"
+    # 无年份日期可能是跨年的：列表日期在 1 月初、详情页写“12月28日”，
+    # 或列表日期在年末、详情页写次年“01月05日”。因此前后各一年都尝试，
+    # 取离基准最近的合法结果，避免把真实发布时间静默换成列表日期。
+    candidates: list[tuple[float, dt.datetime]] = []
+    for year in (
+        local_reference.year - 1,
+        local_reference.year,
+        local_reference.year + 1,
+    ):
+        candidate = (
+            f"{year:04d}-{local_value.month:02d}-{local_value.day:02d} "
+            f"{local_value.hour:02d}:{local_value.minute:02d}:{local_value.second:02d}"
+        )
+        parsed = parse_datetime(candidate, None, timezone_name, allow_year_adjust=False)
+        if parsed is None:
+            continue
+        distance = abs((parsed - local_reference).total_seconds())
+        candidates.append((distance, parsed))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])[1]
+
+
+def parse_yearless_around(
+    raw: str,
+    reference: dt.datetime,
+    timezone_name: str = "Asia/Shanghai",
+) -> dt.datetime | None:
+    """按基准日期前后年份解析无年份月日，取离基准最近的合法结果。
+
+    parse_datetime(..., reference_year=基准年) 遇到“列表日期在 1 月初、
+    详情写去年 12 月”时，会先构造出未来日期并返回 None；这里前后各一年都尝试，
+    取离基准最近的合法结果，避免详情时刻与来源被列表日期整体替代。
+    """
+    tz = get_timezone(timezone_name)
+    local_reference = (
+        reference.replace(tzinfo=tz) if reference.tzinfo is None else reference.astimezone(tz)
     )
-    return parse_datetime(candidate, None, timezone_name, allow_year_adjust=False)
+    candidates: list[tuple[float, dt.datetime]] = []
+    for year in (
+        local_reference.year,
+        local_reference.year - 1,
+        local_reference.year + 1,
+    ):
+        parsed = parse_datetime(
+            raw,
+            None,
+            timezone_name,
+            allow_year_adjust=False,
+            reference_year=year,
+        )
+        if parsed is None:
+            continue
+        candidates.append((abs((parsed - local_reference).total_seconds()), parsed))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])[1]
 
 
 def format_publish_time(value: dt.datetime, timezone_name: str) -> str:
@@ -697,12 +753,19 @@ def xpath_text(node, xpath: str | None) -> str:
         return clean_text(node.text_content())
     if isinstance(values, str):
         return clean_text(values)
+    # count()/number()/string-length() 等表达式返回标量，不能直接迭代。
+    if not isinstance(values, list):
+        values = [values]
     parts = []
     for value in values:
         if isinstance(value, str):
             parts.append(value)
-        elif hasattr(value, "text_content"):
-            parts.append(value.text_content() or "")
+        elif isinstance(getattr(value, "tag", None), str):
+            text_content = getattr(value, "text_content", None)
+            if callable(text_content):
+                parts.append(text_content() or "")
+            else:
+                parts.append("".join(value.itertext()))
     return clean_text(" ".join(parts))
 
 
@@ -713,7 +776,11 @@ def xpath_href(node, xpath: str | None) -> str:
         values = []
     if isinstance(values, str):
         return clean_text(values)
+    if not isinstance(values, list):
+        values = [values]
     for value in values:
+        if not isinstance(value, str):
+            continue
         href = clean_text(value)
         if href and not href.startswith("javascript:"):
             return href
@@ -782,21 +849,97 @@ def parse_list_items(html: str, source: dict, base_url: str) -> list[dict]:
     return items
 
 
-def fetch_list_html(url: str, render: bool) -> str | None:
+def fetch_list_html(
+    url: str,
+    render: bool,
+    *,
+    url_validator: Callable[[str], None] | None = None,
+) -> str | None:
     if render:
-        return fetch_html_with_browser(url)
+        return fetch_html_with_browser(url, url_validator=url_validator)
     try:
-        return fetch_html(url)
+        return fetch_html(url, url_validator=url_validator)
     except urllib.error.HTTPError as exc:
         # 与文章页同一套规则：404/410/500 渲染后仍是同样错误，不值得再启浏览器。
         if exc.code not in BROWSER_FALLBACK_HTTP_CODES:
             LOG.warning("直接抓取列表失败 %s (HTTP %s)，不回退浏览器。", url, exc.code)
             return None
         LOG.warning("直接抓取列表被拒绝 %s (HTTP %s)，尝试浏览器。", url, exc.code)
-        return fetch_html_with_browser(url)
+        return fetch_html_with_browser(url, url_validator=url_validator)
     except Exception as exc:
         LOG.warning("直接抓取列表失败 %s (%s)，尝试浏览器。", url, exc)
-        return fetch_html_with_browser(url)
+        return fetch_html_with_browser(url, url_validator=url_validator)
+
+
+def _pagination_url_validator(source: dict) -> Callable[[str], None]:
+    """Build an SSRF guard for a site's list pages and browser subrequests.
+
+    配置里的 list_url/list_urls 主机是可信的（允许内网），分页模板或下一页
+    指向的其他主机必须是公网地址；连接层解析出的内网 IP 只有命中可信主机的
+    解析结果时才放行，避免列表页把爬虫引向内网或云元数据地址。
+    """
+    configured: list[Any] = list(source.get("list_urls") or [])
+    if source.get("list_url"):
+        configured.append(source["list_url"])
+    trusted_hosts: set[str] = set()
+    for raw in configured:
+        try:
+            host = urlsplit(str(raw)).hostname
+        except ValueError:
+            continue
+        if host:
+            trusted_hosts.add(host.lower().strip("[]"))
+
+    trusted_ips: set[str] = set()
+    resolved = False
+
+    def _resolve_trusted_ips() -> set[str]:
+        nonlocal resolved
+        if resolved:
+            return trusted_ips
+        resolved = True
+        for host in trusted_hosts:
+            try:
+                infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            except OSError:
+                continue
+            for info in infos:
+                address = str(info[4][0]).split("%", 1)[0]
+                try:
+                    ip = ipaddress.ip_address(address)
+                except ValueError:
+                    continue
+                if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+                    ip = ip.ipv4_mapped
+                trusted_ips.add(str(ip))
+        return trusted_ips
+
+    def _validator(target: str) -> None:
+        # allow_private=True 只做格式/凭据/控制字符校验；地址策略在下面自行判断。
+        ensure_url_allowed(target, allow_private=True)
+        try:
+            parts = urlsplit(target)
+        except ValueError as exc:
+            raise UnsafeUrlError(f"URL 格式不合法: {exc}") from exc
+        host = (parts.hostname or "").lower().strip("[]")
+        if not host:
+            raise UnsafeUrlError("URL 缺少主机名")
+        if host in trusted_hosts:
+            return
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            ensure_url_allowed(target, allow_private=False)
+            return
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        if address.is_global:
+            return
+        if str(address) in _resolve_trusted_ips():
+            return
+        raise UnsafeUrlError(f"拒绝访问非配置主机的内网地址: {target}")
+
+    return _validator
 
 
 def _pagination_int(
@@ -1085,6 +1228,7 @@ def collect_list_entries_detailed(
     stop_reason = "done"
     render = bool(source.get("render"))
     delay = float(source.get("delay", 0))
+    page_validator = _pagination_url_validator(source)
 
     while pending:
         page_url = pending.pop(0)
@@ -1094,7 +1238,7 @@ def collect_list_entries_detailed(
             stop_reason = "max_pages"
             break
         visited_pages.add(page_url)
-        html = fetch_list_html(page_url, render)
+        html = fetch_list_html(page_url, render, url_validator=page_validator)
         if not html:
             if fixed_mode:
                 fixed_failed = True
@@ -1105,7 +1249,7 @@ def collect_list_entries_detailed(
         items = parse_list_items(html, source, page_url)
         if not items and not render:
             LOG.info("列表解析为空，尝试 Chrome 渲染 %s", page_url)
-            rendered = fetch_html_with_browser(page_url)
+            rendered = fetch_html_with_browser(page_url, url_validator=page_validator)
             if rendered:
                 # 后续找下一页/模板探测必须基于渲染后的 DOM。
                 html = rendered
@@ -1468,6 +1612,14 @@ def process_entry(
     # 详情日期不允许“未来年份自动减一年”：那会把 2026 年的正文时间
     # 改成 2025 年，从而错误命中 old。解析失败时交给列表日期兜底。
     publish_dt = parse_datetime(publish_raw, None, tz_name, allow_year_adjust=False)
+    # 无年份月日按列表日期前后年份取最近结果：列表日期在 1 月初、详情写
+    # 去年 12 月时，只按列表年份解析会得到未来日期并返回 None。
+    around_applied = False
+    if list_date is not None and is_yearless_month_day(publish_raw):
+        around = parse_yearless_around(publish_raw, list_date, tz_name)
+        if around is not None:
+            publish_dt = around
+            around_applied = True
     raw_publish_source = str(result.get("publish_time_source") or "")
     publish_source = publish_source_for(raw_publish_source)
     title_source = str(result.get("title_source") or "gne_default")
@@ -1481,6 +1633,7 @@ def process_entry(
         and publish_dt is not None
         and publish_source != "list"
         and is_yearless_month_day(publish_raw)
+        and not around_applied
     ):
         reconciled = align_yearless_datetime(publish_dt, list_date, tz_name)
         if reconciled is not None:

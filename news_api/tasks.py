@@ -210,14 +210,6 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
 
         raw_content = str(result.get("content") or "").strip()
         publish_raw = news_crawler.clean_text(result.get("publish_time"))
-        publish_dt = news_crawler.parse_datetime(
-            publish_raw, None, tz_name, allow_year_adjust=False
-        )
-        publish_text = (
-            news_crawler.format_publish_time(publish_dt, tz_name)
-            if publish_dt is not None
-            else ""
-        )
         raw_publish_source = str(result.get("publish_time_source") or "")
         publish_source = news_crawler.publish_source_for(raw_publish_source)
         # 与 crawler 的 process_entry 保持一致：重抓已入库文章时，若详情日期
@@ -237,6 +229,24 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
                 )
                 if list_dt is not None:
                     stored_list_dt = list_dt
+        # 无年份的“12月01日 09:30”必须先用库内列表日期解析，
+        # 否则当前年构造出的未来日期会在 _finalize 里直接返回 None，
+        # 后续只能回退列表日期并丢掉详情时刻与来源。跨年（列表 1 月初、
+        # 详情写去年 12 月）时按列表日期前后年份取最近结果。
+        publish_dt = news_crawler.parse_datetime(
+            publish_raw, None, tz_name, allow_year_adjust=False
+        )
+        around_applied = False
+        if stored_list_dt is not None and news_crawler.is_yearless_month_day(publish_raw):
+            around = news_crawler.parse_yearless_around(publish_raw, stored_list_dt, tz_name)
+            if around is not None:
+                publish_dt = around
+                around_applied = True
+        publish_text = (
+            news_crawler.format_publish_time(publish_dt, tz_name)
+            if publish_dt is not None
+            else ""
+        )
         # 先按库内列表日期年份补齐无年份详情时间，再计算偏差：
         # “09月30日 09:30”若先按当前年解析，会与 2025-09-30 相差一年，
         # 偏差校验会直接换成列表日期，导致详情时分和来源丢失。
@@ -245,6 +255,7 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             and publish_dt is not None
             and publish_source != "list"
             and news_crawler.is_yearless_month_day(publish_raw)
+            and not around_applied
         ):
             reconciled = news_crawler.align_yearless_datetime(
                 publish_dt, stored_list_dt, tz_name

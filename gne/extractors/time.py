@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import re
@@ -25,6 +26,10 @@ _BLOCK_TAGS = frozenset(
 # script/style 里的日期是脚本变量，不是页面展示的发布时间；扫描文本时必须排除。
 _SKIP_TAGS = frozenset({"script", "style", "noscript", "template", "iframe", "footer", "nav"})
 _SIDEBAR_HINTS = ("sidebar", "related", "recommend", "advert", "ad-", " nav")
+_ISO_DATETIME_RE = re.compile(
+    r"((?:19|20)\d{2}-\d{1,2}-\d{1,2}[T ]\d{1,2}:\d{2}"
+    r"(?::\d{2}(?:\.\d{1,6})?)?(?:Z|z|[+-]\d{2}:?\d{2})?)"
+)
 # “发布时间：2026年11月11日”这类带标签的日期，比正文里的时间更可信。
 # 标签与日期之间最多看 30 个字符，避免把后文无关日期带进来。
 _LABELED_DATE_RE = re.compile(
@@ -102,13 +107,17 @@ class TimeExtractor:
         """Return the first valid date substring from text, or an empty string."""
         # XPath/meta 可能给出带时区的 ISO 时间（2026-11-10T23:30:00Z）。
         # 先完整保留，交给 parse_datetime 按真实偏移解析；若只截日期会丢失时刻和时区。
-        iso = re.search(
-            r"((?:19|20)\d{2}-\d{1,2}-\d{1,2}[T ]\d{1,2}:\d{2}"
-            r"(?::\d{2}(?:\.\d{1,6})?)?(?:Z|z|[+-]\d{2}:?\d{2})?)",
-            text,
-        )
-        if iso:
-            return iso.group(1)
+        for iso in _ISO_DATETIME_RE.finditer(text):
+            candidate = iso.group(1)
+            normalized = candidate
+            if normalized.endswith(("Z", "z")):
+                normalized = normalized[:-1] + "+00:00"
+            normalized = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", normalized)
+            try:
+                dt.datetime.fromisoformat(normalized)
+            except ValueError:
+                continue
+            return candidate
         for pattern in self.time_pattern:
             match = pattern.search(text)
             if match:
@@ -158,8 +167,14 @@ class TimeExtractor:
         for value in values:
             if isinstance(value, str):
                 text = value
-            elif hasattr(value, "text_content"):
-                text = value.text_content()
+            elif isinstance(getattr(value, "tag", None), str):
+                # lxml.html 元素有 text_content()；纯 etree 元素没有，用 itertext 兜底，
+                # 避免配置写成元素路径时被静默跳过。
+                text_content = getattr(value, "text_content", None)
+                if callable(text_content):
+                    text = text_content()
+                else:
+                    text = "".join(value.itertext())
             else:
                 # count()/boolean() 等标量结果没有日期语义，直接跳过。
                 continue
@@ -304,9 +319,9 @@ class TimeExtractor:
             if self._is_block(sibling):
                 break
             if not self._is_skipped_element(sibling):
-                for text in sibling.itertext():
-                    if text:
-                        yield str(text)
+                # 必须复用 _text_nodes：脚本/样式里的日期是变量，不是页面可见文本。
+                for text in self._text_nodes(sibling):
+                    yield str(text)
             if sibling.tail:
                 yield str(sibling.tail)
             sibling = sibling.getnext()
