@@ -233,10 +233,10 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 
 ```json
 {
-  "workers": 3,
+  "workers": 16,
   "days": 3,
   "timezone": "Asia/Shanghai",
-  "delay": 0.5,
+  "delay": 0.3,
   "sources": [
     {
       "name": "example",
@@ -266,7 +266,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | `article_title_xpath` | 否 | 详情页标题 XPath（`<title>` 是站点名、真标题在正文 h1 时使用）；推荐直接写标题元素（如 `//h1`），会取其全部文本（含 `<em>` 等子元素）；`/text()` 只取第一个直接文本节点，标题含子标签时会截断；以 `string(` 开头的表达式会被忽略 |
 | `timezone` | 否 | 默认 `Asia/Shanghai` |
 | `render` | 否 | 列表页是否强制 Chrome 渲染 |
-| `delay` | 否 | 请求间隔秒数，默认 0.5；列表页与文章详情页请求前都会等待 |
+| `delay` | 否 | 请求间隔秒数，默认 0.3；列表页与文章详情页请求前都会等待 |
 
 ### XPath 编写约定
 
@@ -396,6 +396,8 @@ docker compose run --rm crawler run --config sources.local.json --days 3
 | `--workers` | 站点级并发数 |
 | `--limit-per-source` | 每个站点最多处理多少条（只计实际处理的条目；已入库被跳过的条目不占名额），调试用 |
 | `--force` | 忽略已抓记录，强制重抓 |
+
+> **内存提示**：`--workers` 是站点级线程数；开启浏览器回退时每线程可能各自启动一个 Chromium（约 200–300 MB）。`workers=16` 建议至少 4 GB 可用内存；小内存机器或 JS 站点较多时请调低，否则可能被 OOM Kill。
 
 ### 单 URL 抓取
 

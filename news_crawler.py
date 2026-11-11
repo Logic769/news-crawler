@@ -542,10 +542,10 @@ def load_config(path: str) -> dict:
     if isinstance(data, list):
         data = {"sources": data}
     data.setdefault("sources", [])
-    data.setdefault("workers", 3)
+    data.setdefault("workers", 16)
     data.setdefault("days", 3)
     data.setdefault("timezone", "Asia/Shanghai")
-    data.setdefault("delay", 0.5)
+    data.setdefault("delay", 0.3)
     for source in data.get("sources") or []:
         if isinstance(source, dict) and "article_title_xpath" in source:
             source["article_title_xpath"] = _validate_title_xpath(
@@ -1101,7 +1101,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             get_timezone(config.get("timezone", "Asia/Shanghai"))
         ) - dt.timedelta(days=args.days or config.get("days", 3))
 
-    workers = args.workers or int(config.get("workers", 3))
+    workers = args.workers or int(config.get("workers", 16))
     workers = max(1, min(workers, len(sources)))
     print(
         f"开始抓取 {len(sources)} 个站点（最近 {args.days or config.get('days', 3)} 天）"
