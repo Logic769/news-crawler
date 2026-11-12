@@ -150,6 +150,12 @@ def row_to_article(
         if "list_publish_time" in keys
         else "",
         "title_source": (row["title_source"] or "") if "title_source" in keys else "",
+        # 项目申报特化字段：新闻站点为空字符串。
+        "deadline": (row["deadline"] or "") if "deadline" in keys else "",
+        "deadline_raw": (row["deadline_raw"] or "") if "deadline_raw" in keys else "",
+        "project_status": (row["project_status"] or "")
+        if "project_status" in keys
+        else "",
         "timezone": tz_name,
         "content": content if include_content else None,
         # 保留段落换行的原始正文；与 content 一样只在详情（include_content）中返回。
@@ -174,6 +180,8 @@ def query_articles(
     source: str | None,
     published_from: str | None,
     published_to: str | None,
+    deadline_from: str | None,
+    deadline_to: str | None,
     q: str | None,
     page: int,
     page_size: int,
@@ -211,6 +219,13 @@ def query_articles(
         params.extend(
             [_wall_bound_to_utc(published_to, default_tz), published_to]
         )
+    # 项目申报公告没有 publish_time，按截止时间过滤/排序用 deadline 列。
+    if deadline_from:
+        where.append("deadline <> '' AND deadline >= ?")
+        params.append(deadline_from)
+    if deadline_to:
+        where.append("deadline <> '' AND deadline <= ?")
+        params.append(deadline_to)
     if q:
         where.append(
             "(title LIKE ? ESCAPE '!' OR content LIKE ? ESCAPE '!' "
@@ -224,6 +239,12 @@ def query_articles(
         "published_desc": "publish_time DESC, source ASC, url ASC",
         "published_asc": "publish_time ASC, source ASC, url ASC",
         "updated_desc": "updated_at DESC, source ASC, url ASC",
+        "deadline_desc": (
+            "NULLIF(deadline, '') IS NULL, deadline DESC, source ASC, url ASC"
+        ),
+        "deadline_asc": (
+            "NULLIF(deadline, '') IS NULL, deadline ASC, source ASC, url ASC"
+        ),
     }.get(order, "publish_time DESC, source ASC, url ASC")
 
     with read_connection(db_path) as conn:
@@ -240,6 +261,7 @@ def query_articles(
             columns = (
                 "article_id, source, url, list_title, title, publish_time, timezone, "
                 "publish_time_source, publish_time_raw, list_publish_time, title_source, "
+                "deadline, deadline_raw, project_status, "
                 "author, content, COALESCE(content_length, length(content)) AS content_length, "
                 "images, status, error, first_seen_at, updated_at"
             )
@@ -247,6 +269,7 @@ def query_articles(
             columns = (
                 "article_id, source, url, list_title, title, publish_time, timezone, "
                 "publish_time_source, publish_time_raw, list_publish_time, title_source, "
+                "deadline, deadline_raw, project_status, "
                 "author, COALESCE(content_length, length(content)) AS content_length, "
                 "images, status, error, first_seen_at, updated_at"
             )
@@ -292,7 +315,8 @@ def get_article(
         row = conn.execute(
             "SELECT article_id, source, url, list_title, title, publish_time, "
             "timezone, publish_time_source, publish_time_raw, list_publish_time, "
-            "title_source, author, content, content_length, raw_content, images, "
+            "title_source, deadline, deadline_raw, project_status, "
+            "author, content, content_length, raw_content, images, "
             "status, error, first_seen_at, updated_at "
             "FROM articles WHERE article_id = ?",
             (article_id,),

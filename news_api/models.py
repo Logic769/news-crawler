@@ -89,6 +89,10 @@ class ArticleOut(BaseModel):
     publish_time_raw: str = ""
     list_publish_time: str = ""
     title_source: str = ""
+    # 项目申报列表特化字段：新闻站点为空字符串。
+    deadline: str = ""
+    deadline_raw: str = ""
+    project_status: str = ""
     timezone: str
     content: str | None = None
     # 保留段落换行的原始正文：只在详情返回，列表接口（include_content=false）为 null。

@@ -38,6 +38,7 @@ from gne.netguard import UnsafeUrlError, ensure_url_allowed
 from url_extract import (
     BROWSER_FALLBACK_HTTP_CODES,
     close_thread_browser,
+    content_is_too_short,
     extract_from_html,
     fetch_html,
     fetch_html_with_browser,
@@ -51,7 +52,7 @@ DEFAULT_DB_FILE = "news.db"
 # 锁等待时长与 sqlite3.connect(timeout=...) 保持一致，避免 PRAGMA 把
 # 30s 的连接超时悄悄压成 5s（并发写时更早报 database is locked）。
 DB_BUSY_TIMEOUT_MS = 30000
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS articles (
@@ -71,6 +72,11 @@ CREATE TABLE IF NOT EXISTS articles (
     list_publish_time TEXT,
     -- 标题来源：article_title_xpath / gne_default。
     title_source TEXT,
+    -- 项目申报列表特化：截止时间与申报状态（news 站点为 NULL）。
+    -- deadline 存站点本地墙钟，deadline_raw 存列表原文。
+    deadline     TEXT,
+    deadline_raw TEXT,
+    project_status TEXT,
     timezone     TEXT,
     author       TEXT,
     content      TEXT,
@@ -134,6 +140,9 @@ _PERFORMANCE_INDEX_SQL = (
     # v6：时间过滤改用 publish_time_utc；放迁移事务内建，老库先 ALTER 补列再建索引。
     "CREATE INDEX IF NOT EXISTS idx_articles_publish_time_utc "
     "ON articles(publish_time_utc)",
+    # v8：项目申报公告按 deadline 排序/过滤（项目行 publish_time 为空）。
+    "CREATE INDEX IF NOT EXISTS idx_articles_deadline "
+    "ON articles(deadline)",
 )
 
 
@@ -511,6 +520,9 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             "publish_time_raw",
             "list_publish_time",
             "title_source",
+            "deadline",
+            "deadline_raw",
+            "project_status",
         } <= columns
         and required_indexes <= indexes
     ):
@@ -531,6 +543,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE articles ADD COLUMN publish_time_utc TEXT")
     # v7：记录发布时间/标题来源，供站点质量统计与问题排查；老行保持 NULL。
     for column in ("publish_time_source", "publish_time_raw", "list_publish_time", "title_source"):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE articles ADD COLUMN {column} TEXT")
+    # v8：项目申报列表特化，截止时间与申报状态；新闻站点保持 NULL。
+    for column in ("deadline", "deadline_raw", "project_status"):
         if column not in columns:
             conn.execute(f"ALTER TABLE articles ADD COLUMN {column} TEXT")
 
@@ -698,6 +714,24 @@ def _validate_title_xpath(name: object, value: object) -> str:
     return _validate_xpath_field(name, value, "article_title_xpath")
 
 
+def _coerce_bool(value: object, *, default: bool) -> tuple[bool, bool]:
+    """把配置里的布尔值归一化，返回 (结果, 是否合法)。
+
+    JSON 里常见的 "false"/"true"/0/1 字符串不应被 bool() 误判为 True。
+    """
+    if isinstance(value, bool):
+        return value, True
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value), True
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes", "on"):
+            return True, True
+        if normalized in ("false", "0", "no", "off"):
+            return False, True
+    return default, False
+
+
 def load_config(path: str) -> dict:
     """读取 JSON 配置并补齐默认值，同时校验各站点的字段 XPath。"""
     if not Path(path).exists():
@@ -722,6 +756,50 @@ def load_config(path: str) -> dict:
                 source[field_name] = _validate_xpath_field(
                     source.get("name"), source.get(field_name), field_name
                 )
+        # 项目申报特化：deadline_xpath / project_status_xpath 与标题时间 XPath
+        # 走同一套校验（非法或标量表达式直接忽略，不中断整站抓取）。
+        for field_name in ("deadline_xpath", "project_status_xpath"):
+            if field_name in source:
+                source[field_name] = _validate_xpath_field(
+                    source.get("name"), source.get(field_name), field_name
+                )
+        listing_type = str(source.get("listing_type") or "news").strip().lower()
+        if listing_type not in ("news", "project_application"):
+            LOG.warning(
+                "站点 %r 的 listing_type %r 不受支持，按 news 处理",
+                source.get("name"),
+                source.get("listing_type"),
+            )
+            listing_type = "news"
+        source["listing_type"] = listing_type
+        # 项目申报列表本身即有效数据（标题+截止时间+状态），详情页可能要求
+        # 登录；默认允许无正文入库，news 站点仍要求正文。
+        default_content_required = listing_type != "project_application"
+        if "content_required" in source:
+            content_required, valid = _coerce_bool(
+                source.get("content_required"), default=default_content_required
+            )
+            if not valid:
+                LOG.warning(
+                    "站点 %r 的 content_required 不是布尔值，回退为 %s: %r",
+                    source.get("name"),
+                    default_content_required,
+                    source.get("content_required"),
+                )
+            source["content_required"] = content_required
+        else:
+            source["content_required"] = default_content_required
+        if listing_type == "project_application" and source.get("date_xpath"):
+            LOG.warning(
+                "站点 %r 是项目申报模式，date_xpath 不会写入 publish_time，"
+                "截止时间请改用 deadline_xpath",
+                source.get("name"),
+            )
+        if listing_type == "project_application" and not source.get("deadline_xpath"):
+            LOG.warning(
+                "站点 %r 是项目申报模式但未配置 deadline_xpath，deadline 将为空",
+                source.get("name"),
+            )
         source.setdefault("date_skew_days", data["date_skew_days"])
         try:
             raw_skew = source["date_skew_days"]
@@ -802,6 +880,8 @@ def parse_list_items(html: str, source: dict, base_url: str) -> list[dict]:
         return []
     tz_name = source.get("timezone", "Asia/Shanghai")
     date_format = source.get("date_format")
+    deadline_format = source.get("deadline_format") or date_format
+    is_project = source.get("listing_type") == "project_application"
     items: list[dict] = []
     seen: set[str] = set()
 
@@ -817,7 +897,12 @@ def parse_list_items(html: str, source: dict, base_url: str) -> list[dict]:
             continue
         seen.add(url)
         date_xpath = source.get("date_xpath")
-        if date_xpath:
+        if is_project and not date_xpath:
+            # 项目申报列表通常只有「截止时间」没有发布时间，不能把截止时间
+            # 当发布日期；未配置 date_xpath 时直接保持 parsed=None。
+            date_text = ""
+            parsed = None
+        elif date_xpath:
             date_text = xpath_text(node, date_xpath)
             parsed = parse_datetime(date_text, date_format, tz_name)
             if parsed is None:
@@ -839,12 +924,25 @@ def parse_list_items(html: str, source: dict, base_url: str) -> list[dict]:
                     node_text = node_text.replace(title_text, " ", 1)
                 date_text = node_text
                 parsed = parse_datetime(date_text, date_format, tz_name)
+        deadline_xpath = source.get("deadline_xpath")
+        deadline_text = ""
+        deadline_dt = None
+        if deadline_xpath:
+            deadline_text = xpath_text(node, deadline_xpath)
+            deadline_dt = parse_datetime(deadline_text, deadline_format, tz_name)
+        project_status = ""
+        status_xpath = source.get("project_status_xpath")
+        if status_xpath:
+            project_status = xpath_text(node, status_xpath)
         items.append(
             {
                 "title": title,
                 "url": url,
                 "date_text": date_text,
                 "parsed": parsed,
+                "deadline_text": deadline_text,
+                "deadline": deadline_dt,
+                "project_status": project_status,
             }
         )
     return items
@@ -1446,6 +1544,9 @@ def save_article(
     publish_time_raw: str = "",
     list_publish_time: str = "",
     title_source: str = "",
+    deadline: str = "",
+    deadline_raw: str = "",
+    project_status: str = "",
     timezone: str = "",
     author: str = "",
     content: str = "",
@@ -1478,10 +1579,11 @@ def save_article(
         INSERT INTO articles (
             article_id, source, url, list_title, title, publish_time,
             publish_time_utc, publish_time_source, publish_time_raw,
-            list_publish_time, title_source, timezone, author, content,
+            list_publish_time, title_source, deadline, deadline_raw,
+            project_status, timezone, author, content,
             content_length, raw_content, images, status, error,
             first_seen_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source, url) DO UPDATE SET
             article_id = excluded.article_id,
             list_title = COALESCE(NULLIF(excluded.list_title, ''), articles.list_title),
@@ -1506,6 +1608,10 @@ def save_article(
             END,
             list_publish_time = COALESCE(NULLIF(excluded.list_publish_time, ''), articles.list_publish_time),
             title_source = COALESCE(NULLIF(excluded.title_source, ''), articles.title_source),
+            -- 项目申报字段：本次为空时保留旧值（部分更新语义与其他字段一致）。
+            deadline = COALESCE(NULLIF(excluded.deadline, ''), articles.deadline),
+            deadline_raw = COALESCE(NULLIF(excluded.deadline_raw, ''), articles.deadline_raw),
+            project_status = COALESCE(NULLIF(excluded.project_status, ''), articles.project_status),
             timezone = COALESCE(NULLIF(excluded.timezone, ''), articles.timezone),
             author = COALESCE(NULLIF(excluded.author, ''), articles.author),
             content = COALESCE(NULLIF(excluded.content, ''), articles.content),
@@ -1530,6 +1636,9 @@ def save_article(
             publish_time_raw,
             list_publish_time,
             title_source,
+            deadline,
+            deadline_raw,
+            project_status,
             timezone,
             author,
             content,
@@ -1567,7 +1676,7 @@ def should_skip_stored(
     也就是重抓一次：宁可多抓一次，也不要让一批条目永远停留在无法判定的状态。
     """
     row = conn.execute(
-        "SELECT status, publish_time, timezone FROM articles "
+        "SELECT status, publish_time, timezone, deadline FROM articles "
         "WHERE source = ? AND url = ?",
         (source, url),
     ).fetchone()
@@ -1579,7 +1688,109 @@ def should_skip_stored(
         return False
     stored_tz = (row[2] or "").strip() or timezone_name
     stored_date = parse_datetime(row[1] or "", None, stored_tz)
+    if stored_date is None and row[3]:
+        # 项目申报行没有 publish_time，过期判定依据 deadline。
+        stored_date = parse_datetime(row[3] or "", None, stored_tz)
     return stored_date is not None and stored_date < cutoff
+
+
+def _process_project_entry(
+    conn: sqlite3.Connection,
+    source: dict,
+    entry: dict,
+    cutoff: dt.datetime,
+    force: bool,
+    delay: float = 0.0,
+) -> str:
+    """处理项目申报列表条目（listing_type=project_application）。
+
+    与新闻条目的差别：
+    - 列表本身即完整数据（标题/截止时间/申报状态/链接），deadline 单独入库；
+    - 不把截止时间伪装成发布时间，publish_time 保持为空；
+    - content_required=False（项目站点默认）时，详情页登录墙/无正文仍记为
+      ok，只保存列表字段，避免 no_content 每次重跑；配 true 则退回新闻语义。
+    """
+    url = entry["url"]
+    source_name = source["name"]
+    tz_name = source.get("timezone", "Asia/Shanghai")
+    content_required = bool(source.get("content_required", False))
+
+    if not force and should_skip_stored(conn, source_name, url, cutoff, tz_name):
+        return "skip"
+
+    # 只认 deadline 列。绝不回退到 parsed（列表发布时间）：项目站点若误配
+    # date_xpath 而漏配 deadline_xpath，回退会把发布时间写成截止时间，
+    # 并可能据此把仍在受理的公告误判为 old。
+    deadline_dt = entry.get("deadline")
+    deadline_text = format_publish_time(deadline_dt, tz_name) if deadline_dt else ""
+    deadline_raw = entry.get("deadline_text") or ""
+    project_status = entry.get("project_status") or ""
+    if deadline_raw and deadline_dt is None:
+        LOG.warning(
+            "[%s] 无法解析项目截止时间 %r，deadline 留空：%s",
+            source_name,
+            deadline_raw,
+            url,
+        )
+
+    def _save(status: str, **kwargs: Any) -> str:
+        # 项目申报的列表标题就是公告标题；详情页常是登录墙，GNE 抽到的
+        # <title> 往往是站点名，因此统一以列表标题作为展示标题。
+        kwargs.setdefault("title", entry.get("title", ""))
+        kwargs.setdefault("title_source", "list_title")
+        save_article(
+            conn,
+            source_name,
+            url,
+            list_title=entry.get("title", ""),
+            deadline=deadline_text,
+            deadline_raw=deadline_raw,
+            project_status=project_status,
+            timezone=tz_name,
+            status=status,
+            **kwargs,
+        )
+        return status
+
+    # 截止时间早于窗口起点视为过期条目，与新闻的 old 语义一致（可用 --days 放宽）。
+    if deadline_dt and deadline_dt < cutoff and not force:
+        return _save("old")
+
+    if delay > 0:
+        time.sleep(delay)
+    fetched = fetch_article_html(url)
+    if not fetched:
+        if content_required:
+            return _save("error", error="抓取 HTML 失败（直接抓取和浏览器回退均失败）")
+        return _save("ok")
+
+    html, already_rendered = fetched
+    result = extract_article(
+        html,
+        url,
+        already_rendered=already_rendered,
+        title_xpath=source.get("article_title_xpath") or "",
+        publish_time_xpath=source.get("article_publish_time_xpath") or "",
+    )
+    if result is None:
+        if content_required:
+            return _save("no_content", error="无法提取正文")
+        return _save("ok")
+
+    raw_content = str(result.get("content") or "").strip()
+    # 登录墙/占位页：GNE 会把站点名当标题、把「还没有账号？立即注册」这类
+    # 十几字提示当正文。低于 100 字一律不当作详情内容，只保留列表字段。
+    if content_is_too_short(clean_text(raw_content)):
+        if content_required:
+            return _save("no_content", error="无法提取正文")
+        return _save("ok")
+
+    return _save(
+        "ok",
+        content=clean_text(raw_content),
+        raw_content=raw_content,
+        images=normalize_images_for_update(result.get("images"), url),
+    )
 
 
 def process_entry(
@@ -1591,6 +1802,8 @@ def process_entry(
     delay: float = 0.0,
 ) -> str:
     """处理单篇文章：去重、时间过滤、抓取、抽取并入库，返回处理结果标签。"""
+    if source.get("listing_type") == "project_application":
+        return _process_project_entry(conn, source, entry, cutoff, force, delay)
     url = entry["url"]
     source_name = source["name"]
     tz_name = source.get("timezone", "Asia/Shanghai")
@@ -1984,15 +2197,21 @@ def cmd_test(args: argparse.Namespace) -> None:
                 collected = collect_list_entries_detailed(source)
                 entries = collected["items"]
                 for entry in entries[: args.limit]:
-                    parsed = entry.get("parsed")
+                    parsed = entry.get("deadline") or entry.get("parsed")
                     date_show = (
                         parsed.strftime("%Y-%m-%d %H:%M")
                         if parsed
-                        else (entry.get("date_text") or "日期未知")
+                        else (
+                            entry.get("deadline_text")
+                            or entry.get("date_text")
+                            or "日期未知"
+                        )
                     )
+                    status_show = entry.get("project_status") or ""
                     title = entry["title"]
                     url = entry["url"]
-                    print(f"{date_show:<20} {title[:50]:<52} {url}")
+                    suffix = f" [{status_show}]" if status_show else ""
+                    print(f"{date_show:<20} {title[:50]:<52}{suffix} {url}")
                 print(
                     f"共解析到 {len(entries)} 条（{collected['pages']} 页，"
                     f"停止原因：{collected['stop_reason']}）"
