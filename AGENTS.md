@@ -316,7 +316,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 - `deadline_xpath` 解析的截止时间写 `deadline`/`deadline_raw`，不写 `publish_time`（项目行 `publish_time` 为空，按发布时间排序会排在末尾；`/v1/articles` 支持 `order=deadline_desc|deadline_asc` 与 `deadline_from`/`deadline_to`，`published_from`/`published_to` 会排除项目行）；
 - `title` 与 `list_title` 都写列表标题，`title_source=list_title`（详情页 `<title>` 通常是站点名，不可信）；
 - `content_required` 默认 `false`：详情抓取失败、或正文短于 100 字（登录墙占位）时只保存列表字段并记 `ok`，下次运行按 `ok` 跳过；设为 `true` 则按新闻语义记 `no_content`/`error` 并重试；
-- 截止时间早于抓取窗口起点时记 `old`（用 `--force` 可强制重抓），避免每次重跑历年公告；已入库 `ok`/`old` 行会在后续运行中按列表刷新 `title`/`list_title`/`title_source`/`deadline`/`deadline_raw`/`project_status`，不抓详情；原 `old` 行截止时间原文非空且变为不可解析（如“常年受理”）时恢复 `ok`，`content_required=true` 时继续抓正文（截止单元格为空时保留旧值与 `old`）；同一 URL 从新闻切项目会清空 `publish_time*` 但保留 `content`/`raw_content`/`author`/`images`；无年份截止时间按列表发布日期（缺失时当前时间）取最近合法年份（列表状态为已截止时取不晚于该日期、且不早于列表发布日期、不晚于抓取时刻的年份，列表发布日期缺失时只约束上界；区间内无候选时 `deadline` 留空、仅保留原文；否则取不早于该日期）；
+- 截止时间早于抓取窗口起点时记 `old`（用 `--force` 可强制重抓），避免每次重跑历年公告；已入库 `ok`/`old` 行会在后续运行中按列表刷新 `title`/`list_title`/`title_source`/`deadline`/`deadline_raw`/`project_status`，不抓详情；原 `old` 行截止时间原文非空且变为不可解析（如“常年受理”）时恢复 `ok`，`content_required=true` 时继续抓正文（截止单元格为空时保留旧值与 `old`）；同一 URL 从新闻切项目会清空 `publish_time*` 但保留 `content`/`raw_content`/`author`/`images`；无年份截止时间按列表发布日期（缺失时当前时间）取最近合法年份（列表状态为已截止时取不晚于该日期、且不早于列表发布日期、不晚于抓取时刻的年份，列表发布日期缺失时只约束上界；区间内无候选时 `deadline` 留空、仅保留原文；否则取不早于该日期；重抓历年已截止公告时无年份截止时间可能随抓取年份后移，属“取最近合法年份”的已知取舍）；
 - 项目模式无需配置 `date_xpath`；`parse_list_items` 在未配置 `date_xpath` 时保持 `parsed=None`，不会把截止时间当发布时间。
 
 ```json

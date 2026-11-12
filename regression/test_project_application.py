@@ -809,9 +809,25 @@ class ProjectApplicationTest(unittest.TestCase):
         deadline = entries[0]["deadline"]
         self.assertIsNotNone(deadline)
         assert deadline is not None
-        self.assertEqual(deadline.strftime("%Y-%m-%d"), "2026-10-01")
+        # 端到端窗口上界随抓取时刻推进，只断言不变量；精确值由固定窗口锁定。
+        self.assertEqual((deadline.month, deadline.day), (10, 1))
+        self.assertGreaterEqual(deadline.date(), dt.date(2026, 9, 15))
+        self.assertLessEqual(deadline.date(), dt.datetime.now(tz).date())
+        fixed = news_crawler.parse_deadline_after(
+            "10月01日",
+            None,
+            dt.datetime(2026, 9, 15, tzinfo=tz),
+            "Asia/Shanghai",
+            allow_past=True,
+            not_before=dt.datetime(2026, 9, 15, tzinfo=tz),
+            not_after=dt.datetime(2026, 11, 12, tzinfo=tz),
+        )
+        self.assertIsNotNone(fixed)
+        assert fixed is not None
+        self.assertEqual(fixed.strftime("%Y-%m-%d"), "2026-10-01")
 
     def test_project_status_closed_tolerates_inner_whitespace(self) -> None:
+        tz = ZoneInfo("Asia/Shanghai")
         self.assertTrue(news_crawler._project_status_closed("已 截止"))
         self.assertTrue(news_crawler._project_status_closed(" 已\u3000截止 "))
         self.assertFalse(news_crawler._project_status_closed("申报中"))
@@ -830,7 +846,22 @@ class ProjectApplicationTest(unittest.TestCase):
         deadline = entries[0]["deadline"]
         self.assertIsNotNone(deadline)
         assert deadline is not None
-        self.assertEqual(deadline.strftime("%Y-%m-%d"), "2026-10-01")
+        # 端到端窗口上界随抓取时刻推进，只断言不变量；精确值由固定窗口锁定。
+        self.assertEqual((deadline.month, deadline.day), (10, 1))
+        self.assertGreaterEqual(deadline.date(), dt.date(2026, 9, 15))
+        self.assertLessEqual(deadline.date(), dt.datetime.now(tz).date())
+        fixed = news_crawler.parse_deadline_after(
+            "10月01日",
+            None,
+            dt.datetime(2026, 9, 15, tzinfo=tz),
+            "Asia/Shanghai",
+            allow_past=True,
+            not_before=dt.datetime(2026, 9, 15, tzinfo=tz),
+            not_after=dt.datetime(2026, 11, 12, tzinfo=tz),
+        )
+        self.assertIsNotNone(fixed)
+        assert fixed is not None
+        self.assertEqual(fixed.strftime("%Y-%m-%d"), "2026-10-01")
 
     def test_deadline_closed_uses_year_after_publish(self) -> None:
         tz = ZoneInfo("Asia/Shanghai")
@@ -915,6 +946,10 @@ class ProjectApplicationTest(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         # 原文必须保留；可解析结果由固定窗口锁定（抓取时刻推进后属已知取舍）。
         self.assertEqual(entries[0]["deadline_text"], "10月01日")
+        deadline = entries[0]["deadline"]
+        self.assertTrue(
+            deadline is None or deadline.date() <= dt.datetime.now(tz).date()
+        )
         fixed = news_crawler.parse_deadline_after(
             "10月01日",
             None,
