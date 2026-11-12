@@ -166,6 +166,57 @@ def get_timezone(name: str | None):
         return dt.datetime.now().astimezone().tzinfo
 
 
+def resolve_timezone_name(
+    value: Any,
+    fallback: str,
+    *,
+    site_name: str | None = None,
+    origin: str = "config",
+    log_level: int = logging.WARNING,
+) -> str:
+    """把配置里的时区名归一为可用值：空串与非法名都回退 ``fallback``。
+
+    ``get_timezone()`` 对空名和非法名都会静默回落到运行环境本地时区，配置写错
+    时同一批数据的日期解析、墙钟格式化与 UTC 换算会落到不同口径（容器 TZ=UTC
+    与站点实际时区可能差 8 小时），因此加载配置时就把名字定死，后续各环节
+    拿到的永远是同一个可用时区。
+
+    ``origin`` 区分值的来源：``config``（站点/顶层配置）与 ``row``（入库行内的
+    ``articles.timezone``）。行内脏值是历史数据问题，排障时不该让人去改配置，
+    因此文案单独说明。``log_level`` 供只读路径降噪（``should_skip_stored`` 每轮
+    都会检查所有 ``old`` 行，重复告警没有意义，真正的修复发生在刷新那一轮）。
+    """
+    name = str(value or "").strip()
+    if not name:
+        return fallback
+    try:
+        ZoneInfo(name)
+    except Exception:
+        if origin == "row":
+            if site_name:
+                LOG.log(
+                    log_level,
+                    "站点 %r 的行内 timezone %r 无效，回退为 %r",
+                    site_name,
+                    name,
+                    fallback,
+                )
+            else:
+                LOG.log(log_level, "行内 timezone %r 无效，回退为 %r", name, fallback)
+        elif site_name:
+            LOG.log(
+                log_level,
+                "站点 %r 的 timezone %r 无效，回退为 %r",
+                site_name,
+                name,
+                fallback,
+            )
+        else:
+            LOG.log(log_level, "顶层 timezone %r 无效，回退为 %r", name, fallback)
+        return fallback
+    return name
+
+
 def clean_text(value: Any) -> str:
     if value is None:
         return ""
@@ -910,12 +961,21 @@ def load_config(path: str) -> dict:
     data.setdefault("sources", [])
     data.setdefault("workers", 16)
     data.setdefault("days", 3)
-    data.setdefault("timezone", "Asia/Shanghai")
+    # 顶层时区先归一：空串/非法值回退 "Asia/Shanghai"，避免 get_timezone()
+    # 静默用运行环境本地时区解析日期（容器 TZ 与站点实际时区可能差 8 小时）。
+    data["timezone"] = resolve_timezone_name(data.get("timezone"), "Asia/Shanghai")
     data.setdefault("delay", 0.3)
     data.setdefault("date_skew_days", 7)
     for source in data.get("sources") or []:
         if not isinstance(source, dict):
             continue
+        # 站点时区在加载期定死：空串/非法值回退顶层 timezone（默认
+        # Asia/Shanghai）。否则 get_timezone('') 会按运行环境本地时区解析列表
+        # 日期并格式化墙钟，刷新时又按行内时区换算 UTC，同一串时间被两种口径
+        # 解释，published_from/published_to 过滤会错位。
+        source["timezone"] = resolve_timezone_name(
+            source.get("timezone"), data["timezone"], site_name=source.get("name")
+        )
         for field_name in (
             "article_title_xpath",
             "article_publish_time_xpath",
@@ -1050,7 +1110,10 @@ def parse_list_items(html: str, source: dict, base_url: str) -> list[dict]:
             exc,
         )
         return []
-    tz_name = source.get("timezone", "Asia/Shanghai")
+    # load_config 已把空串/非法值归一；直接构造 source 的调用方（测试、
+    # 内部复用）没有这一层，这里兜底为仓库默认时区，避免 get_timezone('')
+    # 按运行环境本地时区生成墙钟、换算时又用别的时区。
+    tz_name = source.get("timezone") or "Asia/Shanghai"
     date_format = source.get("date_format")
     deadline_format = source.get("deadline_format") or date_format
     is_project = source.get("listing_type") == "project_application"
@@ -1892,7 +1955,11 @@ def should_skip_stored(
         return True
     if row[0] != "old":
         return False
-    stored_tz = (row[2] or "").strip() or timezone_name
+    # 行内时区可能是历史版本写入的非法名：get_timezone() 会静默回落到运行环境
+    # 本地时区，边界条目会被判错，这里先归一再用（空值仍回落到站点配置）。
+    stored_tz = resolve_timezone_name(
+        row[2], timezone_name, site_name=source, origin="row", log_level=logging.DEBUG
+    )
     stored_date = parse_datetime(row[1] or "", None, stored_tz)
     if stored_date is None and row[3]:
         # 没有 publish_time 时改用 deadline 判定：项目行未配置 date_xpath 时
@@ -1955,7 +2022,15 @@ def _refresh_project_listing(
     # 行内记录的时区是旧墙钟的解释口径：站点 timezone 配置被修正后，沿用旧
     # 墙钟时必须按它换算 UTC，否则同一串墙钟会被当成新时区的本地时间（差 8
     # 小时以上），API 展示与 published_from/published_to 过滤都会错位。
-    old_timezone = str(row[12] or "")
+    # 空值表示写入时的口径未知（不能拿站点配置冒充）；非空但非法的历史值先
+    # 归一再用，否则 get_timezone() 会静默回落到运行环境时区，换算随之错位。
+    # 脏值判定用未 strip 的原文：首尾带空白的合法名也属于要写回一次的历史值。
+    old_timezone_raw = str(row[12] or "")
+    old_timezone = ""
+    if old_timezone_raw.strip():
+        old_timezone = resolve_timezone_name(
+            old_timezone_raw, timezone_name, site_name=source_name, origin="row"
+        )
     # content_required 从 false 改成 true 后，之前以“列表字段完整”入库的 ok 行
     # 正文仍为空；必须按正文要求重新抓详情，不能因为列表字段没变就 skip。
     content_missing = content_required and old_content_length < MIN_CONTENT_LENGTH
@@ -2070,6 +2145,16 @@ def _refresh_project_listing(
         # 接受本次列表日期时补写行内 timezone，让墙钟与 UTC 的换算依据可自证；
         # 沿用旧墙钟且行内时区缺失时 new_timezone 保持空，不把猜测写库。
         unchanged = False
+    if old_timezone and old_timezone_raw != old_timezone:
+        # 行内时区名是历史脏值（如 "Asia/Shangha"）：本轮已按归一值换算，再把
+        # 合法名写回，避免每轮都要重新猜一次，也避免配置修好后仍留着一个会让
+        # get_timezone() 回落运行环境时区的值。
+        unchanged = False
+    elif old_timezone_raw and not old_timezone:
+        # 行内时区只剩空白：语义上等同「未知」，本轮写成 NULL（空串按 NULL 落库），
+        # 避免 /v1/sources 按 timezone 聚合时多出一个 "   " 分组、API 也把它当成
+        # 合法时区返回。
+        unchanged = False
     if unchanged:
         if new_status == "ok" and content_missing:
             return "retry"
@@ -2175,7 +2260,10 @@ def _process_project_entry(
     """
     url = entry["url"]
     source_name = source["name"]
-    tz_name = source.get("timezone", "Asia/Shanghai")
+    # load_config 已把空串/非法值归一；直接构造 source 的调用方（测试、
+    # 内部复用）没有这一层，这里兜底为仓库默认时区，避免 get_timezone('')
+    # 按运行环境本地时区生成墙钟、换算时又用别的时区。
+    tz_name = source.get("timezone") or "Asia/Shanghai"
     content_required = bool(source.get("content_required", False))
 
     # 只认 deadline 列。绝不回退到 parsed（列表发布时间）：项目站点若误配
@@ -2244,7 +2332,13 @@ def _process_project_entry(
             deadline=deadline_text,
             deadline_raw=deadline_raw,
             project_status=project_status,
-            timezone=tz_name,
+            # 只有本次确实写入列表发布日期时才更新行内 timezone：正文重试
+            # （content_required 从 false 改成 true、或列表状态从 old 恢复 ok）
+            # 会保留旧的 publish_time/publish_time_utc，此时把站点当前时区写
+            # 进去会让下一轮刷新按错误的时区重算旧墙钟（差 8 小时且随后固化）。
+            # 传空串由 UPSERT 的 COALESCE 保留行内旧值；首插入且无发布日期时
+            # 时区落空串，读取侧统一按「未知」处理（与历史行的 NULL 等价）。
+            timezone=tz_name if publish_text else "",
             status=status,
             **kwargs,
         )
@@ -2322,7 +2416,10 @@ def process_entry(
         return _process_project_entry(conn, source, entry, cutoff, force, delay)
     url = entry["url"]
     source_name = source["name"]
-    tz_name = source.get("timezone", "Asia/Shanghai")
+    # load_config 已把空串/非法值归一；直接构造 source 的调用方（测试、
+    # 内部复用）没有这一层，这里兜底为仓库默认时区，避免 get_timezone('')
+    # 按运行环境本地时区生成墙钟、换算时又用别的时区。
+    tz_name = source.get("timezone") or "Asia/Shanghai"
 
     if not force and should_skip_stored(conn, source_name, url, cutoff, tz_name):
         return "skip"
@@ -2569,7 +2666,9 @@ def run_source(
             else:
                 LOG.warning("[%s] 列表页没有解析到任何条目。", source_name)
         else:
-            now = dt.datetime.now(get_timezone(source.get("timezone")))
+            now = dt.datetime.now(
+                get_timezone(source.get("timezone") or "Asia/Shanghai")
+            )
             entries.sort(key=lambda item: item.get("parsed") or now, reverse=True)
             # limit_per_source 只统计“实际处理”的条目；已入库被跳过的条目
             # 不占用名额，否则增量运行会一直卡在同一批 skip 上无法前进。
