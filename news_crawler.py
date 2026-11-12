@@ -37,6 +37,7 @@ from gne import GeneralNewsExtractor
 from gne.netguard import UnsafeUrlError, ensure_url_allowed
 from url_extract import (
     BROWSER_FALLBACK_HTTP_CODES,
+    MIN_CONTENT_LENGTH,
     close_thread_browser,
     content_is_too_short,
     extract_from_html,
@@ -471,20 +472,50 @@ def parse_yearless_around(
     return min(candidates, key=lambda item: item[0])[1]
 
 
+def _project_status_closed(value: str) -> bool:
+    """列表状态是否明确表示已截止，用于无年份截止时间的年份推断。
+
+    判定忽略内部空白（`已 截止`/全角空格/NBSP），落库的 `project_status` 仍保留原文。
+    """
+    text = re.sub(r"\s+", "", clean_text(value))
+    return any(
+        token in text for token in ("已截止", "已结束", "已过期", "报名结束", "已关闭")
+    )
+
+
 def parse_deadline_after(
     raw: str,
     fmt: str | None,
     reference: dt.datetime,
     timezone_name: str = "Asia/Shanghai",
+    *,
+    allow_past: bool = False,
 ) -> dt.datetime | None:
     """无年份截止时间取不早于 reference 的最近年份。
 
     例：2026-12-20 发布“1月15日截止”应解析为 2027-01-15，而不是已过去的
     2026-01-15；有明确年份的文本直接按 parse_datetime 处理。
+
+    allow_past=True 用于列表已明确标注“已截止”的行：截止时间必须已经
+    过去，取不晚于 reference 的最近年份，避免把 2026-11 列表里的
+    “10月01日 / 已截止”推成 2027-10-01。
+
+    fmt 不含 %Y/%y（如 %m%d）时同样按基准年补齐：strptime 会把缺失年份
+    填成 1900，不能直接交给通用解析。
     """
-    if not is_yearless_month_day(raw):
+    text = clean_text(raw)
+    if not text:
+        return None
+    # 原文自带年份时年份可信，不参与基准年推断。
+    if has_explicit_year(text):
         return parse_datetime(
-            raw, fmt, timezone_name, allow_year_adjust=False, allow_future=True
+            text, fmt, timezone_name, allow_year_adjust=False, allow_future=True
+        )
+    fmt_has_year = bool(fmt and re.search(r"%[Yy]", fmt))
+    # 不是“月日”形态、且格式本身含年份（或未配置格式）：按普通解析。
+    if not is_yearless_month_day(text) and (not fmt or fmt_has_year):
+        return parse_datetime(
+            text, fmt, timezone_name, allow_year_adjust=False, allow_future=True
         )
     tz = get_timezone(timezone_name)
     local_reference = (
@@ -493,21 +524,40 @@ def parse_deadline_after(
         else reference.astimezone(tz)
     )
     candidates: list[dt.datetime] = []
-    # 闰日（2 月 29 日）可能隔两年才出现，因此多试一个年份。
-    for year in (local_reference.year, local_reference.year + 1, local_reference.year + 2):
+    # 闰日（2 月 29 日）可能隔两年才出现，多试到第三个后续年份；
+    # allow_past 还要回看四年，否则“已截止 + 2月29日”在非闰年附近会解析失败。
+    if allow_past:
+        years = tuple(
+            local_reference.year + offset for offset in (-4, -3, -2, -1, 0, 1, 2, 3)
+        )
+    else:
+        years = tuple(local_reference.year + offset for offset in (0, 1, 2, 3))
+    for year in years:
         parsed = parse_datetime(
-            raw,
+            text,
             fmt,
             timezone_name,
             allow_year_adjust=False,
             reference_year=year,
             allow_future=True,
         )
-        if parsed is not None and parsed.date() >= local_reference.date():
+        if parsed is not None:
             candidates.append(parsed)
-    if not candidates:
+    if allow_past:
+        past = [
+            candidate
+            for candidate in candidates
+            if candidate.date() <= local_reference.date()
+        ]
+        return max(past) if past else None
+    future = [
+        candidate
+        for candidate in candidates
+        if candidate.date() >= local_reference.date()
+    ]
+    if not future:
         return None
-    return min(candidates)
+    return min(future)
 
 
 def format_publish_time(value: dt.datetime, timezone_name: str) -> str:
@@ -972,6 +1022,10 @@ def parse_list_items(html: str, source: dict, base_url: str) -> list[dict]:
                     node_text = node_text.replace(title_text, " ", 1)
                 date_text = node_text
                 parsed = parse_datetime(date_text, date_format, tz_name)
+        project_status = ""
+        status_xpath = source.get("project_status_xpath")
+        if status_xpath:
+            project_status = xpath_text(node, status_xpath)
         deadline_xpath = source.get("deadline_xpath")
         deadline_text = ""
         deadline_dt = None
@@ -980,16 +1034,17 @@ def parse_list_items(html: str, source: dict, base_url: str) -> list[dict]:
             # 截止时间可以晚于当前时间；无年份的“11月30日”必须保留今年，
             # 不能走发布时间“未来回退上一年”的逻辑。跨年场景（2026-12-20
             # 发布“1月15日截止”）则按列表日期/当前时间取不早于基准的年份。
+            # 列表已明确“已截止”时截止时间必须已经过去，不能推成下一年。
             reference = parsed if parsed is not None else dt.datetime.now(
                 get_timezone(tz_name)
             )
             deadline_dt = parse_deadline_after(
-                deadline_text, deadline_format, reference, tz_name
+                deadline_text,
+                deadline_format,
+                reference,
+                tz_name,
+                allow_past=_project_status_closed(project_status),
             )
-        project_status = ""
-        status_xpath = source.get("project_status_xpath")
-        if status_xpath:
-            project_status = xpath_text(node, status_xpath)
         items.append(
             {
                 "title": title,
@@ -1776,11 +1831,13 @@ def _refresh_project_listing(
 
     返回 None 表示该行不存在或不是 ok/old，交由后续正常流程处理；
     返回 "skip" 表示列表字段与状态都没有变化；返回 "ok"/"old" 表示已刷新；
-    返回 "retry" 表示状态已从 old 恢复为 ok，但仍需继续抓正文（content_required）。
+    返回 "retry" 表示仍需继续抓正文：列表状态从 old 恢复为 ok，或
+    content_required 从 false 改成 true 后已入库的 ok 行正文仍缺失。
     """
     row = conn.execute(
         "SELECT status, title, deadline, deadline_raw, project_status, "
-        "publish_time, publish_time_utc FROM articles WHERE source = ? AND url = ?",
+        "publish_time, publish_time_utc, content_length, title_source FROM articles "
+        "WHERE source = ? AND url = ?",
         (source_name, url),
     ).fetchone()
     if row is None or row[0] not in ("ok", "old"):
@@ -1791,6 +1848,11 @@ def _refresh_project_listing(
     old_raw = str(row[3] or "")
     old_project_status = str(row[4] or "")
     old_publish = str(row[5] or "") or str(row[6] or "")
+    old_content_length = int(row[7] or 0)
+    old_title_source = str(row[8] or "")
+    # content_required 从 false 改成 true 后，之前以“列表字段完整”入库的 ok 行
+    # 正文仍为空；必须按正文要求重新抓详情，不能因为列表字段没变就 skip。
+    content_missing = content_required and old_content_length < MIN_CONTENT_LENGTH
     new_title = title or old_title
     # 本次没有给出截止原文时保留旧解析值；给出了就与原文同步，解析失败
     # 意味着旧截止时间已经失效，必须清空而不是继续沿用。
@@ -1812,13 +1874,19 @@ def _refresh_project_listing(
         old_project_status,
         old_status,
     )
+    if old_title_source != "list_title":
+        # 旧行可能来自新闻模式（gne_default）；项目行必须带 list_title 标记，
+        # 否则查询侧按 title_source 识别项目行会漏掉它。
+        unchanged = False
     if unchanged and not old_publish:
+        if new_status == "ok" and content_missing:
+            return "retry"
         return "skip"
     conn.execute(
         "UPDATE articles SET title = ?, list_title = ?, deadline = ?, deadline_raw = ?, "
         "project_status = ?, status = ?, publish_time = '', publish_time_utc = '', "
         "publish_time_source = '', publish_time_raw = '', list_publish_time = '', "
-        "updated_at = ? WHERE source = ? AND url = ?",
+        "title_source = 'list_title', updated_at = ? WHERE source = ? AND url = ?",
         (
             new_title,
             new_title,
@@ -1832,7 +1900,7 @@ def _refresh_project_listing(
         ),
     )
     conn.commit()
-    if new_status == "ok" and old_status == "old" and content_required:
+    if new_status == "ok" and content_required and (old_status == "old" or content_missing):
         return "retry"
     return new_status
 

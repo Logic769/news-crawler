@@ -732,6 +732,35 @@ class ProjectApplicationTest(unittest.TestCase):
         assert deadline is not None
         self.assertEqual(deadline.strftime("%Y-%m-%d"), "2027-01-15")
 
+    def test_yearless_deadline_format_without_separator_uses_reference_year(self) -> None:
+        tz = ZoneInfo("Asia/Shanghai")
+        parsed = news_crawler.parse_deadline_after(
+            "1130", "%m%d", dt.datetime(2026, 11, 15, tzinfo=tz), "Asia/Shanghai"
+        )
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.strftime("%Y-%m-%d"), "2026-11-30")
+        html = (
+            "<html><body><table><tbody>"
+            '<tr class="ant-table-row"><td><a class="detailLink" '
+            'href="/project/detail/yearless-compact">2026年度项目申报指南</a></td>'
+            "<td>1130</td><td>申报中</td><td>2026-11-15</td></tr>"
+            "</tbody></table></body></html>"
+        )
+        source = _source(
+            deadline_format="%m%d",
+            date_xpath="./td[4]",
+            date_format="%Y-%m-%d",
+        )
+        entries = news_crawler.parse_list_items(
+            html, source, "https://svc20.stcsm.sh.gov.cn/project"
+        )
+        self.assertEqual(len(entries), 1)
+        deadline = entries[0]["deadline"]
+        self.assertIsNotNone(deadline)
+        assert deadline is not None
+        self.assertEqual(deadline.strftime("%Y-%m-%d"), "2026-11-30")
+
     def test_deadline_feb_29_skips_non_leap_years(self) -> None:
         tz = ZoneInfo("Asia/Shanghai")
         parsed = news_crawler.parse_deadline_after(
@@ -740,6 +769,81 @@ class ProjectApplicationTest(unittest.TestCase):
         self.assertIsNotNone(parsed)
         assert parsed is not None
         self.assertEqual(parsed.strftime("%Y-%m-%d"), "2028-02-29")
+
+    def test_deadline_feb_29_candidate_extends_three_years(self) -> None:
+        tz = ZoneInfo("Asia/Shanghai")
+        parsed = news_crawler.parse_deadline_after(
+            "2月29日", None, dt.datetime(2025, 3, 1, tzinfo=tz), "Asia/Shanghai"
+        )
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.strftime("%Y-%m-%d"), "2028-02-29")
+
+    def test_deadline_closed_status_constrains_year_to_past(self) -> None:
+        tz = ZoneInfo("Asia/Shanghai")
+        reference = dt.datetime(2026, 11, 15, tzinfo=tz)
+        future = news_crawler.parse_deadline_after(
+            "10月01日", None, reference, "Asia/Shanghai"
+        )
+        self.assertIsNotNone(future)
+        assert future is not None
+        self.assertEqual(future.strftime("%Y-%m-%d"), "2027-10-01")
+        past = news_crawler.parse_deadline_after(
+            "10月01日", None, reference, "Asia/Shanghai", allow_past=True
+        )
+        self.assertIsNotNone(past)
+        assert past is not None
+        self.assertEqual(past.strftime("%Y-%m-%d"), "2026-10-01")
+        html = (
+            "<html><body><table><tbody>"
+            '<tr class="ant-table-row"><td><a class="detailLink" '
+            'href="/project/detail/closed">2026年度项目申报指南</a></td>'
+            "<td>10月01日</td><td>已截止</td><td>2026-11-15</td></tr>"
+            "</tbody></table></body></html>"
+        )
+        source = _source(date_xpath="./td[4]", date_format="%Y-%m-%d")
+        entries = news_crawler.parse_list_items(
+            html, source, "https://svc20.stcsm.sh.gov.cn/project"
+        )
+        self.assertEqual(len(entries), 1)
+        deadline = entries[0]["deadline"]
+        self.assertIsNotNone(deadline)
+        assert deadline is not None
+        self.assertEqual(deadline.strftime("%Y-%m-%d"), "2026-10-01")
+
+    def test_project_status_closed_tolerates_inner_whitespace(self) -> None:
+        self.assertTrue(news_crawler._project_status_closed("已 截止"))
+        self.assertTrue(news_crawler._project_status_closed(" 已\u3000截止 "))
+        self.assertFalse(news_crawler._project_status_closed("申报中"))
+        html = (
+            "<html><body><table><tbody>"
+            '<tr class="ant-table-row"><td><a class="detailLink" '
+            'href="/project/detail/closed-space">2026年度项目申报指南</a></td>'
+            "<td>10月01日</td><td>已 截止</td><td>2026-11-15</td></tr>"
+            "</tbody></table></body></html>"
+        )
+        source = _source(date_xpath="./td[4]", date_format="%Y-%m-%d")
+        entries = news_crawler.parse_list_items(
+            html, source, "https://svc20.stcsm.sh.gov.cn/project"
+        )
+        self.assertEqual(len(entries), 1)
+        deadline = entries[0]["deadline"]
+        self.assertIsNotNone(deadline)
+        assert deadline is not None
+        self.assertEqual(deadline.strftime("%Y-%m-%d"), "2026-10-01")
+
+    def test_deadline_closed_feb_29_looks_back_four_years(self) -> None:
+        tz = ZoneInfo("Asia/Shanghai")
+        parsed = news_crawler.parse_deadline_after(
+            "2月29日",
+            None,
+            dt.datetime(2026, 11, 15, tzinfo=tz),
+            "Asia/Shanghai",
+            allow_past=True,
+        )
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.strftime("%Y-%m-%d"), "2024-02-29")
 
     def test_refresh_updates_title_without_fetching_detail(self) -> None:
         conn, tmp = _new_conn()
@@ -822,10 +926,10 @@ class ProjectApplicationTest(unittest.TestCase):
             self.assertEqual(status, "ok")
             row = conn.execute(
                 "SELECT publish_time, publish_time_utc, publish_time_source, "
-                "publish_time_raw, list_publish_time FROM articles"
+                "publish_time_raw, list_publish_time, title_source FROM articles"
             ).fetchone()
             self.assertEqual(
-                tuple(row), ("", "", "", "", "")
+                tuple(row), ("", "", "", "", "", "list_title")
             )
         finally:
             conn.close()
@@ -856,6 +960,72 @@ class ProjectApplicationTest(unittest.TestCase):
                 )
             self.assertEqual(status, "no_content")
             fetch_mock.assert_called_once()
+        finally:
+            conn.close()
+            tmp.cleanup()
+
+    def test_refresh_ok_row_retries_when_content_becomes_required(self) -> None:
+        conn, tmp = _new_conn()
+        try:
+            cutoff = news_crawler.parse_datetime("2026-01-01", None, "Asia/Shanghai")
+            assert cutoff is not None
+            entry = _entry(
+                "https://example.com/detail/refresh-required-ok", "2026-11-30 16:30:00"
+            )
+            with mock.patch.object(
+                news_crawler, "fetch_article_html", return_value=("<html></html>", False)
+            ), mock.patch.object(news_crawler, "extract_article", return_value=None):
+                self.assertEqual(
+                    news_crawler.process_entry(conn, _source(), entry, cutoff, force=False),
+                    "ok",
+                )
+            row = conn.execute(
+                "SELECT content_length, title_source FROM articles"
+            ).fetchone()
+            self.assertEqual(row["content_length"], 0)
+            self.assertEqual(row["title_source"], "list_title")
+            with mock.patch.object(
+                news_crawler, "fetch_article_html", return_value=("<html></html>", False)
+            ) as fetch_mock, mock.patch.object(news_crawler, "extract_article", return_value=None):
+                status = news_crawler.process_entry(
+                    conn,
+                    _source(content_required=True),
+                    entry,
+                    cutoff,
+                    force=False,
+                )
+            self.assertEqual(status, "no_content")
+            fetch_mock.assert_called_once()
+        finally:
+            conn.close()
+            tmp.cleanup()
+
+    def test_refresh_marks_legacy_row_with_list_title_source(self) -> None:
+        conn, tmp = _new_conn()
+        try:
+            cutoff = news_crawler.parse_datetime("2026-01-01", None, "Asia/Shanghai")
+            assert cutoff is not None
+            news_crawler.save_article(
+                conn,
+                "svc20",
+                "https://example.com/detail/legacy-source",
+                list_title="2026年度项目申报指南",
+                title="2026年度项目申报指南",
+                title_source="gne_default",
+                deadline="2026-11-30 16:30:00",
+                deadline_raw="2026-11-30 16:30:00",
+                project_status="申报中",
+                timezone="Asia/Shanghai",
+                status="ok",
+            )
+            entry = _entry(
+                "https://example.com/detail/legacy-source", "2026-11-30 16:30:00"
+            )
+            status = news_crawler.process_entry(conn, _source(), entry, cutoff, force=False)
+            self.assertEqual(status, "ok")
+            row = conn.execute("SELECT title_source, status FROM articles").fetchone()
+            self.assertEqual(row["title_source"], "list_title")
+            self.assertEqual(row["status"], "ok")
         finally:
             conn.close()
             tmp.cleanup()
