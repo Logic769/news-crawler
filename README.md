@@ -243,10 +243,11 @@ curl "http://localhost:8000/v1/articles?status=all&page_size=50"
 | --- | --- |
 | `status` | `ok`（默认）、`old`、`no_content`、`unknown_date`、`error`、`all` |
 | `source` | 站点名，对应配置里的 `name` |
-| `published_from` / `published_to` | 日期或 ISO 时间；只写日期时按 `NEWS_TIMEZONE` 解释，结束日期包含当天 |
+| `published_from` / `published_to` | 日期或 ISO 时间；只写日期时按 `NEWS_TIMEZONE` 解释，结束日期包含当天。项目申报行 `publish_time` 为空，会被这两个参数排除 |
+| `deadline_from` / `deadline_to` | 项目申报专用：按 `deadline` 过滤（站点墙钟），只写日期时结束日期包含当天；带时区偏移的时间只取墙钟部分，不做时区换算；与 `published_from`/`published_to` 同时传会 AND 成空集，请二选一 |
 | `q` | 标题、列表标题、正文的模糊搜索 |
 | `page` / `page_size` | 分页，`page_size` 最大 100 |
-| `order` | `published_desc`（默认）、`published_asc`、`updated_desc` |
+| `order` | `published_desc`（默认）、`published_asc`、`updated_desc`、`deadline_desc`、`deadline_asc` |
 | `include_content` | 列表是否返回正文，默认 `false` |
 
 文章对象中的关键字段：
@@ -261,7 +262,9 @@ curl "http://localhost:8000/v1/articles?status=all&page_size=50"
 | `publish_time_source` | 发布时间来源：`xpath`（详情页配置的 XPath）、`labeled_text`（“发布时间：…”标签）、`meta`（meta/JSON-LD/time 标签）、`text`（正文扫描）、`video_meta`（视频页 meta）、`detail`（其他详情页来源）、`list`（回退列表页日期）；历史行或无法判定时可能为空字符串 |
 | `publish_time_raw` | 详情页抽取到的发布时间文本（XPath 场景可能是匹配出的日期子串；文本扫描可能只有“09月30日”这类无年份日期），便于核对日期为什么被回退 |
 | `list_publish_time` | 列表页解析出的日期；详情日期缺失或与列表相差过大时用于交叉校验 |
-| `title_source` | 标题来源：`article_title_xpath`（配置的标题 XPath **实际命中**）或 `gne_default`（未命中时回退 GNE 自动识别） |
+| `title_source` | 标题来源：`article_title_xpath`（配置的标题 XPath **实际命中**）、`gne_default`（未命中时回退 GNE 自动识别）或 `list_title`（项目申报列表行使用列表标题） |
+| `deadline` / `deadline_raw` | 项目申报专用：解析后的截止时间（`YYYY-MM-DD HH:MM:SS`）与列表页原文；新闻站点为空 |
+| `project_status` | 项目申报专用：列表页的申报状态文本（如“申报中”“已截止”）；新闻站点为空 |
 | `timezone` | 该文章写入时使用的站点时区（落库保存，站点配置变化不影响历史数据；`unknown_date` 等没有发布时间的结果不会写入该列，API extract 路径同样如此） |
 | `content` / `content_length` | 正文与字数（已归一化为单行；列表默认不返回，详情始终返回） |
 | `raw_content` | GNE 原始正文，保留段落换行；只在 `GET /v1/articles/{id}` 详情返回，列表（含 `include_content=true`）为 `null`；v4 之前入库的历史行为空，需 `--force` 重抓，或用 `backfill_raw_content.py` 回填（先 `--dry-run` 看候选数，再 `--limit 50` 小批试跑；容器内必须显式传 `--db /app/data/news.db`，命令见 AGENTS.md §8） |
@@ -398,6 +401,11 @@ cp sources.json sources.local.json
 | `article_title_xpath` | 可选 | 详情页标题 XPath。用于 `<title>` 写的是站点名、真标题在正文 `h1` 的站点。推荐直接写标题元素（如 `//h1[@class='article-title']`），会取其全部文本（含 `<em>` 等子元素）；写成 `//h1/text()` 只能取第一个直接文本节点，标题含子标签时会截断。以 `string(` 开头的表达式会被忽略 |
 | `article_publish_time_xpath` | 可选 | 详情页发布时间 XPath。用于正文里更早出现无关时间、页头日期才是真发布时间的站点；推荐写包含日期的元素（如 `//p[contains(@class,'article__subTitle')]/span[1]`）。以 `string(` 开头或非法表达式会被忽略 |
 | `date_skew_days` | 可选 | 详情日期与列表日期允许相差的天数，默认 7，范围 0–365；超过时改用列表日期，避免正文里的未来时间或站内推荐日期污染发布时间 |
+| `listing_type` | 可选 | 列表类型：`news`（默认）或 `project_application`。项目申报模式把列表本身当作数据源，见下方“项目申报列表” |
+| `deadline_xpath` | 可选 | 项目申报：截止时间所在单元格 XPath（相对条目节点） |
+| `deadline_format` | 可选 | 项目申报：截止时间格式，默认回退 `date_format` |
+| `project_status_xpath` | 可选 | 项目申报：申报状态所在单元格 XPath |
+| `content_required` | 可选 | 项目申报：是否必须抓到详情正文。默认 `false`（登录墙/无正文仍记 `ok` 并存列表字段）；设为 `true` 退回新闻语义（无正文记 `no_content`/`error`） |
 | `pagination` | 可选 | 自动分页配置对象，见下方“自动分页（可选）”；只对单个 `list_url` 生效，配置 `list_urls` 时仍按固定地址列表抓取（不受 `max_pages`/`stop_when_older_than_cutoff` 影响） |
 | `render` | 可选 | 设为 `true` 表示列表页需要用 Chrome 渲染后再解析 |
 | `delay` | 可选 | 每个请求之间的等待秒数，默认 0.3 |
@@ -431,12 +439,41 @@ cp sources.json sources.local.json
 | `total_pages_regex` | `(?:index_\|page[=/])(\\d+)` | 从 HTML 提取最大页码的正则，捕获组必须是数字（表格中 `\\|` 表示正则里的或） |
 | `start` | `1` | 模板模式从第几页开始生成（第 1 页始终是 `list_url`，通常设为 2）；范围 1–1000 |
 | `max_pages` | `50` | 最多抓取页数（含 `list_url` 计 1 页，后续页最多 `max_pages-1` 个）；范围 1–500 |
-| `stop_when_older_than_cutoff` | `true` | 当前页最晚日期早于抓取窗口起点时停止翻页（整页每条都能解析出日期且都早于窗口才停，避免置顶旧文或缺失日期导致漏抓） |
+| `stop_when_older_than_cutoff` | `true` | 当前页最晚日期早于抓取窗口起点时停止翻页（整页每条都能解析出日期且都早于窗口才停，避免置顶旧文或缺失日期导致漏抓）；项目申报模式不按发布日期早停，窗口判断只看 `deadline` |
 | `stop_after_known_pages` | `0` | 连续 N 页链接都已入库时停止（增量运行）；范围 0–100，默认 0 关闭；仅 template/next/auto 模式生效。开启后若上次运行更后页失败，可能提前停止，建议确认完整抓取后再开 |
 
 未配置 `render: true` 时，列表页解析为空会自动用 Chrome 渲染一次，并基于渲染后的 DOM 重新解析与继续翻页。自动分页会在页内按 URL 去重，并在 `test` 命令输出页数与停止原因（如 `cutoff`、`known_pages`、`no_next`、`max_pages`、`empty`、`fetch_failed`、`done`）。
 
 自动分页会为列表页启用 SSRF 地址白名单：配置的 `list_url`/`list_urls` 是唯一可信目标，且要求 scheme + host + port 完全一致；其他目标必须是公网地址，并且只允许 http 80 / https 443 端口。指向配置主机其他端口的链接会被拒绝；同端口无法按路径区分，配置主机本身视为可信。带地址校验的列表页请求为直连（不读取 `HTTP(S)_PROXY`），文章详情页保持原有代理行为。浏览器回退时每个请求都会重新校验，但 Playwright 自行解析 DNS，无法像 HTTP 路径那样在连接层钉扎 IP，残余 DNS rebinding 风险需由出口网络策略兜底。
+
+#### 项目申报列表（`listing_type: project_application`）
+
+项目申报公告的列表页本身就是完整数据：标题、截止时间、申报状态和详情链接都在表格里，而详情页常需要登录。把站点声明为项目申报类型后：
+
+- `deadline_xpath` 解析出的截止时间写入 `deadline`/`deadline_raw`，**不会**被当成 `publish_time`（项目行 `published_at` 为空，按发布时间排序时会排在末尾）；`/v1/articles` 提供 `order=deadline_desc|deadline_asc` 与 `deadline_from`/`deadline_to` 专门查询项目公告，注意 `published_from`/`published_to` 会把项目行全部排除；
+- `project_status_xpath` 解析出的状态写入 `project_status`；
+- `title` 与 `list_title` 都写列表标题，`title_source=list_title`；
+- `content_required: false`（默认）时，详情页抓不到正文、或正文短于 100 字（登录墙占位）不会记为失败，只保存列表字段，下次运行也不会重复重试；需要正文的站点请显式设为 `true`；
+- 截止时间早于抓取窗口起点（`--days`/`--since`）的条目记为 `old`，避免每次重跑都处理历年公告；`--force` 可强制重抓；
+- 已入库的 `ok`/`old` 行会在后续运行中按列表字段刷新 `title`/`list_title`/`title_source`/`deadline`/`deadline_raw`/`project_status`（延期、标题修订、截止状态变化都无需重抓详情）；原 `old` 行若截止时间原文非空且变得不可解析（如“常年受理”）会恢复为 `ok`，`content_required: true` 时继续抓正文（列表截止时间单元格为空时保留旧 `deadline` 与 `old` 状态，不会恢复）；`content_required` 由 `false` 改为 `true` 后，正文缺失的 `ok` 行也会自动补抓；
+- 同一 URL 从新闻模式切换为项目模式时，历史 `publish_time`/`publish_time_source`/`publish_time_raw`/`list_publish_time` 会被清空，但 `content`/`raw_content`/`author`/`images` 保留（可能残留旧新闻正文，查询侧请以 `title_source=list_title` 或站点配置识别项目行，不要只按 `deadline`；`deadline_from`/`deadline_to` 只对有可解析截止时间的项目行生效；项目切回新闻模式并重新抓取后旧 `deadline`/`deadline_raw`/`project_status` 仍会保留，这类新闻行也可能命中截止时间过滤、或被按 `project_status` 误判为项目行，查询侧请按站点/字段区分行类型）
+- 无年份的截止时间（如“11月30日”）按列表发布日期（缺失时按当前时间）取最近的合法年份：列表状态为已截止时以列表发布日期为下界、抓取时刻为上界，在该区间内取最近的合法年份（例：2025-12-20 发布、原文“1月15日”、2026-02-01 抓取 → 2026-01-15；列表发布日期缺失时只约束上界；区间内无候选时 `deadline` 留空、仅保留原文），否则取不早于该日期的最近年份，不会被减一年；配置了无年份 `deadline_format`（如 `%m月%d日`）时同样按基准年补齐；注意重抓历年已截止公告时，无年份截止时间可能随抓取年份后移（“取最近合法年份”的已知取舍，已有 `deadline` 的行可用 `--force` 之外的常规运行保留原值）。
+
+```json
+{
+  "name": "svc20_stcsm",
+  "list_url": "https://svc20.stcsm.sh.gov.cn/project",
+  "listing_type": "project_application",
+  "item_xpath": "//tr[contains(@class,'ant-table-row')]",
+  "title_xpath": ".//a[contains(@class,'detailLink')]",
+  "url_xpath": ".//a[contains(@class,'detailLink')]/@href",
+  "deadline_xpath": "./td[2]",
+  "deadline_format": "%Y-%m-%d %H:%M:%S",
+  "project_status_xpath": "./td[3]",
+  "render": true,
+  "delay": 0.8
+}
+```
 
 ### 第 3 步：测试列表解析
 

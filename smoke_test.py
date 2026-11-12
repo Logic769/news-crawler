@@ -264,9 +264,13 @@ def main() -> None:
                 "idx_articles_status_published",
                 "idx_articles_source_cover",
                 "idx_articles_status_updated",
+                "idx_articles_publish_time_utc",
+                "idx_articles_deadline",
             }
             if not required_upgraded <= upgraded:
-                raise AssertionError(f"v2 -> v7 upgrade missed indexes: {upgraded}")
+                raise AssertionError(
+                    f"v2 -> v{SCHEMA_VERSION} upgrade missed indexes: {upgraded}"
+                )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(articles)")}
             for required_column in (
                 "raw_content",
@@ -275,20 +279,27 @@ def main() -> None:
                 "publish_time_raw",
                 "list_publish_time",
                 "title_source",
+                "deadline",
+                "deadline_raw",
+                "project_status",
             ):
                 if required_column not in columns:
                     raise AssertionError(
-                        f"v2 -> v7 upgrade missed {required_column}: {columns}"
+                        f"v2 -> v{SCHEMA_VERSION} upgrade missed {required_column}: {columns}"
                     )
             legacy_row = conn.execute(
                 "SELECT publish_time_source, publish_time_raw, "
-                "list_publish_time, title_source FROM articles LIMIT 1"
+                "list_publish_time, title_source, deadline, deadline_raw, "
+                "project_status FROM articles LIMIT 1"
             ).fetchone()
             if legacy_row is None:
-                raise AssertionError("v2 -> v7 upgrade lost legacy article row")
+                raise AssertionError(
+                    f"v2 -> v{SCHEMA_VERSION} upgrade lost legacy article row"
+                )
             if any(value is not None for value in legacy_row):
                 raise AssertionError(
-                    f"v2 -> v7 upgrade should leave new columns NULL: {legacy_row}"
+                    f"v2 -> v{SCHEMA_VERSION} upgrade should leave new columns NULL: "
+                    f"{legacy_row}"
                 )
             current = int(conn.execute("PRAGMA user_version").fetchone()[0])
             if current != SCHEMA_VERSION:

@@ -418,6 +418,52 @@ class PaginationTest(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "done")
         self.assertEqual(calls, ["https://example.com/list/"])
 
+    def test_project_mode_cutoff_does_not_stop_on_old_publish_dates(self) -> None:
+        def page(*items: tuple[str, str, str, str]) -> str:
+            rows = "".join(
+                f'<li><a href="/{url}">{title}</a>'
+                f'<span class="publish">{publish}</span>'
+                f'<span class="deadline">{deadline}</span></li>'
+                for title, publish, deadline, url in items
+            )
+            return f'<html><body><ul class="list">{rows}</ul></body></html>'
+
+        source = _source(
+            mode="template",
+            url_template="https://example.com/list/index_{page}.html",
+            total_pages_regex=r"index_(\d+)\.html",
+            start=2,
+            max_pages=2,
+            stop_when_older_than_cutoff=True,
+            stop_after_known_pages=0,
+        )
+        source["listing_type"] = "project_application"
+        source["date_xpath"] = ".//span[@class='publish']"
+        source["deadline_xpath"] = ".//span[@class='deadline']"
+        source["deadline_format"] = "%Y-%m-%d"
+        source["content_required"] = False
+        pages = {
+            "https://example.com/list/": page(
+                ("旧发布日期但仍在申报", "2025-09-01", "2026-12-01", "a1.html")
+            ),
+            "https://example.com/list/index_2.html": page(
+                ("新公告", "2026-02-01", "2026-12-31", "a2.html")
+            ),
+        }
+        cutoff = datetime(2026, 1, 1, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        with mock.patch.object(
+            news_crawler,
+            "fetch_list_html",
+            side_effect=lambda url, render, url_validator=None: pages[url],
+        ):
+            result = news_crawler.collect_list_entries_detailed(source, cutoff=cutoff)
+
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(result["stop_reason"], "done")
+        self.assertEqual(len(result["items"]), 2)
+        self.assertTrue(all(item["deadline"] is not None for item in result["items"]))
+
     def test_collect_list_entries_wrapper_returns_list(self) -> None:
         source = _source()
         html = _page(("一", "2026-01-01", "a1.html"))

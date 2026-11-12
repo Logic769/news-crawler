@@ -110,6 +110,21 @@ def _bound(value: str | None, tz_name: str, *, end_of_day: bool) -> str | None:
         raise HTTPException(status_code=400, detail=f"时间参数不合法: {value}") from exc
 
 
+def _wall_bound(value: str | None, *, end_of_day: bool) -> str | None:
+    """项目截止时间边界：deadline 存的是站点墙钟，不做时区换算。"""
+    if not value:
+        return None
+    raw = value.strip()
+    try:
+        if len(raw) == 10:
+            day = dt.date.fromisoformat(raw)
+            return f"{day.isoformat()} {'23:59:59' if end_of_day else '00:00:00'}"
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"时间参数不合法: {value}") from exc
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
 
@@ -282,12 +297,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         source: str | None = Query(None, max_length=100),
         published_from: str | None = Query(None, max_length=40),
         published_to: str | None = Query(None, max_length=40),
+        deadline_from: str | None = Query(None, max_length=40),
+        deadline_to: str | None = Query(None, max_length=40),
         q: str | None = Query(None, max_length=200),
         page: int = Query(1, ge=1),
         page_size: int = Query(20, ge=1, le=100),
         order: str = Query(
             "published_desc",
-            pattern="^(published_desc|published_asc|updated_desc)$",
+            pattern="^(published_desc|published_asc|updated_desc|deadline_desc|deadline_asc)$",
         ),
         include_content: bool = False,
     ) -> dict[str, Any]:
@@ -298,6 +315,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             source=source,
             published_from=_bound(published_from, default_tz, end_of_day=False),
             published_to=_bound(published_to, default_tz, end_of_day=True),
+            deadline_from=_wall_bound(deadline_from, end_of_day=False),
+            deadline_to=_wall_bound(deadline_to, end_of_day=True),
             q=q,
             page=page,
             page_size=page_size,
