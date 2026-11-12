@@ -455,9 +455,9 @@ cp sources.json sources.local.json
 - `title` 与 `list_title` 都写列表标题，`title_source=list_title`；
 - `content_required: false`（默认）时，详情页抓不到正文、或正文短于 100 字（登录墙占位）不会记为失败，只保存列表字段，下次运行也不会重复重试；需要正文的站点请显式设为 `true`；
 - 截止时间早于抓取窗口起点（`--days`/`--since`）的条目记为 `old`，避免每次重跑都处理历年公告；`--force` 可强制重抓；
-- 已入库的 `ok`/`old` 行会在后续运行中按列表字段刷新 `title`/`list_title`/`title_source`/`deadline`/`deadline_raw`/`project_status`（延期、标题修订、截止状态变化都无需重抓详情）；原 `old` 行若截止时间变得不可解析（如“常年受理”）会恢复为 `ok`，`content_required: true` 时继续抓正文；`content_required` 由 `false` 改为 `true` 后，正文缺失的 `ok` 行也会自动补抓；
-- 同一 URL 从新闻模式切换为项目模式时，历史 `publish_time`/`publish_time_source`/`publish_time_raw`/`list_publish_time` 会被清空，但 `content`/`raw_content`/`author`/`images` 保留（可能残留旧新闻正文，查询侧请以 `title_source=list_title` 或站点配置识别项目行，不要只按 `deadline`；`deadline_from`/`deadline_to` 只对有可解析截止时间的项目行生效）；
-- 无年份的截止时间（如“11月30日”）按列表发布日期（缺失时按当前时间）取最近的合法年份：列表状态为已截止时取不晚于该日期的最近年份，否则取不早于该日期的最近年份，不会被减一年；配置了无年份 `deadline_format`（如 `%m月%d日`）时同样按基准年补齐。
+- 已入库的 `ok`/`old` 行会在后续运行中按列表字段刷新 `title`/`list_title`/`title_source`/`deadline`/`deadline_raw`/`project_status`（延期、标题修订、截止状态变化都无需重抓详情）；原 `old` 行若截止时间原文非空且变得不可解析（如“常年受理”）会恢复为 `ok`，`content_required: true` 时继续抓正文（列表截止时间单元格为空时保留旧 `deadline` 与 `old` 状态，不会恢复）；`content_required` 由 `false` 改为 `true` 后，正文缺失的 `ok` 行也会自动补抓；
+- 同一 URL 从新闻模式切换为项目模式时，历史 `publish_time`/`publish_time_source`/`publish_time_raw`/`list_publish_time` 会被清空，但 `content`/`raw_content`/`author`/`images` 保留（可能残留旧新闻正文，查询侧请以 `title_source=list_title` 或站点配置识别项目行，不要只按 `deadline`；`deadline_from`/`deadline_to` 只对有可解析截止时间的项目行生效；项目切回新闻模式并重新抓取后旧 `deadline`/`deadline_raw`/`project_status` 仍会保留，这类新闻行也可能命中截止时间过滤、或被按 `project_status` 误判为项目行，查询侧请按站点/字段区分行类型）
+- 无年份的截止时间（如“11月30日”）按列表发布日期（缺失时按当前时间）取最近的合法年份：列表状态为已截止时取不晚于该日期、且落在列表发布日期与抓取时刻之间的最近年份（区间内无候选时保留原文），否则取不早于该日期的最近年份，不会被减一年；配置了无年份 `deadline_format`（如 `%m月%d日`）时同样按基准年补齐。
 
 ```json
 {

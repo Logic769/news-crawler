@@ -798,7 +798,7 @@ class ProjectApplicationTest(unittest.TestCase):
             "<html><body><table><tbody>"
             '<tr class="ant-table-row"><td><a class="detailLink" '
             'href="/project/detail/closed">2026年度项目申报指南</a></td>'
-            "<td>10月01日</td><td>已截止</td><td>2026-11-15</td></tr>"
+            "<td>10月01日</td><td>已截止</td><td>2026-09-15</td></tr>"
             "</tbody></table></body></html>"
         )
         source = _source(date_xpath="./td[4]", date_format="%Y-%m-%d")
@@ -819,7 +819,7 @@ class ProjectApplicationTest(unittest.TestCase):
             "<html><body><table><tbody>"
             '<tr class="ant-table-row"><td><a class="detailLink" '
             'href="/project/detail/closed-space">2026年度项目申报指南</a></td>'
-            "<td>10月01日</td><td>已 截止</td><td>2026-11-15</td></tr>"
+            "<td>10月01日</td><td>已 截止</td><td>2026-09-15</td></tr>"
             "</tbody></table></body></html>"
         )
         source = _source(date_xpath="./td[4]", date_format="%Y-%m-%d")
@@ -831,6 +831,58 @@ class ProjectApplicationTest(unittest.TestCase):
         self.assertIsNotNone(deadline)
         assert deadline is not None
         self.assertEqual(deadline.strftime("%Y-%m-%d"), "2026-10-01")
+
+    def test_deadline_closed_uses_year_after_publish(self) -> None:
+        html = (
+            "<html><body><table><tbody>"
+            '<tr class="ant-table-row"><td><a class="detailLink" '
+            'href="/project/detail/closed-cross-year">2026年度项目申报指南</a></td>'
+            "<td>1月15日</td><td>已截止</td><td>2025-12-20</td></tr>"
+            "</tbody></table></body></html>"
+        )
+        source = _source(date_xpath="./td[4]", date_format="%Y-%m-%d")
+        entries = news_crawler.parse_list_items(
+            html, source, "https://svc20.stcsm.sh.gov.cn/project"
+        )
+        self.assertEqual(len(entries), 1)
+        deadline = entries[0]["deadline"]
+        self.assertIsNotNone(deadline)
+        assert deadline is not None
+        self.assertEqual(deadline.strftime("%Y-%m-%d"), "2026-01-15")
+
+    def test_deadline_closed_on_publish_day(self) -> None:
+        html = (
+            "<html><body><table><tbody>"
+            '<tr class="ant-table-row"><td><a class="detailLink" '
+            'href="/project/detail/closed-same-day">2026年度项目申报指南</a></td>'
+            "<td>11月5日</td><td>已截止</td><td>2026-11-05</td></tr>"
+            "</tbody></table></body></html>"
+        )
+        source = _source(date_xpath="./td[4]", date_format="%Y-%m-%d")
+        entries = news_crawler.parse_list_items(
+            html, source, "https://svc20.stcsm.sh.gov.cn/project"
+        )
+        self.assertEqual(len(entries), 1)
+        deadline = entries[0]["deadline"]
+        self.assertIsNotNone(deadline)
+        assert deadline is not None
+        self.assertEqual(deadline.strftime("%Y-%m-%d"), "2026-11-05")
+
+    def test_deadline_closed_without_plausible_year_keeps_raw(self) -> None:
+        html = (
+            "<html><body><table><tbody>"
+            '<tr class="ant-table-row"><td><a class="detailLink" '
+            'href="/project/detail/closed-implausible">2026年度项目申报指南</a></td>'
+            "<td>10月01日</td><td>已截止</td><td>2026-11-01</td></tr>"
+            "</tbody></table></body></html>"
+        )
+        source = _source(date_xpath="./td[4]", date_format="%Y-%m-%d")
+        entries = news_crawler.parse_list_items(
+            html, source, "https://svc20.stcsm.sh.gov.cn/project"
+        )
+        self.assertEqual(len(entries), 1)
+        self.assertIsNone(entries[0]["deadline"])
+        self.assertEqual(entries[0]["deadline_text"], "10月01日")
 
     def test_deadline_closed_feb_29_looks_back_four_years(self) -> None:
         tz = ZoneInfo("Asia/Shanghai")

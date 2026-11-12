@@ -490,6 +490,8 @@ def parse_deadline_after(
     timezone_name: str = "Asia/Shanghai",
     *,
     allow_past: bool = False,
+    not_before: dt.datetime | None = None,
+    not_after: dt.datetime | None = None,
 ) -> dt.datetime | None:
     """无年份截止时间取不早于 reference 的最近年份。
 
@@ -498,7 +500,9 @@ def parse_deadline_after(
 
     allow_past=True 用于列表已明确标注“已截止”的行：截止时间必须已经
     过去，取不晚于 reference 的最近年份，避免把 2026-11 列表里的
-    “10月01日 / 已截止”推成 2027-10-01。
+    “10月01日 / 已截止”推成 2027-10-01。此时可用 not_before/not_after
+    限定可信区间（通常是列表发布日期到抓取时刻）：区间内没有候选时返回
+    None，保留原文，不猜年份。
 
     fmt 不含 %Y/%y（如 %m%d）时同样按基准年补齐：strptime 会把缺失年份
     填成 1900，不能直接交给通用解析。
@@ -543,7 +547,20 @@ def parse_deadline_after(
         )
         if parsed is not None:
             candidates.append(parsed)
+    def _local(value: dt.datetime) -> dt.datetime:
+        return value.replace(tzinfo=tz) if value.tzinfo is None else value.astimezone(tz)
+
     if allow_past:
+        if not_before is not None or not_after is not None:
+            lower = _local(not_before).date() if not_before is not None else None
+            upper = _local(not_after).date() if not_after is not None else local_reference.date()
+            windowed = [
+                candidate
+                for candidate in candidates
+                if (lower is None or candidate.date() >= lower)
+                and (upper is None or candidate.date() <= upper)
+            ]
+            return max(windowed) if windowed else None
         past = [
             candidate
             for candidate in candidates
@@ -1035,15 +1052,20 @@ def parse_list_items(html: str, source: dict, base_url: str) -> list[dict]:
             # 不能走发布时间“未来回退上一年”的逻辑。跨年场景（2026-12-20
             # 发布“1月15日截止”）则按列表日期/当前时间取不早于基准的年份。
             # 列表已明确“已截止”时截止时间必须已经过去，不能推成下一年。
-            reference = parsed if parsed is not None else dt.datetime.now(
-                get_timezone(tz_name)
-            )
+            status_closed = _project_status_closed(project_status)
+            now = dt.datetime.now(get_timezone(tz_name))
+            reference = parsed if parsed is not None else now
             deadline_dt = parse_deadline_after(
                 deadline_text,
                 deadline_format,
                 reference,
                 tz_name,
-                allow_past=_project_status_closed(project_status),
+                allow_past=status_closed,
+                # 已截止：截止时间必须落在公告发布之后、抓取时刻之前；区间内
+                # 没有候选时保留原文（例如 2025-12-20 发布的“1月15日”不能
+                # 解析成 2025-01-15）。
+                not_before=parsed if status_closed else None,
+                not_after=now if status_closed else None,
             )
         items.append(
             {
