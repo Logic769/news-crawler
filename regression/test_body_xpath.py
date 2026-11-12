@@ -350,6 +350,18 @@ class ResolveBodyTest(unittest.TestCase):
         self.assertIsInstance(node, HtmlElement)
         self.assertEqual(node.tag, "body")
 
+    def test_boolean_expression_falls_back(self) -> None:
+        # true() 不以 count(/boolean( 等前缀开头，配置校验不会拦下，
+        # lxml 返回 bool，直接下标会抛 TypeError 并穿透到 extract。
+        node = self._resolve("true()")
+        self.assertIsInstance(node, HtmlElement)
+        self.assertEqual(node.tag, "body")
+
+    def test_numeric_expression_falls_back(self) -> None:
+        node = self._resolve("1 + count(//div)")
+        self.assertIsInstance(node, HtmlElement)
+        self.assertEqual(node.tag, "body")
+
     def test_matched_container_is_used(self) -> None:
         from gne.extractors.content import ContentExtractor
         from gne.html import html2element

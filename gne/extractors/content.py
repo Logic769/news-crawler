@@ -70,9 +70,10 @@ class ContentExtractor:
     def _resolve_body(selector: HtmlElement, body_xpath: str) -> HtmlElement:
         """按配置的 body_xpath 选正文容器，未命中或不是元素节点时回退整页 //body。
 
-        body_xpath 来自站点配置（手写 XPath），写错或写成属性/文本表达式
-        （如 //div/@id、//div/text()）时不能让它把整篇文章变成 error，
-        因此这里统一兜底：非元素结果与空结果都回退 //body，并留一条告警，
+        body_xpath 来自站点配置（手写 XPath），写错、写成属性/文本表达式
+        （如 //div/@id、//div/text()）或标量表达式（如 true()、
+        1 + count(//div)）时不能让它把整篇文章变成 error，因此这里统一兜底：
+        非节点列表、非元素结果与空结果都回退 //body，并留一条告警，
         便于区分「配错」与「没配」。
         """
         fallback: list[HtmlElement] = selector.xpath("//body") or [selector]
@@ -80,6 +81,16 @@ class ContentExtractor:
             matched = selector.xpath(body_xpath)
         except Exception as exc:  # 运行期 XPath 异常（如非法函数组合）
             LOG.warning("body_xpath %r 执行失败（%s），回退整页 //body", body_xpath, exc)
+            return fallback[0]
+        # lxml 对布尔/数值表达式的返回值不是列表（true() 得 bool、1 + count(//div)
+        # 得 float），直接下标会抛 TypeError；它又发生在 try 之外，会一路抛到 extract，
+        # 与「配置写错不中断整篇抽取」的约定相反，因此先判类型。
+        if not isinstance(matched, list):
+            LOG.warning(
+                "body_xpath %r 的结果不是节点列表（%s），回退整页 //body",
+                body_xpath,
+                type(matched).__name__,
+            )
             return fallback[0]
         node = matched[0] if matched else None
         if node is None:
