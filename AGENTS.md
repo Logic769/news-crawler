@@ -222,7 +222,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | GET | `/v1/jobs`、`/v1/jobs/{id}` | 作业列表与状态 |
 | GET | `/v1/health` | 健康检查（无需鉴权） |
 
-列表参数：`status`、`source`、`published_from`、`published_to`、`deadline_from`、`deadline_to`、`q`、`page`、`page_size`、`order`（`published_desc`/`published_asc`/`updated_desc`/`deadline_desc`/`deadline_asc`）、`include_content`（为 `true` 时列表返回 `content`；`raw_content` 无论何时都只在详情返回）。项目申报行 `publish_time` 为空，使用 `published_from`/`published_to` 会被排除，应按 `deadline` 过滤（`deadline` 为站点墙钟；`deadline_*` 与 `published_*` 同时传会 AND 成空集）。文章列表与作业列表返回 `{"data": [...], "meta": {...}}`；文章详情、统计、健康检查返回对应对象；`/v1/sources` 返回 `{"data": [...]}`。
+列表参数：`status`、`source`、`published_from`、`published_to`、`deadline_from`、`deadline_to`、`q`、`page`、`page_size`、`order`（`published_desc`/`published_asc`/`updated_desc`/`deadline_desc`/`deadline_asc`）、`include_content`（为 `true` 时列表返回 `content`；`raw_content` 无论何时都只在详情返回）。项目申报行 `publish_time` 为空，使用 `published_from`/`published_to` 会被排除，应按 `deadline` 过滤（`deadline` 为站点墙钟，`deadline_*` 带时区偏移时只取墙钟部分、不做换算；`deadline_*` 与 `published_*` 同时传会 AND 成空集）。文章列表与作业列表返回 `{"data": [...], "meta": {...}}`；文章详情、统计、健康检查返回对应对象；`/v1/sources` 返回 `{"data": [...]}`。
 
 设置 `NEWS_API_KEY` 后，除 `/v1/health` 与文档外都需 `X-API-Key` 或 `Authorization: Bearer <key>`。作业状态为 `queued`/`running`/`succeeded`/`failed`，单进程执行，避免 SQLite 并发写冲突。排队 + 运行中的作业上限为 `NEWS_MAX_PENDING_JOBS`（默认 50），超出返回 `429`；相同类型与参数的未完成作业复用同一 ID。`extract` 默认拒绝回环、内网与保留地址（`NEWS_ALLOW_PRIVATE_URLS=1` 可放开）；`fetch_html` 通过自定义 `HTTPRedirectHandler` 对每个重定向目标复用同一校验，默认还以 `allow_browser=False` 禁用浏览器回退（`NEWS_EXTRACT_ALLOW_BROWSER=1` 可放开），避免页面 JS 绕过地址限制。上述限制仍不能替代 API Key。已完成作业保留 30 天后自动清理。未设置 `NEWS_API_KEY` 时默认开放（仅提示 warning）；设置 `NEWS_REQUIRE_AUTH=1` 后行为是"未配置 key 则业务请求一律 401，已配置 key 时按 key 校验"（401 带 `WWW-Authenticate`，`/v1/health`、`/docs`、openapi 与根路径始终开放）。错误响应统一为 `{"error": {"code", "status": <HTTP 码>, "message", "details"?}}`，参数校验错误为 422 且带 `details`。`docker compose` 通过白名单透传 API 变量，需在 `.env` 或 shell 中设置后生效。
 
@@ -302,7 +302,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | `total_pages_regex` | `(?:index_\|page[=/])(\\d+)` | 提取最大页码的正则，捕获组必须是数字（表格中 `\\|` 表示正则里的或） |
 | `start` | `1` | 模板模式从第几页开始生成后续页（第 1 页始终是 `list_url`，通常设 2）；范围 1–1000 |
 | `max_pages` | `50` | 最多抓取页数（含 `list_url` 计 1 页，后续页最多 `max_pages-1` 个）；范围 1–500 |
-| `stop_when_older_than_cutoff` | `true` | 当前页最晚日期早于抓取窗口起点时停止翻页（整页每条都能解析出日期且都早于窗口才停，避免置顶旧文或缺失日期导致漏抓） |
+| `stop_when_older_than_cutoff` | `true` | 当前页最晚日期早于抓取窗口起点时停止翻页（整页每条都能解析出日期且都早于窗口才停，避免置顶旧文或缺失日期导致漏抓）；项目申报模式不按发布日期早停，窗口判断只看 `deadline` |
 | `stop_after_known_pages` | `0` | 连续 N 页链接都已入库时停止（增量运行）；范围 0–100，默认 0 关闭；仅 template/next/auto 模式生效。开启后若上次运行更后页失败，可能提前停止，建议确认完整抓取后再开 |
 
 未配置 `render: true` 时，列表页解析为空会自动用 Chrome 渲染一次，并基于渲染后的 DOM 重新解析与继续翻页。自动分页在页内按 URL 去重；`test` 命令输出页数与停止原因（`cutoff`/`known_pages`/`no_next`/`max_pages`/`empty`/`fetch_failed`/`done`）。实现入口：`collect_list_entries_detailed(source, *, cutoff=None, known_urls=None) -> dict`，返回 `items/pages/page_urls/stop_reason`；`collect_list_entries` 保留旧返回类型。
@@ -316,7 +316,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 - `deadline_xpath` 解析的截止时间写 `deadline`/`deadline_raw`，不写 `publish_time`（项目行 `publish_time` 为空，按发布时间排序会排在末尾；`/v1/articles` 支持 `order=deadline_desc|deadline_asc` 与 `deadline_from`/`deadline_to`，`published_from`/`published_to` 会排除项目行）；
 - `title` 与 `list_title` 都写列表标题，`title_source=list_title`（详情页 `<title>` 通常是站点名，不可信）；
 - `content_required` 默认 `false`：详情抓取失败、或正文短于 100 字（登录墙占位）时只保存列表字段并记 `ok`，下次运行按 `ok` 跳过；设为 `true` 则按新闻语义记 `no_content`/`error` 并重试；
-- 截止时间早于抓取窗口起点时记 `old`（用 `--force` 可强制重抓），避免每次重跑历年公告；
+- 截止时间早于抓取窗口起点时记 `old`（用 `--force` 可强制重抓），避免每次重跑历年公告；已入库 `ok`/`old` 行会在后续运行中按列表刷新 `deadline`/`deadline_raw`/`project_status`，不抓详情；无年份截止时间按当前年份保留；
 - 项目模式无需配置 `date_xpath`；`parse_list_items` 在未配置 `date_xpath` 时保持 `parsed=None`，不会把截止时间当发布时间。
 
 ```json
@@ -591,8 +591,8 @@ curl http://localhost:8000/v1/health
 | `regression/test_publish_source.py` | 2 个用例：GNE 内部来源映射到落库值、视频页 meta 来源标记 |
 | `regression/test_process_entry_dates.py` | 17 个用例：未来/超 skew 详情日期回退列表、跨 UTC 日期边界、无年份按列表年补齐、跨年无年份日期取上一年并保留时刻、跨年正方向（列表年末+详情次年）保留时刻、未来无年份日期按列表年补齐、无列表日期记 unknown_date、title_source 归一、skew 钳制、unknown_date 不覆盖旧来源 |
 | `regression/test_extract_job_dates.py` | 7 个用例：API extract 作业超 skew 回退库内列表日期、无年份兜底、跨年无年份取上一年、跨年正方向保留时刻、详情不可解析兜底、无列表日期记 unknown_date |
-| `regression/test_project_application.py` | 15 个用例：`listing_type` 默认值/非法值回退、`deadline_xpath`/`project_status_xpath` 解析且不把截止时间当发布时间、详情缺失或登录墙短正文仍存列表字段（标题取列表标题、`title_source=list_title`）、`content_required=true` 走 `no_content`、截止时间早于窗口记 `old`、v7→v8 迁移补三列、deadline 不回退发布时间、不可解析截止时间保留原文、项目 `old` 行二次运行 skip、`--force` 仍抓详情、长正文成功入库、`content_required` 字符串值归一、deadline 过滤与排序 |
-| `regression/test_pagination.py` | 39 个用例：模板分页按截止日期停止、模板生成后续页、max_pages 含首页语义、last_url_xpath 多候选取最大页码、跟随 onclick/忽略 # 锚点、渲染后 DOM 找下一页、未知日期不触发 cutoff、已入库页连续早停、旧 list_urls 行为、非法 mode 回退、固定列表忽略 max_pages/分页配置/cutoff、固定页抓取失败不误报、固定列表全空报 empty、置顶旧文不提前停、next XPath 无 href 文本忽略、next XPath 属性 onclick 解析（含 JavaScript: 前缀）、模板缺 {page} 回退、collect_list_entries 包装、分页 URL SSRF 校验（可信内网主机/可信主机 DNS 解析出的内网 IP/公网 IP/未信任私网拒绝）、连接层 IP 字面量保留 scheme+port（`_PinnedHTTPConnection`/`_PinnedHTTPSConnection` 的 `connect` 真实路径）、可信端点 DNS 失败冷却后重试、列表抓取确实收到 validator |
+| `regression/test_project_application.py` | 21 个用例：`listing_type` 默认值/非法值回退、`deadline_xpath`/`project_status_xpath` 解析且不把截止时间当发布时间、详情缺失或登录墙短正文仍存列表字段（标题取列表标题、`title_source=list_title`）、`content_required=true` 走 `no_content`、截止时间早于窗口记 `old`、v7→v8 迁移补三列、deadline 不回退发布时间、不可解析截止时间保留原文、项目 `old` 行二次运行 skip、`--force` 仍抓详情、长正文成功入库、`content_required` 字符串值归一、deadline 过滤与排序、已入库 `ok`/`old` 行刷新列表字段（延期/截止/不可解析清空）且不抓详情、无年份未来截止保留当年、deadline 边界按站点墙钟 |
+| `regression/test_pagination.py` | 40 个用例：模板分页按截止日期停止、模板生成后续页、max_pages 含首页语义、last_url_xpath 多候选取最大页码、跟随 onclick/忽略 # 锚点、渲染后 DOM 找下一页、未知日期不触发 cutoff、已入库页连续早停、旧 list_urls 行为、非法 mode 回退、固定列表忽略 max_pages/分页配置/cutoff、固定页抓取失败不误报、固定列表全空报 empty、置顶旧文不提前停、next XPath 无 href 文本忽略、next XPath 属性 onclick 解析（含 JavaScript: 前缀）、模板缺 {page} 回退、collect_list_entries 包装、分页 URL SSRF 校验（可信内网主机/可信主机 DNS 解析出的内网 IP/公网 IP/未信任私网拒绝）、连接层 IP 字面量保留 scheme+port（`_PinnedHTTPConnection`/`_PinnedHTTPSConnection` 的 `connect` 真实路径）、可信端点 DNS 失败冷却后重试、列表抓取确实收到 validator |
 
 运行方式：`python -X utf8 -m unittest discover -s regression -t . -p "test_*.py" -v`（约 15 秒，无需网络）。
 
@@ -706,7 +706,7 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 - `TitleExtractor.extract_with_source(element, title_xpath: str = "") -> tuple[str, str]`：返回 `(title, title_source)`，`title_source` 为 `article_title_xpath`（配置的 XPath 实际命中）或 `gne_default`；
 - `TimeExtractor.extract_with_source(element, publish_time_xpath: str = "") -> tuple[str, str]`：返回 `(publish_time, source)`，`source` 为 `xpath`/`labeled_text`/`meta`/`json_ld`/`time_tag`/`text` 等内部来源；
 - `publish_source_for(raw: str) -> str`：把 GNE 内部来源映射为落库值 `xpath`/`labeled_text`/`meta`/`text`/`video_meta`/`detail`/`list`，未知值记 `detail`；
-- `parse_datetime(value, fmt=None, timezone_name="Asia/Shanghai", *, allow_year_adjust: bool = True, reference_year: int | None = None) -> dt.datetime | None`：解析中文/数字/相对/ISO 日期；`reference_year` 用于无年份月日按指定年份补齐，避免当前年构造出未来日期；
+- `parse_datetime(value, fmt=None, timezone_name="Asia/Shanghai", *, allow_year_adjust: bool = True, reference_year: int | None = None, allow_future: bool = False) -> dt.datetime | None`：解析中文/数字/相对/ISO 日期；`reference_year` 用于无年份月日按指定年份补齐，避免当前年构造出未来日期；`allow_future=True` 保留晚于当前时间的显式年份（截止时间用），不再回退上一年；
 - `collect_list_entries_detailed(source, *, cutoff: dt.datetime | None = None, known_urls: set[str] | None = None) -> dict[str, Any]`：抓取列表页并返回 `items/pages/page_urls/stop_reason`，支持 `pagination` 的 template/next/auto 模式；`collect_list_entries` 保留只返回条目的旧签名；
 - `_process_project_entry(conn, source, entry, cutoff, force, delay=0.0) -> str`：项目申报条目入库入口，返回 `ok/old/skip/no_content/error`；`entry` 需含 `title/url/deadline_text/deadline/project_status`；
 - `save_article(..., deadline: str = "", deadline_raw: str = "", project_status: str = "", ...) -> str`：新增三个项目申报字段，UPSERT 按空值保留旧值；

@@ -244,7 +244,7 @@ curl "http://localhost:8000/v1/articles?status=all&page_size=50"
 | `status` | `ok`（默认）、`old`、`no_content`、`unknown_date`、`error`、`all` |
 | `source` | 站点名，对应配置里的 `name` |
 | `published_from` / `published_to` | 日期或 ISO 时间；只写日期时按 `NEWS_TIMEZONE` 解释，结束日期包含当天。项目申报行 `publish_time` 为空，会被这两个参数排除 |
-| `deadline_from` / `deadline_to` | 项目申报专用：按 `deadline` 过滤（站点墙钟），只写日期时结束日期包含当天；与 `published_from`/`published_to` 同时传会 AND 成空集，请二选一 |
+| `deadline_from` / `deadline_to` | 项目申报专用：按 `deadline` 过滤（站点墙钟），只写日期时结束日期包含当天；带时区偏移的时间只取墙钟部分，不做时区换算；与 `published_from`/`published_to` 同时传会 AND 成空集，请二选一 |
 | `q` | 标题、列表标题、正文的模糊搜索 |
 | `page` / `page_size` | 分页，`page_size` 最大 100 |
 | `order` | `published_desc`（默认）、`published_asc`、`updated_desc`、`deadline_desc`、`deadline_asc` |
@@ -439,7 +439,7 @@ cp sources.json sources.local.json
 | `total_pages_regex` | `(?:index_\|page[=/])(\\d+)` | 从 HTML 提取最大页码的正则，捕获组必须是数字（表格中 `\\|` 表示正则里的或） |
 | `start` | `1` | 模板模式从第几页开始生成（第 1 页始终是 `list_url`，通常设为 2）；范围 1–1000 |
 | `max_pages` | `50` | 最多抓取页数（含 `list_url` 计 1 页，后续页最多 `max_pages-1` 个）；范围 1–500 |
-| `stop_when_older_than_cutoff` | `true` | 当前页最晚日期早于抓取窗口起点时停止翻页（整页每条都能解析出日期且都早于窗口才停，避免置顶旧文或缺失日期导致漏抓） |
+| `stop_when_older_than_cutoff` | `true` | 当前页最晚日期早于抓取窗口起点时停止翻页（整页每条都能解析出日期且都早于窗口才停，避免置顶旧文或缺失日期导致漏抓）；项目申报模式不按发布日期早停，窗口判断只看 `deadline` |
 | `stop_after_known_pages` | `0` | 连续 N 页链接都已入库时停止（增量运行）；范围 0–100，默认 0 关闭；仅 template/next/auto 模式生效。开启后若上次运行更后页失败，可能提前停止，建议确认完整抓取后再开 |
 
 未配置 `render: true` 时，列表页解析为空会自动用 Chrome 渲染一次，并基于渲染后的 DOM 重新解析与继续翻页。自动分页会在页内按 URL 去重，并在 `test` 命令输出页数与停止原因（如 `cutoff`、`known_pages`、`no_next`、`max_pages`、`empty`、`fetch_failed`、`done`）。
@@ -454,7 +454,8 @@ cp sources.json sources.local.json
 - `project_status_xpath` 解析出的状态写入 `project_status`；
 - `title` 与 `list_title` 都写列表标题，`title_source=list_title`；
 - `content_required: false`（默认）时，详情页抓不到正文、或正文短于 100 字（登录墙占位）不会记为失败，只保存列表字段，下次运行也不会重复重试；需要正文的站点请显式设为 `true`；
-- 截止时间早于抓取窗口起点（`--days`/`--since`）的条目记为 `old`，避免每次重跑都处理历年公告；`--force` 可强制重抓。
+- 截止时间早于抓取窗口起点（`--days`/`--since`）的条目记为 `old`，避免每次重跑都处理历年公告；`--force` 可强制重抓；
+- 已入库的 `ok`/`old` 行会在后续运行中按列表字段刷新 `deadline`/`deadline_raw`/`project_status`（延期、截止状态变化无需重抓详情即可落库）；无年份的截止时间（如“11月30日”）按当前年份保留，不会被减一年。
 
 ```json
 {

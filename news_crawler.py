@@ -227,6 +227,7 @@ def parse_datetime(
     *,
     allow_year_adjust: bool = True,
     reference_year: int | None = None,
+    allow_future: bool = False,
 ) -> dt.datetime | None:
     """Parse common Chinese news date strings into an aware datetime."""
     text = clean_text(value)
@@ -241,6 +242,10 @@ def parse_datetime(
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=tz)
         if parsed > now + dt.timedelta(days=1):
+            # 截止时间允许位于未来：项目申报公告的“11月30日”就是未来日期，
+            # 不能按新闻发布时间回退到上一年。
+            if allow_future:
+                return parsed
             if not allow_year_adjust:
                 return None
             # 文本里自带年份时不能减一年：列表页若给出 2026-11-14 这类
@@ -929,7 +934,15 @@ def parse_list_items(html: str, source: dict, base_url: str) -> list[dict]:
         deadline_dt = None
         if deadline_xpath:
             deadline_text = xpath_text(node, deadline_xpath)
-            deadline_dt = parse_datetime(deadline_text, deadline_format, tz_name)
+            # 截止时间可以晚于当前时间；无年份的“11月30日”必须保留今年，
+            # 不能走发布时间“未来回退上一年”的逻辑。
+            deadline_dt = parse_datetime(
+                deadline_text,
+                deadline_format,
+                tz_name,
+                allow_year_adjust=False,
+                allow_future=True,
+            )
         project_status = ""
         status_xpath = source.get("project_status_xpath")
         if status_xpath:
@@ -1369,6 +1382,7 @@ def collect_list_entries_detailed(
     settings = _pagination_settings(source)
     fixed_urls = [str(url) for url in (source.get("list_urls") or [source["list_url"]])]
     fixed_mode = settings["mode"] == "none" or bool(source.get("list_urls"))
+    is_project = source.get("listing_type") == "project_application"
     pending = list(fixed_urls)
     all_items: list[dict] = []
     seen_urls: set[str] = set()
@@ -1424,8 +1438,11 @@ def collect_list_entries_detailed(
             all_items.append(item)
 
         parsed_dates = [item["parsed"] for item in items if item.get("parsed")]
+        # 项目申报页的 parsed 是公告发布日期，不是截止时间；整页公告都
+        # 发布于窗口之前并不代表后面的页没有仍在受理的项目，禁止据此早停。
         if (
             not fixed_mode
+            and not is_project
             and cutoff is not None
             and settings["stop_when_older_than_cutoff"]
             and len(parsed_dates) == len(items)
@@ -1608,8 +1625,13 @@ def save_article(
             END,
             list_publish_time = COALESCE(NULLIF(excluded.list_publish_time, ''), articles.list_publish_time),
             title_source = COALESCE(NULLIF(excluded.title_source, ''), articles.title_source),
-            -- 项目申报字段：本次为空时保留旧值（部分更新语义与其他字段一致）。
-            deadline = COALESCE(NULLIF(excluded.deadline, ''), articles.deadline),
+            -- 项目申报字段：本次给出了新的截止原文时，deadline 必须与它同步：
+            -- 解析失败（如“常年受理”）要清空旧解析值，否则会继续用过期截止
+            -- 时间过滤该行；本次没给原文才保留旧值。
+            deadline = CASE
+                WHEN excluded.deadline_raw <> '' THEN excluded.deadline
+                ELSE COALESCE(NULLIF(excluded.deadline, ''), articles.deadline)
+            END,
             deadline_raw = COALESCE(NULLIF(excluded.deadline_raw, ''), articles.deadline_raw),
             project_status = COALESCE(NULLIF(excluded.project_status, ''), articles.project_status),
             timezone = COALESCE(NULLIF(excluded.timezone, ''), articles.timezone),
@@ -1694,6 +1716,67 @@ def should_skip_stored(
     return stored_date is not None and stored_date < cutoff
 
 
+def _refresh_project_listing(
+    conn: sqlite3.Connection,
+    source_name: str,
+    url: str,
+    deadline_text: str,
+    deadline_raw: str,
+    project_status: str,
+    cutoff: dt.datetime,
+    timezone_name: str,
+) -> str | None:
+    """刷新已入库项目行的列表字段与窗口状态，不抓详情。
+
+    返回 None 表示该行不存在或不是 ok/old，交由后续正常流程处理；
+    返回 "skip" 表示列表字段与状态都没有变化；返回 "ok"/"old" 表示已刷新。
+    """
+    row = conn.execute(
+        "SELECT status, deadline, deadline_raw, project_status FROM articles "
+        "WHERE source = ? AND url = ?",
+        (source_name, url),
+    ).fetchone()
+    if row is None or row[0] not in ("ok", "old"):
+        return None
+    old_status = str(row[0])
+    old_deadline = str(row[1] or "")
+    old_raw = str(row[2] or "")
+    old_project_status = str(row[3] or "")
+    # 本次没有给出截止原文时保留旧解析值；给出了就与原文同步，解析失败
+    # 意味着旧截止时间已经失效，必须清空而不是继续沿用。
+    new_deadline = deadline_text if deadline_raw else old_deadline
+    new_raw = deadline_raw if deadline_raw else old_raw
+    new_project_status = project_status or old_project_status
+    new_status = old_status
+    if deadline_raw:
+        if deadline_text:
+            parsed = parse_datetime(deadline_text, None, timezone_name)
+            if parsed is not None:
+                new_status = "old" if parsed < cutoff else "ok"
+    if (new_deadline, new_raw, new_project_status, new_status) == (
+        old_deadline,
+        old_raw,
+        old_project_status,
+        old_status,
+    ):
+        return "skip"
+    conn.execute(
+        "UPDATE articles SET deadline = ?, deadline_raw = ?, project_status = ?, "
+        "status = ?, updated_at = ? WHERE source = ? AND url = ?",
+        (
+            new_deadline,
+            new_raw,
+            new_project_status,
+            new_status,
+            now_iso(),
+            source_name,
+            url,
+        ),
+    )
+    conn.commit()
+    return new_status
+
+
 def _process_project_entry(
     conn: sqlite3.Connection,
     source: dict,
@@ -1715,9 +1798,6 @@ def _process_project_entry(
     tz_name = source.get("timezone", "Asia/Shanghai")
     content_required = bool(source.get("content_required", False))
 
-    if not force and should_skip_stored(conn, source_name, url, cutoff, tz_name):
-        return "skip"
-
     # 只认 deadline 列。绝不回退到 parsed（列表发布时间）：项目站点若误配
     # date_xpath 而漏配 deadline_xpath，回退会把发布时间写成截止时间，
     # 并可能据此把仍在受理的公告误判为 old。
@@ -1732,6 +1812,24 @@ def _process_project_entry(
             deadline_raw,
             url,
         )
+
+    # 已入库的项目行也要用本次列表数据刷新截止时间、申报状态和窗口状态；
+    # 只跳过详情抓取，不能整条跳过，否则列表延期/截止状态变化永远不落库。
+    if not force:
+        refreshed = _refresh_project_listing(
+            conn,
+            source_name,
+            url,
+            deadline_text,
+            deadline_raw,
+            project_status,
+            cutoff,
+            tz_name,
+        )
+        if refreshed is not None:
+            return refreshed
+        if should_skip_stored(conn, source_name, url, cutoff, tz_name):
+            return "skip"
 
     def _save(status: str, **kwargs: Any) -> str:
         # 项目申报的列表标题就是公告标题；详情页常是登录墙，GNE 抽到的
