@@ -273,7 +273,9 @@ class ProjectApplicationTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(row["deadline"], "")
             self.assertEqual(row["deadline_raw"], "")
-            self.assertEqual(row["publish_time"], "")
+            # 配置了 date_xpath 时列表发布日期照常写入 publish_time；
+            # 关键是 deadline 不取它，两者互不影响。
+            self.assertEqual(row["publish_time"], "2026-11-01 00:00:00")
         finally:
             conn.close()
             tmp.cleanup()
@@ -1097,13 +1099,499 @@ class ProjectApplicationTest(unittest.TestCase):
                 "SELECT publish_time, publish_time_utc, publish_time_source, "
                 "publish_time_raw, list_publish_time, title_source FROM articles"
             ).fetchone()
+            # 源站没配 date_xpath：项目行的 publish_time 与 UTC 都清空
+            # （UTC 写 NULL，与 save_article 的 NULL 语义一致）。
             self.assertEqual(
-                tuple(row), ("", "", "", "", "", "list_title")
+                tuple(row), ("", None, "", "", "", "list_title")
             )
         finally:
             conn.close()
             tmp.cleanup()
 
+    def test_project_entry_saves_list_publish_date(self) -> None:
+        """配置 date_xpath 时，项目行保留列表发布日期，且与 deadline 互不影响。"""
+        conn, tmp = _new_conn()
+        try:
+            cutoff = news_crawler.parse_datetime("2026-01-01", None, "Asia/Shanghai")
+            assert cutoff is not None
+            entry = {
+                "title": "2026年度项目申报指南",
+                "url": "https://example.com/detail/publish-date",
+                "date_text": "2026-11-05",
+                "parsed": news_crawler.parse_datetime(
+                    "2026-11-05", None, "Asia/Shanghai"
+                ),
+                "deadline_text": "2026-11-30 16:30:00",
+                "deadline": news_crawler.parse_datetime(
+                    "2026-11-30 16:30:00", None, "Asia/Shanghai"
+                ),
+                "project_status": "申报中",
+            }
+            with mock.patch.object(
+                news_crawler,
+                "fetch_article_html",
+                return_value=("<html></html>", False),
+            ), mock.patch.object(news_crawler, "extract_article", return_value=None):
+                status = news_crawler.process_entry(
+                    conn, _source(date_xpath="./td[4]"), entry, cutoff, force=False
+                )
+            self.assertEqual(status, "ok")
+            row = conn.execute(
+                "SELECT publish_time, publish_time_utc, publish_time_source, "
+                "publish_time_raw, list_publish_time, deadline FROM articles"
+            ).fetchone()
+            self.assertEqual(row["publish_time"], "2026-11-05 00:00:00")
+            self.assertEqual(row["publish_time_source"], "list")
+            self.assertEqual(row["publish_time_raw"], "2026-11-05")
+            self.assertEqual(row["list_publish_time"], "2026-11-05 00:00:00")
+            self.assertEqual(row["deadline"], "2026-11-30 16:30:00")
+            self.assertEqual(row["publish_time_utc"], "2026-11-04 16:00:00")
+        finally:
+            conn.close()
+            tmp.cleanup()
+
+    def test_project_entry_without_date_xpath_keeps_publish_time_empty(self) -> None:
+        """未配置 date_xpath（只有截止时间列）时 publish_time 必须为空。"""
+        conn, tmp = _new_conn()
+        try:
+            cutoff = news_crawler.parse_datetime("2026-01-01", None, "Asia/Shanghai")
+            assert cutoff is not None
+            entry = _entry("https://example.com/detail/no-date-xpath", "2026-11-30 16:30:00")
+            with mock.patch.object(
+                news_crawler,
+                "fetch_article_html",
+                return_value=("<html></html>", False),
+            ), mock.patch.object(news_crawler, "extract_article", return_value=None):
+                status = news_crawler.process_entry(conn, _source(), entry, cutoff, force=False)
+            self.assertEqual(status, "ok")
+            row = conn.execute(
+                "SELECT publish_time, publish_time_utc, publish_time_source, "
+                "publish_time_raw, list_publish_time FROM articles"
+            ).fetchone()
+            self.assertEqual(
+                tuple(row), ("", None, "", "", "")
+            )
+        finally:
+            conn.close()
+            tmp.cleanup()
+
+    def test_refresh_updates_list_publish_date(self) -> None:
+        """列表发布日期变化时，已入库项目行要跟着刷新，且不抓详情。"""
+        conn, tmp = _new_conn()
+        try:
+            cutoff = news_crawler.parse_datetime("2026-01-01", None, "Asia/Shanghai")
+            assert cutoff is not None
+            source = _source(date_xpath="./td[4]")
+            first = {
+                "title": "2026年度项目申报指南",
+                "url": "https://example.com/detail/refresh-date",
+                "date_text": "2026-11-01",
+                "parsed": news_crawler.parse_datetime(
+                    "2026-11-01", None, "Asia/Shanghai"
+                ),
+                "deadline_text": "2026-11-30 16:30:00",
+                "deadline": news_crawler.parse_datetime(
+                    "2026-11-30 16:30:00", None, "Asia/Shanghai"
+                ),
+                "project_status": "申报中",
+            }
+            with mock.patch.object(
+                news_crawler,
+                "fetch_article_html",
+                return_value=("<html></html>", False),
+            ), mock.patch.object(news_crawler, "extract_article", return_value=None):
+                self.assertEqual(
+                    news_crawler.process_entry(conn, source, first, cutoff, force=False),
+                    "ok",
+                )
+            second = dict(first)
+            second["date_text"] = "2026-11-03"
+            second["parsed"] = news_crawler.parse_datetime(
+                "2026-11-03", None, "Asia/Shanghai"
+            )
+            with mock.patch.object(
+                news_crawler, "fetch_article_html"
+            ) as fetch_mock, mock.patch.object(
+                news_crawler, "extract_article", return_value=None
+            ):
+                status = news_crawler.process_entry(
+                    conn, source, second, cutoff, force=False
+                )
+            self.assertEqual(status, "ok")
+            fetch_mock.assert_not_called()
+            row = conn.execute(
+                "SELECT publish_time, list_publish_time FROM articles"
+            ).fetchone()
+            self.assertEqual(
+                tuple(row), ("2026-11-03 00:00:00", "2026-11-03 00:00:00")
+            )
+        finally:
+            conn.close()
+            tmp.cleanup()
+
+    def test_refresh_keeps_old_publish_date_when_list_date_unparsable(self) -> None:
+        """列表发布日期本次解析失败时保留旧值，不因页面抖动丢日期。"""
+        conn, tmp = _new_conn()
+        try:
+            cutoff = news_crawler.parse_datetime("2026-01-01", None, "Asia/Shanghai")
+            assert cutoff is not None
+            source = _source(date_xpath="./td[4]")
+            entry = {
+                "title": "2026年度项目申报指南",
+                "url": "https://example.com/detail/date-flicker",
+                "date_text": "2026-11-01",
+                "parsed": news_crawler.parse_datetime(
+                    "2026-11-01", None, "Asia/Shanghai"
+                ),
+                "deadline_text": "2026-11-30 16:30:00",
+                "deadline": news_crawler.parse_datetime(
+                    "2026-11-30 16:30:00", None, "Asia/Shanghai"
+                ),
+                "project_status": "申报中",
+            }
+            with mock.patch.object(
+                news_crawler,
+                "fetch_article_html",
+                return_value=("<html></html>", False),
+            ), mock.patch.object(news_crawler, "extract_article", return_value=None):
+                self.assertEqual(
+                    news_crawler.process_entry(conn, source, entry, cutoff, force=False),
+                    "ok",
+                )
+            degraded = dict(entry)
+            degraded["date_text"] = "待定"
+            degraded["parsed"] = None
+            status = news_crawler.process_entry(
+                conn, source, degraded, cutoff, force=False
+            )
+            self.assertEqual(status, "skip")
+            row = conn.execute("SELECT publish_time FROM articles").fetchone()
+            self.assertEqual(row["publish_time"], "2026-11-01 00:00:00")
+        finally:
+            conn.close()
+            tmp.cleanup()
+
+    def test_refresh_warns_when_keeping_non_list_publish_source(self) -> None:
+        """列表日期本次不可解析而沿用新闻遗留日期时，要留下 WARNING 便于排查。
+
+        只有截止时间延期（deadline 变化）触发 UPDATE，标题与 title_source 全部
+        相同，确保断言不依赖「标题变化」这类无关条件。
+        """
+        conn, tmp = _new_conn()
+        try:
+            cutoff = news_crawler.parse_datetime("2026-01-01", None, "Asia/Shanghai")
+            assert cutoff is not None
+            news_crawler.save_article(
+                conn,
+                "svc20",
+                "https://example.com/detail/legacy-kept",
+                list_title="2026年度项目申报指南",
+                title="2026年度项目申报指南",
+                title_source="list_title",
+                publish_time="2026-11-05 10:00:00",
+                publish_time_source="xpath",
+                publish_time_raw="2026年11月5日 10:00",
+                list_publish_time="2026-11-05 00:00:00",
+                deadline="2026-11-20 16:30:00",
+                deadline_raw="2026-11-20 16:30:00",
+                project_status="申报中",
+                timezone="Asia/Shanghai",
+                status="ok",
+            )
+            entry = {
+                "title": "2026年度项目申报指南",
+                "url": "https://example.com/detail/legacy-kept",
+                "date_text": "待定",
+                "parsed": None,
+                "deadline_text": "2026-11-30 16:30:00",
+                "deadline": news_crawler.parse_datetime(
+                    "2026-11-30 16:30:00", None, "Asia/Shanghai"
+                ),
+                "project_status": "申报中",
+            }
+            with self.assertLogs("news_crawler", level="WARNING") as logs:
+                status = news_crawler.process_entry(
+                    conn, _source(date_xpath="./td[4]"), entry, cutoff, force=False
+                )
+            # 截止时间延期 → 走 UPDATE 分支；关键是不清空、不改来源。
+            self.assertEqual(status, "ok")
+            self.assertTrue(any("沿用旧发布时间" in line for line in logs.output))
+            row = conn.execute(
+                "SELECT publish_time, publish_time_source FROM articles"
+            ).fetchone()
+            self.assertEqual(row["publish_time"], "2026-11-05 10:00:00")
+            self.assertEqual(row["publish_time_source"], "xpath")
+        finally:
+            conn.close()
+            tmp.cleanup()
+
+    def test_refresh_clears_list_publish_time_when_no_local_publish_time(self) -> None:
+        """没有任何可沿用的本地墙钟时，不能留下「有列表日期却没有发布时间」的态。"""
+        conn, tmp = _new_conn()
+        try:
+            cutoff = news_crawler.parse_datetime("2026-01-01", None, "Asia/Shanghai")
+            assert cutoff is not None
+            news_crawler.save_article(
+                conn,
+                "svc20",
+                "https://example.com/detail/empty-publish",
+                list_title="2026年度项目申报指南",
+                title="2026年度项目申报指南",
+                title_source="list_title",
+                publish_time_source="xpath",
+                publish_time_raw="2026年11月5日",
+                list_publish_time="2026-11-05 00:00:00",
+                deadline="2026-11-20 16:30:00",
+                deadline_raw="2026-11-20 16:30:00",
+                project_status="申报中",
+                timezone="Asia/Shanghai",
+                status="ok",
+            )
+            entry = {
+                "title": "2026年度项目申报指南",
+                "url": "https://example.com/detail/empty-publish",
+                "date_text": "待定",
+                "parsed": None,
+                "deadline_text": "2026-11-30 16:30:00",
+                "deadline": news_crawler.parse_datetime(
+                    "2026-11-30 16:30:00", None, "Asia/Shanghai"
+                ),
+                "project_status": "申报中",
+            }
+            status = news_crawler.process_entry(
+                conn, _source(date_xpath="./td[4]"), entry, cutoff, force=False
+            )
+            self.assertEqual(status, "ok")
+            row = conn.execute(
+                "SELECT publish_time, publish_time_utc, publish_time_source, "
+                "publish_time_raw, list_publish_time FROM articles"
+            ).fetchone()
+            self.assertEqual(row["publish_time"], "")
+            self.assertIsNone(row["publish_time_utc"])
+            self.assertEqual(row["publish_time_source"], "")
+            self.assertEqual(row["publish_time_raw"], "")
+            self.assertEqual(row["list_publish_time"], "")
+        finally:
+            conn.close()
+            tmp.cleanup()
+
+    def test_refresh_does_not_warn_on_unchanged_rows(self) -> None:
+        """未变化的行不写库，也不应每轮重复打「沿用旧发布时间」WARNING。"""
+        conn, tmp = _new_conn()
+        try:
+            cutoff = news_crawler.parse_datetime("2026-01-01", None, "Asia/Shanghai")
+            assert cutoff is not None
+            news_crawler.save_article(
+                conn,
+                "svc20",
+                "https://example.com/detail/quiet-skip",
+                list_title="2026年度项目申报指南",
+                title="2026年度项目申报指南",
+                title_source="list_title",
+                publish_time="2026-11-05 10:00:00",
+                publish_time_source="xpath",
+                publish_time_raw="2026年11月5日 10:00",
+                list_publish_time="2026-11-05 00:00:00",
+                deadline="2026-11-30 16:30:00",
+                deadline_raw="2026-11-30 16:30:00",
+                project_status="申报中",
+                timezone="Asia/Shanghai",
+                status="ok",
+            )
+            entry = {
+                "title": "2026年度项目申报指南",
+                "url": "https://example.com/detail/quiet-skip",
+                "date_text": "待定",
+                "parsed": None,
+                "deadline_text": "2026-11-30 16:30:00",
+                "deadline": news_crawler.parse_datetime(
+                    "2026-11-30 16:30:00", None, "Asia/Shanghai"
+                ),
+                "project_status": "申报中",
+            }
+            with self.assertNoLogs("news_crawler", level="WARNING"):
+                status = news_crawler.process_entry(
+                    conn, _source(date_xpath="./td[4]"), entry, cutoff, force=False
+                )
+            self.assertEqual(status, "skip")
+            row = conn.execute("SELECT publish_time FROM articles").fetchone()
+            self.assertEqual(row["publish_time"], "2026-11-05 10:00:00")
+        finally:
+            conn.close()
+            tmp.cleanup()
+    def test_no_content_retry_keeps_list_publish_date(self) -> None:
+        """正文重试期间不能把已保留的列表发布日期抹掉。"""
+        conn, tmp = _new_conn()
+        try:
+            cutoff = news_crawler.parse_datetime("2026-01-01", None, "Asia/Shanghai")
+            assert cutoff is not None
+            source = _source(date_xpath="./td[4]", content_required=True)
+            entry = {
+                "title": "2026年度项目申报指南",
+                "url": "https://example.com/detail/keep-date",
+                "date_text": "2026-11-05",
+                "parsed": news_crawler.parse_datetime(
+                    "2026-11-05", None, "Asia/Shanghai"
+                ),
+                "deadline_text": "2026-11-30 16:30:00",
+                "deadline": news_crawler.parse_datetime(
+                    "2026-11-30 16:30:00", None, "Asia/Shanghai"
+                ),
+                "project_status": "申报中",
+            }
+            # 首轮：列表日期解析成功，但详情抽不到正文 → no_content，日期已入库。
+            with mock.patch.object(
+                news_crawler,
+                "fetch_article_html",
+                return_value=("<html></html>", False),
+            ), mock.patch.object(news_crawler, "extract_article", return_value=None):
+                self.assertEqual(
+                    news_crawler.process_entry(conn, source, entry, cutoff, force=False),
+                    "no_content",
+                )
+            row = conn.execute(
+                "SELECT publish_time, publish_time_source, list_publish_time FROM articles"
+            ).fetchone()
+            self.assertEqual(row["publish_time"], "2026-11-05 00:00:00")
+            self.assertEqual(row["publish_time_source"], "list")
+
+            # 第二轮：列表日期本次不可解析（refresh 沿用旧值并要求重试正文），
+            # 正文仍然抽不到；旧日期不能被这次失败清空。
+            degraded = dict(entry)
+            degraded["date_text"] = "待定"
+            degraded["parsed"] = None
+            with mock.patch.object(
+                news_crawler,
+                "fetch_article_html",
+                return_value=("<html></html>", False),
+            ), mock.patch.object(news_crawler, "extract_article", return_value=None):
+                self.assertEqual(
+                    news_crawler.process_entry(
+                        conn, source, degraded, cutoff, force=False
+                    ),
+                    "no_content",
+                )
+            row = conn.execute(
+                "SELECT publish_time, publish_time_source, list_publish_time, deadline "
+                "FROM articles"
+            ).fetchone()
+            self.assertEqual(row["publish_time"], "2026-11-05 00:00:00")
+            self.assertEqual(row["publish_time_source"], "list")
+            self.assertEqual(row["list_publish_time"], "2026-11-05 00:00:00")
+            self.assertEqual(row["deadline"], "2026-11-30 16:30:00")
+        finally:
+            conn.close()
+            tmp.cleanup()
+
+    def test_refresh_fixes_legacy_publish_source_to_list(self) -> None:
+        """历史新闻行切项目后，即使日期值不变也要把来源改写成 list。
+
+        除 publish_time_source / publish_time_raw 之外，其余字段全部与本次列表
+        数据一致（含 title 与 title_source），因此只有「五元组比较」能触发
+        UPDATE；退回三元组比较时本用例必须变红，否则是假覆盖。
+        """
+        conn, tmp = _new_conn()
+        try:
+            cutoff = news_crawler.parse_datetime("2026-01-01", None, "Asia/Shanghai")
+            assert cutoff is not None
+            # 历史新闻模式残留：日期值与本次列表日期相同，但来源/原文是详情抽取。
+            news_crawler.save_article(
+                conn,
+                "svc20",
+                "https://example.com/detail/legacy-source",
+                list_title="2026年度项目申报指南",
+                title="2026年度项目申报指南",
+                title_source="list_title",
+                publish_time="2026-11-05 00:00:00",
+                publish_time_source="xpath",
+                publish_time_raw="2026年11月5日",
+                list_publish_time="2026-11-05 00:00:00",
+                deadline="2026-11-30 16:30:00",
+                deadline_raw="2026-11-30 16:30:00",
+                project_status="申报中",
+                timezone="Asia/Shanghai",
+                status="ok",
+            )
+            entry = {
+                "title": "2026年度项目申报指南",
+                "url": "https://example.com/detail/legacy-source",
+                "date_text": "2026-11-05",
+                "parsed": news_crawler.parse_datetime("2026-11-05", None, "Asia/Shanghai"),
+                "deadline_text": "2026-11-30 16:30:00",
+                "deadline": news_crawler.parse_datetime(
+                    "2026-11-30 16:30:00", None, "Asia/Shanghai"
+                ),
+                "project_status": "申报中",
+            }
+            with mock.patch.object(
+                news_crawler,
+                "fetch_article_html",
+                return_value=("<html></html>", False),
+            ), mock.patch.object(news_crawler, "extract_article", return_value=None):
+                status = news_crawler.process_entry(
+                    conn, _source(date_xpath="./td[4]"), entry, cutoff, force=False
+                )
+            self.assertEqual(status, "ok")
+            row = conn.execute(
+                "SELECT publish_time, publish_time_source, publish_time_raw FROM articles"
+            ).fetchone()
+            self.assertEqual(row["publish_time_source"], "list")
+            self.assertEqual(row["publish_time_raw"], "2026-11-05")
+        finally:
+            conn.close()
+            tmp.cleanup()
+
+    def test_refresh_does_not_treat_utc_clock_as_local_publish_time(self) -> None:
+        """publish_time 为空而 publish_time_utc 有值时，不能把 UTC 墙钟当本地时间。"""
+        conn, tmp = _new_conn()
+        try:
+            cutoff = news_crawler.parse_datetime("2026-01-01", None, "Asia/Shanghai")
+            assert cutoff is not None
+            news_crawler.save_article(
+                conn,
+                "svc20",
+                "https://example.com/detail/utc-only",
+                list_title="2026年度项目申报指南",
+                title="2026年度项目申报指南",
+                title_source="list_title",
+                publish_time_source="xpath",
+                publish_time_raw="2026年11月5日",
+                list_publish_time="2026-11-05 00:00:00",
+                deadline="2026-11-30 16:30:00",
+                deadline_raw="2026-11-30 16:30:00",
+                project_status="申报中",
+                timezone="Asia/Shanghai",
+                status="ok",
+            )
+            # 只有 UTC 墙钟、没有本地墙钟：模拟历史脏数据。
+            conn.execute(
+                "UPDATE articles SET publish_time_utc = '2026-11-04 16:00:00' "
+                "WHERE source = 'svc20'"
+            )
+            entry = {
+                "title": "2026年度项目申报指南",
+                "url": "https://example.com/detail/utc-only",
+                "date_text": "待定",
+                "parsed": None,
+                "deadline_text": "2026-11-30 16:30:00",
+                "deadline": news_crawler.parse_datetime(
+                    "2026-11-30 16:30:00", None, "Asia/Shanghai"
+                ),
+                "project_status": "申报中",
+            }
+            status = news_crawler.process_entry(
+                conn, _source(date_xpath="./td[4]"), entry, cutoff, force=False
+            )
+            self.assertEqual(status, "ok")
+            row = conn.execute(
+                "SELECT publish_time, publish_time_utc FROM articles"
+            ).fetchone()
+            # 不能把 UTC 墙钟 2026-11-04 16:00 当成本地墙钟写回 publish_time。
+            self.assertEqual(row["publish_time"], "")
+            self.assertIsNone(row["publish_time_utc"])
+        finally:
+            conn.close()
+            tmp.cleanup()
     def test_refresh_old_row_to_ok_required_content_fetches_detail(self) -> None:
         conn, tmp = _new_conn()
         try:
