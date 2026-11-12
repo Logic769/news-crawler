@@ -2088,22 +2088,40 @@ def _refresh_project_listing(
     if tz_guessed:
         # 行内时区缺失属于历史数据（v6 之前入库），只能按站点当前配置猜一次
         # UTC；不写回 timezone，站点配置日后被修正时还能靠 --force 重算。
-        LOG.warning(
-            "站点 %r 的项目行 %s 沿用旧发布时间 %r 但缺少行内时区，"
-            "按站点当前时区 %r 换算 publish_time_utc",
-            source_name,
-            url,
-            new_publish,
-            timezone_name,
-        )
+        if timezone_name:
+            LOG.warning(
+                "站点 %r 的项目行 %s 沿用旧发布时间 %r 但缺少行内时区，"
+                "按站点当前时区 %r 换算 publish_time_utc",
+                source_name,
+                url,
+                new_publish,
+                timezone_name,
+            )
+        else:
+            # 站点配置也为空时没有可换算的口径，utc 保持 NULL；不要把「没算」
+            # 说成「按空时区算过」，否则排障时会误以为已经有可信 UTC 值。
+            LOG.warning(
+                "站点 %r 的项目行 %s 缺少可用时区（站点配置与行内均未提供），"
+                "publish_time_utc 留空",
+                source_name,
+                url,
+            )
     if tz_config_missing:
         # 站点配置缺 timezone 属于配置问题，按行内旧时区换算并提示修正。
-        LOG.warning(
-            "站点 %r 未配置 timezone，项目行 %s 沿用行内时区 %r 换算 publish_time_utc",
-            source_name,
-            url,
-            new_timezone or "空",
-        )
+        if new_timezone:
+            LOG.warning(
+                "站点 %r 未配置 timezone，项目行 %s 沿用行内时区 %r 换算 publish_time_utc",
+                source_name,
+                url,
+                new_timezone,
+            )
+        else:
+            LOG.warning(
+                "站点 %r 未配置 timezone，项目行 %s 也没有行内时区，"
+                "publish_time_utc 留空",
+                source_name,
+                url,
+            )
     # publish_time 在这里按 source 一起写：只有配置了 date_xpath 的站点才有值，
     # 其余站点写空串，与「项目行不伪装发布时间」的语义保持一致。
     utc_value = new_publish_utc or None
