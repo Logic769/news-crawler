@@ -2003,6 +2003,77 @@ class ProjectApplicationTest(unittest.TestCase):
             # 没有可信口径，只能按站点当前时区猜一次。
             self.assertEqual(row["publish_time_utc"], "2026-11-05 00:00:00")
             self.assertIsNone(row["timezone"])
+            # 猜出来的 utc 下一轮成了「行内无时区但已有 utc」分支的旧值被沿用，
+            # 不再重复换算，所以第二轮必须 skip。
+            updated_at = conn.execute(
+                "SELECT updated_at FROM articles"
+            ).fetchone()["updated_at"]
+            again = news_crawler.process_entry(
+                conn,
+                _source(date_xpath="./td[4]", timezone="UTC"),
+                entry,
+                cutoff,
+                force=False,
+            )
+            self.assertEqual(again, "skip")
+            self.assertEqual(
+                conn.execute("SELECT updated_at FROM articles").fetchone()["updated_at"],
+                updated_at,
+            )
+        finally:
+            conn.close()
+            tmp.cleanup()
+
+    def test_refresh_keeps_row_timezone_when_site_timezone_missing(self) -> None:
+        """站点配置 timezone 为空串时保留行内已知时区，不把已知口径清成未知。"""
+        conn, tmp = _new_conn()
+        try:
+            cutoff = news_crawler.parse_datetime("2026-01-01", None, "Asia/Shanghai")
+            assert cutoff is not None
+            url = "https://example.com/detail/tz-config-missing"
+            news_crawler.save_article(
+                conn,
+                "svc20",
+                url,
+                list_title="2026年度项目申报指南",
+                title="2026年度项目申报指南",
+                title_source="list_title",
+                publish_time="2026-11-01 00:00:00",
+                publish_time_source="list",
+                publish_time_raw="2026-11-01",
+                list_publish_time="2026-11-01 00:00:00",
+                deadline="2026-11-20 16:30:00",
+                deadline_raw="2026-11-20 16:30:00",
+                project_status="申报中",
+                timezone="Asia/Shanghai",
+                status="ok",
+            )
+            with self.assertLogs("news_crawler", level="WARNING") as logs:
+                refreshed = news_crawler._refresh_project_listing(
+                    conn,
+                    "svc20",
+                    url,
+                    "2026年度项目申报指南",
+                    "2026-11-30 16:30:00",
+                    news_crawler.parse_datetime("2026-11-30 16:30:00", None, "UTC"),
+                    "2026-11-30 16:30:00",
+                    "申报中",
+                    cutoff,
+                    "",  # 站点配置缺 timezone（写成空串）
+                    False,
+                    "2026-11-05 00:00:00",
+                    "2026-11-05",
+                    True,
+                )
+            self.assertEqual(refreshed, "ok")
+            self.assertTrue(any("未配置 timezone" in line for line in logs.output))
+            row = conn.execute(
+                "SELECT publish_time, publish_time_utc, timezone FROM articles"
+            ).fetchone()
+            self.assertEqual(row["publish_time"], "2026-11-05 00:00:00")
+            # 按行内 Asia/Shanghai 换算：11-05 00:00 上海 → 11-04 16:00Z
+            self.assertEqual(row["publish_time_utc"], "2026-11-04 16:00:00")
+            self.assertEqual(row["timezone"], "Asia/Shanghai")
         finally:
             conn.close()
             tmp.cleanup()
