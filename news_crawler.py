@@ -493,7 +493,8 @@ def parse_deadline_after(
     not_before: dt.datetime | None = None,
     not_after: dt.datetime | None = None,
 ) -> dt.datetime | None:
-    """无年份截止时间取不早于 reference 的最近年份。
+    """无年份截止时间按基准年取最近合法年份：默认不早于 reference，
+    allow_past 时不晚于 reference。
 
     例：2026-12-20 发布“1月15日截止”应解析为 2027-01-15，而不是已过去的
     2026-01-15；有明确年份的文本直接按 parse_datetime 处理。
@@ -501,8 +502,9 @@ def parse_deadline_after(
     allow_past=True 用于列表已明确标注“已截止”的行：截止时间必须已经
     过去，取不晚于 reference 的最近年份，避免把 2026-11 列表里的
     “10月01日 / 已截止”推成 2027-10-01。此时可用 not_before/not_after
-    限定可信区间（通常是列表发布日期到抓取时刻）：区间内没有候选时返回
-    None，保留原文，不猜年份。
+    限定可信窗口（通常是列表发布日期到抓取时刻，not_before 缺失时只约束
+    上界；仅 allow_past=True 时生效）：区间内没有候选时返回 None，不猜年份
+    （落库时 deadline 留空、只保留 deadline_raw 原文）。
 
     fmt 不含 %Y/%y（如 %m%d）时同样按基准年补齐：strptime 会把缺失年份
     填成 1900，不能直接交给通用解析。

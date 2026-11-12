@@ -833,6 +833,7 @@ class ProjectApplicationTest(unittest.TestCase):
         self.assertEqual(deadline.strftime("%Y-%m-%d"), "2026-10-01")
 
     def test_deadline_closed_uses_year_after_publish(self) -> None:
+        tz = ZoneInfo("Asia/Shanghai")
         html = (
             "<html><body><table><tbody>"
             '<tr class="ant-table-row"><td><a class="detailLink" '
@@ -848,9 +849,26 @@ class ProjectApplicationTest(unittest.TestCase):
         deadline = entries[0]["deadline"]
         self.assertIsNotNone(deadline)
         assert deadline is not None
-        self.assertEqual(deadline.strftime("%Y-%m-%d"), "2026-01-15")
+        # 端到端受抓取时刻约束，只断言不变量，避免用例随时钟老化。
+        self.assertEqual((deadline.month, deadline.day), (1, 15))
+        self.assertGreaterEqual(deadline.date(), dt.date(2025, 12, 20))
+        self.assertLessEqual(deadline.date(), dt.datetime.now(tz).date())
+        # 精确年份用固定窗口的直调用例锁定（同时覆盖 deadline_format 分支）。
+        fixed = news_crawler.parse_deadline_after(
+            "1月15日",
+            "%m月%d日",
+            dt.datetime(2025, 12, 20, tzinfo=tz),
+            "Asia/Shanghai",
+            allow_past=True,
+            not_before=dt.datetime(2025, 12, 20, tzinfo=tz),
+            not_after=dt.datetime(2026, 11, 12, tzinfo=tz),
+        )
+        self.assertIsNotNone(fixed)
+        assert fixed is not None
+        self.assertEqual(fixed.strftime("%Y-%m-%d"), "2026-01-15")
 
     def test_deadline_closed_on_publish_day(self) -> None:
+        tz = ZoneInfo("Asia/Shanghai")
         html = (
             "<html><body><table><tbody>"
             '<tr class="ant-table-row"><td><a class="detailLink" '
@@ -866,9 +884,23 @@ class ProjectApplicationTest(unittest.TestCase):
         deadline = entries[0]["deadline"]
         self.assertIsNotNone(deadline)
         assert deadline is not None
-        self.assertEqual(deadline.strftime("%Y-%m-%d"), "2026-11-05")
+        self.assertEqual((deadline.month, deadline.day), (11, 5))
+        self.assertGreaterEqual(deadline.date(), dt.date(2026, 11, 5))
+        fixed = news_crawler.parse_deadline_after(
+            "11月5日",
+            None,
+            dt.datetime(2026, 11, 5, tzinfo=tz),
+            "Asia/Shanghai",
+            allow_past=True,
+            not_before=dt.datetime(2026, 11, 5, tzinfo=tz),
+            not_after=dt.datetime(2026, 11, 12, tzinfo=tz),
+        )
+        self.assertIsNotNone(fixed)
+        assert fixed is not None
+        self.assertEqual(fixed.strftime("%Y-%m-%d"), "2026-11-05")
 
     def test_deadline_closed_without_plausible_year_keeps_raw(self) -> None:
+        tz = ZoneInfo("Asia/Shanghai")
         html = (
             "<html><body><table><tbody>"
             '<tr class="ant-table-row"><td><a class="detailLink" '
@@ -881,8 +913,18 @@ class ProjectApplicationTest(unittest.TestCase):
             html, source, "https://svc20.stcsm.sh.gov.cn/project"
         )
         self.assertEqual(len(entries), 1)
-        self.assertIsNone(entries[0]["deadline"])
+        # 原文必须保留；可解析结果由固定窗口锁定（抓取时刻推进后属已知取舍）。
         self.assertEqual(entries[0]["deadline_text"], "10月01日")
+        fixed = news_crawler.parse_deadline_after(
+            "10月01日",
+            None,
+            dt.datetime(2026, 11, 1, tzinfo=tz),
+            "Asia/Shanghai",
+            allow_past=True,
+            not_before=dt.datetime(2026, 11, 1, tzinfo=tz),
+            not_after=dt.datetime(2026, 11, 12, tzinfo=tz),
+        )
+        self.assertIsNone(fixed)
 
     def test_deadline_closed_feb_29_looks_back_four_years(self) -> None:
         tz = ZoneInfo("Asia/Shanghai")
