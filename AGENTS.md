@@ -316,7 +316,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 - `deadline_xpath` 解析的截止时间写 `deadline`/`deadline_raw`，不写 `publish_time`（项目行 `publish_time` 为空，按发布时间排序会排在末尾；`/v1/articles` 支持 `order=deadline_desc|deadline_asc` 与 `deadline_from`/`deadline_to`，`published_from`/`published_to` 会排除项目行）；
 - `title` 与 `list_title` 都写列表标题，`title_source=list_title`（详情页 `<title>` 通常是站点名，不可信）；
 - `content_required` 默认 `false`：详情抓取失败、或正文短于 100 字（登录墙占位）时只保存列表字段并记 `ok`，下次运行按 `ok` 跳过；设为 `true` 则按新闻语义记 `no_content`/`error` 并重试；
-- 截止时间早于抓取窗口起点时记 `old`（用 `--force` 可强制重抓），避免每次重跑历年公告；已入库 `ok`/`old` 行会在后续运行中按列表刷新 `deadline`/`deadline_raw`/`project_status`，不抓详情；无年份截止时间按当前年份保留；
+- 截止时间早于抓取窗口起点时记 `old`（用 `--force` 可强制重抓），避免每次重跑历年公告；已入库 `ok`/`old` 行会在后续运行中按列表刷新 `title`/`list_title`/`deadline`/`deadline_raw`/`project_status`，不抓详情；原 `old` 行截止时间变为不可解析（如“常年受理”）时恢复 `ok`，`content_required=true` 时继续抓正文；同一 URL 从新闻切项目会清空 `publish_time*` 但保留 `content`/`raw_content`/`author`/`images`；无年份截止时间按列表发布日期（缺失时当前时间）取最近合法年份；
 - 项目模式无需配置 `date_xpath`；`parse_list_items` 在未配置 `date_xpath` 时保持 `parsed=None`，不会把截止时间当发布时间。
 
 ```json
@@ -430,7 +430,7 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 - `timezone` 随文章落库，读取时优先使用该列，旧行（NULL）才回落到当前配置推断；`publish_time_utc` 存真实时刻（UTC），`published_from`/`published_to` 按它过滤以消除混时区偏差，`publish_time_utc` 为 NULL/空串的历史行回退旧的 `publish_time` 墙钟比较；列表排序仍按 `publish_time` 墙钟；
 - 详情页日期晚于当前时间超过 1 天时视为不可信（不再自动减一年），回退列表日期；列表日期也缺失时记 `unknown_date`；`date_skew_days` 范围为 0–365；GNE 文本扫描可能只抽到“09月30日”这类无年份日期：主抓取路径优先用列表日期的年份补齐，列表日期也缺失时记 `unknown_date`；API 单 URL extract 无列表日期可交叉校验时同样记 `unknown_date`，不按当前年猜测；
 - `old` 分支的 `publish_time_source` 取决于判定时机：列表阶段就确认超出窗口时记 `list`；详情抓取后才发现超出窗口时保留详情来源（`xpath`/`labeled_text`/`meta`/`text`）。`publish_time_raw` 与当前 `publish_time` 同步：回退到列表日期时清空，不再保留旧详情原文；`unknown_date` 本次没有可信发布时间，新插入行会保留本次抽取文本便于排查，已有行则保留旧值与旧时间配对；新行的 `publish_time_source` 为空字符串，已有行保留旧来源，避免旧时间挂新来源；
-- 项目申报行（`listing_type=project_application`）的 `title`/`list_title` 都写列表标题、`title_source=list_title`，`publish_time` 为空（截止时间在 `deadline` 列），因此按 `published_desc` 排序会排在末尾、且会被 `published_from`/`published_to` 排除；查询项目公告请用 `order=deadline_desc|deadline_asc` 与 `deadline_from`/`deadline_to`。`content_required=false` 时详情抓不到正文也记 `ok`，不会反复重试；
+- 项目申报行（`listing_type=project_application`）的 `title`/`list_title` 都写列表标题、`title_source=list_title`，`publish_time` 为空（截止时间在 `deadline` 列），因此按 `published_desc` 排序会排在末尾、且会被 `published_from`/`published_to` 排除；查询项目公告请用 `order=deadline_desc|deadline_asc` 与 `deadline_from`/`deadline_to`。`content_required=false` 时详情抓不到正文也记 `ok`，不会反复重试；同一 URL 从新闻模式切到项目模式时只清空 `publish_time*`，`content`/`raw_content`/`author`/`images` 保留（可能残留旧新闻正文，检索侧请以 `deadline` 识别项目行）；
 - `article_id` 由 `sha256(source + \x1f + url)` 派生，不随数据库重建变化，可安全作为下游引用；
 - SQLite 启用 WAL 与 `busy_timeout=30000`（`DB_BUSY_TIMEOUT_MS`，与连接 timeout 一致，不用 5s 覆盖 30s 连接超时），API 作业默认单 worker 写入；只读查询使用 `file:...?mode=ro` URI（路径会转义），WAL 库仍要求目录可写（需要 -shm/-wal）。
 
@@ -591,7 +591,7 @@ curl http://localhost:8000/v1/health
 | `regression/test_publish_source.py` | 2 个用例：GNE 内部来源映射到落库值、视频页 meta 来源标记 |
 | `regression/test_process_entry_dates.py` | 17 个用例：未来/超 skew 详情日期回退列表、跨 UTC 日期边界、无年份按列表年补齐、跨年无年份日期取上一年并保留时刻、跨年正方向（列表年末+详情次年）保留时刻、未来无年份日期按列表年补齐、无列表日期记 unknown_date、title_source 归一、skew 钳制、unknown_date 不覆盖旧来源 |
 | `regression/test_extract_job_dates.py` | 7 个用例：API extract 作业超 skew 回退库内列表日期、无年份兜底、跨年无年份取上一年、跨年正方向保留时刻、详情不可解析兜底、无列表日期记 unknown_date |
-| `regression/test_project_application.py` | 21 个用例：`listing_type` 默认值/非法值回退、`deadline_xpath`/`project_status_xpath` 解析且不把截止时间当发布时间、详情缺失或登录墙短正文仍存列表字段（标题取列表标题、`title_source=list_title`）、`content_required=true` 走 `no_content`、截止时间早于窗口记 `old`、v7→v8 迁移补三列、deadline 不回退发布时间、不可解析截止时间保留原文、项目 `old` 行二次运行 skip、`--force` 仍抓详情、长正文成功入库、`content_required` 字符串值归一、deadline 过滤与排序、已入库 `ok`/`old` 行刷新列表字段（延期/截止/不可解析清空）且不抓详情、无年份未来截止保留当年、deadline 边界按站点墙钟 |
+| `regression/test_project_application.py` | 28 个用例：`listing_type` 默认值/非法值回退、`deadline_xpath`/`project_status_xpath` 解析且不把截止时间当发布时间、详情缺失或登录墙短正文仍存列表字段（标题取列表标题、`title_source=list_title`）、`content_required=true` 走 `no_content`、截止时间早于窗口记 `old`、v7→v8 迁移补三列、deadline 不回退发布时间、不可解析截止时间保留原文、项目 `old` 行二次运行 skip、`--force` 仍抓详情、长正文成功入库、`content_required` 字符串值归一、deadline 过滤与排序、已入库 `ok`/`old` 行刷新列表字段（`title`/`list_title`/延期/截止/不可解析清空）且不抓详情、`old` 恢复 `ok` 且 `content_required=true` 时继续抓正文、新闻切项目清空 `publish_time*`、无年份未来截止保留当年、无年份 `deadline_format` 按基准年补齐、闰日隔两年取最近合法年、deadline 边界按站点墙钟 |
 | `regression/test_pagination.py` | 40 个用例：模板分页按截止日期停止、模板生成后续页、max_pages 含首页语义、last_url_xpath 多候选取最大页码、跟随 onclick/忽略 # 锚点、渲染后 DOM 找下一页、未知日期不触发 cutoff、已入库页连续早停、旧 list_urls 行为、非法 mode 回退、固定列表忽略 max_pages/分页配置/cutoff、固定页抓取失败不误报、固定列表全空报 empty、置顶旧文不提前停、next XPath 无 href 文本忽略、next XPath 属性 onclick 解析（含 JavaScript: 前缀）、模板缺 {page} 回退、collect_list_entries 包装、分页 URL SSRF 校验（可信内网主机/可信主机 DNS 解析出的内网 IP/公网 IP/未信任私网拒绝）、连接层 IP 字面量保留 scheme+port（`_PinnedHTTPConnection`/`_PinnedHTTPSConnection` 的 `connect` 真实路径）、可信端点 DNS 失败冷却后重试、列表抓取确实收到 validator |
 
 运行方式：`python -X utf8 -m unittest discover -s regression -t . -p "test_*.py" -v`（约 15 秒，无需网络）。
@@ -709,7 +709,9 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 - `parse_datetime(value, fmt=None, timezone_name="Asia/Shanghai", *, allow_year_adjust: bool = True, reference_year: int | None = None, allow_future: bool = False) -> dt.datetime | None`：解析中文/数字/相对/ISO 日期；`reference_year` 用于无年份月日按指定年份补齐，避免当前年构造出未来日期；`allow_future=True` 保留晚于当前时间的显式年份（截止时间用），不再回退上一年；
 - `collect_list_entries_detailed(source, *, cutoff: dt.datetime | None = None, known_urls: set[str] | None = None) -> dict[str, Any]`：抓取列表页并返回 `items/pages/page_urls/stop_reason`，支持 `pagination` 的 template/next/auto 模式；`collect_list_entries` 保留只返回条目的旧签名；
 - `_process_project_entry(conn, source, entry, cutoff, force, delay=0.0) -> str`：项目申报条目入库入口，返回 `ok/old/skip/no_content/error`；`entry` 需含 `title/url/deadline_text/deadline/project_status`；
-- `save_article(..., deadline: str = "", deadline_raw: str = "", project_status: str = "", ...) -> str`：新增三个项目申报字段，UPSERT 按空值保留旧值；
+- `save_article(..., deadline: str = "", deadline_raw: str = "", project_status: str = "", ...) -> str`：新增三个项目申报字段，UPSERT 按空值保留旧值；**deadline 例外**：`deadline_raw` 非空而 `deadline` 为空（本次原文不可解析）时会清空旧 `deadline`，与原文保持一致；
+- `parse_deadline_after(raw: str, fmt: str | None, reference: dt.datetime, timezone_name: str = "Asia/Shanghai") -> dt.datetime | None`：解析截止时间；无年份文本取不早于 `reference`（列表发布日期或当前时间）的最近年份，跨年场景（2026-12 发布“1月15日截止”）解析为次年；有年份文本按 `allow_future=True` 保留；
+- `_refresh_project_listing(conn, source_name, url, title, deadline_text, deadline_dt, deadline_raw, project_status, cutoff, timezone_name, content_required) -> str | None`：刷新已入库项目行的列表字段（含 `title`/`list_title`）与状态，清空历史 `publish_time*`；返回 `skip`/`ok`/`old`，`retry` 表示已从 `old` 恢复 `ok` 但需继续抓正文（`content_required=true`）；`deadline_dt` 为已解析的截止时间（无则 None），用于避免重复解析；
 - `has_explicit_year(value: Any) -> bool`：日期文本是否自带年份（19xx/20xx 四位或 `18-03-08` 这类两位年份）；用于判断能否安全按当前年或列表日期年份补齐；
 - `is_yearless_month_day(value: Any) -> bool`：是否是需要按基准年份补齐的“月日”文本；排除“昨天/前天/N 分钟前/小时前/天前”等相对时间与自带年份的日期；
 - `parse_yearless_around(raw: str, reference: dt.datetime, timezone_name: str = "Asia/Shanghai") -> dt.datetime | None`：按基准日期的前一年、当年与下一年分别解析无年份月日，取离基准最近的合法结果（覆盖列表日期在 1 月初/年末两个方向的跨年场景；`parse_datetime(reference_year=当年)` 会因未来日期返回 None）；
