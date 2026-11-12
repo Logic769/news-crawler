@@ -25,7 +25,14 @@ import time
 from pathlib import Path
 
 from gne import GeneralNewsExtractor
-from news_crawler import DEFAULT_DB_FILE, SCHEMA_VERSION, init_db
+from news_crawler import (
+    DEFAULT_DB_FILE,
+    DEFAULT_SOURCES_FILE,
+    SCHEMA_VERSION,
+    init_db,
+    load_config,
+    resolve_config_path,
+)
 from url_extract import close_thread_browser, extract_article
 
 # 只有 ok / unknown_date 会写入 raw_content：old 分支刻意不写（见 process_entry），
@@ -125,6 +132,31 @@ def write_failed_list(path: Path, failures: list[Failure]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def load_source_xpaths(config_path: str) -> dict[str, str]:
+    """读取站点配置里的 article_body_xpath，返回 {站点名: body_xpath}。
+
+    回填走的是与主抓取相同的 url_extract.extract_article，不读站点配置就会
+    对「默认密度算法被页面其他长文本块带偏」的站点把诱饵正文写进 raw_content，
+    与同一行历史 content 不一致。配置缺失或损坏时返回空字典（按 GNE 默认抽取），
+    只提示一次，不阻断回填。
+    """
+    path = resolve_config_path(config_path)
+    try:
+        config = load_config(path)
+    except (OSError, ValueError) as exc:
+        print(f"未读取站点配置（{path}）：{exc}；回填将使用 GNE 默认抽取", file=sys.stderr)
+        return {}
+    result: dict[str, str] = {}
+    for item in config.get("sources") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        body_xpath = str(item.get("article_body_xpath") or "").strip()
+        if name and body_xpath:
+            result[name] = body_xpath
+    return result
+
+
 def backfill(
     conn: sqlite3.Connection,
     candidates: list[tuple[str, str]],
@@ -132,6 +164,7 @@ def backfill(
     delay: float,
     allow_browser: bool,
     dry_run: bool,
+    source_xpaths: dict[str, str] | None = None,
 ) -> tuple[int, int, int, list[Failure], int]:
     """逐条重抓并写回 raw_content。
 
@@ -142,6 +175,7 @@ def backfill(
     if dry_run or not candidates:
         return 0, 0, 0, [], 0
 
+    source_xpaths = source_xpaths or {}
     # 单线程串行复用同一实例是安全的（跨线程共享才会出 math domain error）。
     extractor = GeneralNewsExtractor()
     updated = 0
@@ -154,7 +188,12 @@ def backfill(
             if index and delay > 0:
                 time.sleep(delay)
             try:
-                result = extract_article(url, extractor, allow_browser=allow_browser)
+                result = extract_article(
+                    url,
+                    extractor,
+                    allow_browser=allow_browser,
+                    body_xpath=source_xpaths.get(source, ""),
+                )
                 raw_content = str((result or {}).get("content") or "").strip()
             except Exception as exc:  # 单条失败不能中止整批
                 failed += 1
@@ -198,6 +237,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="回填 articles.raw_content：重抓历史行，补齐保留段落换行的原始正文"
     )
     parser.add_argument("--db", default=DEFAULT_DB_FILE)
+    parser.add_argument(
+        "--config",
+        default=DEFAULT_SOURCES_FILE,
+        help="站点配置路径，用于读取 article_body_xpath（存在 sources.local.json 时优先）",
+    )
     parser.add_argument("--source", default="", help="只回填指定站点（source 字段）")
     parser.add_argument(
         "--limit", type=int, default=0, help="本次最多尝试多少条（跨站点全局计数，0 为不限制）"
@@ -288,12 +332,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"候选 {len(candidates)} 条（status in {statuses} 且 raw_content 为空）")
         if skip:
             print(f"已跳过清单中的 {len(skip)} 条")
+        source_xpaths = {} if args.dry_run else load_source_xpaths(args.config)
+        if source_xpaths:
+            names = "、".join(sorted(source_xpaths))
+            print(f"已读取 {len(source_xpaths)} 个站点的 article_body_xpath：{names}")
+        elif not args.dry_run:
+            # 常见于未挂载 sources.local.json、只读到镜像内空模板的情况：
+            # 不提示的话用户会以为容器 XPath 已生效，实际走的是 GNE 默认抽取。
+            print(
+                f"未在 {resolve_config_path(args.config)} 读到 article_body_xpath，"
+                "回填将使用 GNE 默认抽取"
+            )
         updated, failed, skipped, failures, write_failed = backfill(
             conn,
             candidates,
             delay=args.delay,
             allow_browser=args.allow_browser,
             dry_run=args.dry_run,
+            source_xpaths=source_xpaths,
         )
     finally:
         conn.close()

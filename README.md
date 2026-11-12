@@ -400,6 +400,7 @@ cp sources.json sources.local.json
 | `timezone` | 可选 | 站点时区，默认 `Asia/Shanghai` |
 | `article_title_xpath` | 可选 | 详情页标题 XPath。用于 `<title>` 写的是站点名、真标题在正文 `h1` 的站点。推荐直接写标题元素（如 `//h1[@class='article-title']`），会取其全部文本（含 `<em>` 等子元素）；写成 `//h1/text()` 只能取第一个直接文本节点，标题含子标签时会截断。以 `string(` 开头的表达式会被忽略 |
 | `article_publish_time_xpath` | 可选 | 详情页发布时间 XPath。用于正文里更早出现无关时间、页头日期才是真发布时间的站点；推荐写包含日期的元素（如 `//p[contains(@class,'article__subTitle')]/span[1]`）。以 `string(` 开头或非法表达式会被忽略 |
+| `article_body_xpath` | 可选 | 详情页正文容器 XPath，透传给 GNE 的 `body_xpath`。用于默认密度算法被页面其他长文本块带偏、或正文抽不出来的站点（例：`//div[@id='ivs_content']`）。**必须是元素节点表达式**：写成 `//div/@id`、`//div/text()` 这类属性/文本表达式，或表达式未命中、命中的容器没有文本时，都会记一条 WARNING 并回退整页 `//body`，不会中断抓取；命中多个节点时只用第一个并记 WARNING（建议写成唯一元素表达式）；以 `string(` 开头或非法表达式在加载配置时就被忽略。正文与配图仍会在该容器内按密度算法取最佳子块（容器内并列多个正文块时可能只取一段），收窄容器也会漏掉容器外的配图。视频页（`/shipin/`、`/video/` 等）走 meta 抽取，优先于本字段 |
 | `date_skew_days` | 可选 | 详情日期与列表日期允许相差的天数，默认 7，范围 0–365；超过时改用列表日期，避免正文里的未来时间或站内推荐日期污染发布时间 |
 | `listing_type` | 可选 | 列表类型：`news`（默认）或 `project_application`。项目申报模式把列表本身当作数据源，见下方“项目申报列表” |
 | `deadline_xpath` | 可选 | 项目申报：截止时间所在单元格 XPath（相对条目节点） |
