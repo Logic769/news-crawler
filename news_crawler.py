@@ -801,7 +801,7 @@ def resolve_config_path(path: str) -> str:
 
 
 def _validate_xpath_field(name: object, value: object, field_name: str) -> str:
-    """校验手写的 article_title_xpath / article_publish_time_xpath。
+    """校验手写的 article_title_xpath / article_publish_time_xpath / article_body_xpath。
 
     - `string(...)` 开头的表达式一律忽略（统一改用元素节点或 /text()）；
     - 非法 XPath 或 count()/boolean()/string-length() 等标量表达式会被忽略；
@@ -868,6 +868,10 @@ def load_config(path: str) -> dict:
         data = json.load(f)
     if isinstance(data, list):
         data = {"sources": data}
+    if not isinstance(data, dict):
+        # 手写配置顶层误写成字符串/数字时，后续 data.setdefault 会抛
+        # AttributeError（不是 OSError/ValueError），调用方捕获不到就崩栈。
+        raise ValueError(f"配置文件 {path} 顶层必须是对象或数组，实际是 {type(data).__name__}")
     data.setdefault("sources", [])
     data.setdefault("workers", 16)
     data.setdefault("days", 3)
@@ -877,7 +881,11 @@ def load_config(path: str) -> dict:
     for source in data.get("sources") or []:
         if not isinstance(source, dict):
             continue
-        for field_name in ("article_title_xpath", "article_publish_time_xpath"):
+        for field_name in (
+            "article_title_xpath",
+            "article_publish_time_xpath",
+            "article_body_xpath",
+        ):
             if field_name in source:
                 source[field_name] = _validate_xpath_field(
                     source.get("name"), source.get(field_name), field_name
@@ -1660,6 +1668,7 @@ def extract_article(
     already_rendered: bool = False,
     title_xpath: str = "",
     publish_time_xpath: str = "",
+    body_xpath: str = "",
 ) -> dict | None:
     """用已抓取的 HTML 抽取一篇文章（与 url_extract.extract_article 共用实现）。
 
@@ -1677,6 +1686,7 @@ def extract_article(
         already_rendered=already_rendered,
         title_xpath=title_xpath,
         publish_time_xpath=publish_time_xpath,
+        body_xpath=body_xpath,
     )
 
 
@@ -2046,6 +2056,7 @@ def _process_project_entry(
         already_rendered=already_rendered,
         title_xpath=source.get("article_title_xpath") or "",
         publish_time_xpath=source.get("article_publish_time_xpath") or "",
+        body_xpath=source.get("article_body_xpath") or "",
     )
     if result is None:
         if content_required:
@@ -2134,6 +2145,7 @@ def process_entry(
         already_rendered=already_rendered,
         title_xpath=source.get("article_title_xpath") or "",
         publish_time_xpath=source.get("article_publish_time_xpath") or "",
+        body_xpath=source.get("article_body_xpath") or "",
     )
     if result is None:
         save_article(

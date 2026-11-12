@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from html import unescape
@@ -47,6 +48,9 @@ PUNCTUATION = frozenset({
 })
 
 
+LOG = logging.getLogger(__name__)
+
+
 class ContentExtractor:
     """Extract the densest article body from a parsed HTML document."""
 
@@ -62,6 +66,52 @@ class ContentExtractor:
         self.node_info = {}
         self.element_text_cache = {}
 
+    @staticmethod
+    def _resolve_body(selector: HtmlElement, body_xpath: str) -> HtmlElement:
+        """按配置的 body_xpath 选正文容器，未命中或不是元素节点时回退整页 //body。
+
+        body_xpath 来自站点配置（手写 XPath），写错或写成属性/文本表达式
+        （如 //div/@id、//div/text()）时不能让它把整篇文章变成 error，
+        因此这里统一兜底：非元素结果与空结果都回退 //body，并留一条告警，
+        便于区分「配错」与「没配」。
+        """
+        fallback: list[HtmlElement] = selector.xpath("//body") or [selector]
+        try:
+            matched = selector.xpath(body_xpath)
+        except Exception as exc:  # 运行期 XPath 异常（如非法函数组合）
+            LOG.warning("body_xpath %r 执行失败（%s），回退整页 //body", body_xpath, exc)
+            return fallback[0]
+        node = matched[0] if matched else None
+        if node is None:
+            LOG.warning("body_xpath %r 未命中任何节点，回退整页 //body", body_xpath)
+            return fallback[0]
+        # 宽松表达式（如 //div[contains(@class,'content')]）在真实站点上常常
+        # 命中侧栏/导航等多个容器，只取第一个就会把侧栏当正文以 status=ok 入库。
+        # 语义保持不变（仍取第一个），但必须告警，否则事后无从发现。
+        if len(matched) > 1:
+            LOG.warning(
+                "body_xpath %r 命中 %d 个节点，只使用第一个；建议改写成唯一元素表达式",
+                body_xpath,
+                len(matched),
+            )
+        # 属性/文本节点（_ElementUnicodeResult）没有 getroottree/tag 语义，
+        # 后续密度算法会直接抛 AttributeError，这里提前拦下。
+        if not isinstance(node, HtmlElement):
+            LOG.warning(
+                "body_xpath %r 命中的不是元素节点（%s），请改写成元素表达式，已回退整页 //body",
+                body_xpath,
+                type(node).__name__,
+            )
+            return fallback[0]
+        # 命中的容器没有可见文本（改版后容器仍在但内容被挪走）时同样回退，
+        # 否则正文恒为空，整站会一直记 no_content。
+        if not (node.text_content() or "").strip():
+            LOG.warning(
+                "body_xpath %r 命中的容器没有文本内容，回退整页 //body", body_xpath
+            )
+            return fallback[0]
+        return node
+
     def extract(
         self,
         selector: HtmlElement,
@@ -75,8 +125,7 @@ class ContentExtractor:
         body_xpath = body_xpath or config.get("body", {}).get("xpath", "")
         use_visiable_info = use_visiable_info or config.get("use_visiable_info", False)
         if body_xpath:
-            body_list = selector.xpath(body_xpath)
-            body = body_list[0] if body_list else selector.xpath("//body")[0]
+            body = self._resolve_body(selector, body_xpath)
         else:
             article_body = selector.xpath('//*[@itemprop="articleBody"]')
             if article_body:

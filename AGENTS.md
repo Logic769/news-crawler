@@ -266,6 +266,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | `date_format` | 否 | 指定 `strptime` 格式 |
 | `article_title_xpath` | 否 | 详情页标题 XPath（`<title>` 是站点名、真标题在正文 h1 时使用）；推荐直接写标题元素（如 `//h1`），会取其全部文本（含 `<em>` 等子元素）；`/text()` 只取第一个直接文本节点，标题含子标签时会截断；以 `string(` 开头的表达式会被忽略 |
 | `article_publish_time_xpath` | 否 | 详情页发布时间 XPath；推荐直接写日期元素（如 `//p[contains(@class,'article__subTitle')]/span[1]`）；以 `string(` 开头或非法表达式会被忽略 |
+| `article_body_xpath` | 否 | 详情页正文容器 XPath，透传 GNE 的 `body_xpath`；必须是元素节点表达式，属性/文本表达式（`//div/@id`、`//div/text()`）、未命中、命中空容器都会记 WARNING 并回退整页 `//body`（见 `ContentExtractor._resolve_body`）；命中多个节点只取第一个并记 WARNING；以 `string(` 开头或非法表达式在加载配置时被忽略；正文与配图仍在该容器内按密度算法取最佳子块（并列多个正文块时可能只取一段），收窄容器会漏掉容器外的配图；视频页分支优先于本字段 |
 | `date_skew_days` | 否 | 详情日期与列表日期允许相差的天数，默认 7，范围 0–365；超过时改用列表日期 |
 | `listing_type` | 否 | `news`（默认）或 `project_application`。项目申报模式把列表页当作数据源，见下方“项目申报列表” |
 | `deadline_xpath` | 否 | 项目申报：截止时间单元格 XPath（相对条目节点），写 `deadline`/`deadline_raw`，不写 `publish_time` |
@@ -499,7 +500,8 @@ docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content
 
 - 抓取失败与「UPDATE 未命中」分开统计：后者通常是另一个进程已并发回填或行已被删除，计入「跳过」而不是「失败」；
 - 失败明细默认写入与 `--db` **同目录**的 `backfill_failed.txt`（TSV：source / url / error），容器内即 `/app/data/backfill_failed.txt`，随 `./data` 挂载保留；`--failed-list` 可改路径（不能指向数据库文件或目录，否则返回 2）。每次运行都会覆盖该文件，但会保留本次 `--skip-file` 清单中的条目（第三列写「上次失败，本次跳过」），避免把仍然有效的死链记录洗掉；清单为空且全部成功时只剩表头；
-- `--skip-file` 读取该清单并把对应 `(source, url)` 从候选中排除；清单不存在时报错退出（返回 2），避免拼错路径后静默失效。
+- `--skip-file` 读取该清单并把对应 `(source, url)` 从候选中排除；清单不存在时报错退出（返回 2），避免拼错路径后静默失效；
+- `--config` 指定站点配置路径（默认 `sources.json`，存在 `sources.local.json` 时由 `resolve_config_path` 优先取它）。回填会按站点名读取 `article_body_xpath` 并透传给 GNE，否则正文容器被页面长文本块带偏的站点会把诱饵写进 `raw_content`，与同一行的 `content` 不一致；`--dry-run` 不读配置；一个都没读到时打印提示（常见于未挂载 `sources.local.json`、只读到镜像内空模板）。
 
 脚本的 `--db` 默认值取自 `news_crawler.DEFAULT_DB_FILE`（相对路径 `news.db`），容器内必须显式传 `/app/data/news.db`，否则会指向 `/app/news.db`。
 
@@ -589,6 +591,7 @@ curl http://localhost:8000/v1/health
 | `regression/test_time_extractor.py` | 34 个用例：标签日期优先于正文、XPath 元素/字符串/多值、多日期按文本位置取最早、无效 ISO 候选跳过、脚本与页脚排除、兄弟/嵌套行内节点拼接、块级边界、表格单元格（`td`/`th`）标签日期与不跨 `<tr>`、停止词、dateUpdate 兜底、拆分年份重建 |
 | `regression/test_parse_datetime.py` | 16 个用例：中文/数字/相对日期、ISO 偏移、未来日期与年份调整、reference_year 指定年份、无年份日期按基准年补齐、跨年无年份日期取最近合法年份、闰日落非闰年返回 None |
 | `regression/test_publish_source.py` | 2 个用例：GNE 内部来源映射到落库值、视频页 meta 来源标记 |
+| `regression/test_body_xpath.py` | 21 个用例：默认密度算法被诱饵长文本带偏、指定 `article_body_xpath` 选中真正文、未命中时回退整页 `//body` 不抛异常、`extract_from_html` 透传与缺省空串、`load_config` 保留合法值、非法 `//div[` 与 `string(...)` 被忽略并告警、`process_entry` 与 API extract 作业转发、`news_crawler.extract_article` 直调转发、`url_extract.extract_article` 真实 GNE 端到端、浏览器回退第二次 extract 带 `body_xpath`、`_resolve_body` 对属性/文本表达式/未命中/空容器回退 `//body` 且告警、命中容器正常使用、`load_source_xpaths` 读配置与缺配置、`backfill` 转发 `body_xpath` |
 | `regression/test_process_entry_dates.py` | 17 个用例：未来/超 skew 详情日期回退列表、跨 UTC 日期边界、无年份按列表年补齐、跨年无年份日期取上一年并保留时刻、跨年正方向（列表年末+详情次年）保留时刻、未来无年份日期按列表年补齐、无列表日期记 unknown_date、title_source 归一、skew 钳制、unknown_date 不覆盖旧来源 |
 | `regression/test_extract_job_dates.py` | 7 个用例：API extract 作业超 skew 回退库内列表日期、无年份兜底、跨年无年份取上一年、跨年正方向保留时刻、详情不可解析兜底、无列表日期记 unknown_date |
 | `regression/test_project_application.py` | 39 个用例：`listing_type` 默认值/非法值回退、`deadline_xpath`/`project_status_xpath` 解析且不把截止时间当发布时间、详情缺失或登录墙短正文仍存列表字段（标题取列表标题、`title_source=list_title`）、`content_required=true` 走 `no_content`、截止时间早于窗口记 `old`、v7→v8 迁移补三列、deadline 不回退发布时间、不可解析截止时间保留原文、项目 `old` 行二次运行 skip、`--force` 仍抓详情、长正文成功入库、`content_required` 字符串值归一、deadline 过滤与排序、已入库 `ok`/`old` 行刷新列表字段（`title`/`list_title`/延期/截止/不可解析清空）且不抓详情、`old` 恢复 `ok` 且 `content_required=true` 时继续抓正文、新闻切项目清空 `publish_time*`、无年份未来截止保留当年、无年份 `deadline_format` 按基准年补齐、闰日隔两年取最近合法年、deadline 边界按站点墙钟、无分隔符 `deadline_format`（`%m%d`）按基准年补齐、已截止状态把无年份截止约束到过去、`content_required` 由 false 改 true 后 `ok` 行按正文缺失重抓、已截止状态下闰日回看四年、旧新闻行刷新时补写 `title_source=list_title`、已截止状态文本含内部空白（半角/全角空格、NBSP）时仍按过去方向解析、已截止时截止时间须落在列表发布日期与抓取时刻之间（区间无候选保留原文）、公告发布当天截止仍能解析、候选年份覆盖抓取时刻上界（发布日期距抓取超过三年） |
@@ -702,7 +705,9 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 - `fetch_html_with_browser(url) -> str | None`：失败返回 `None`；
 - `content_needs_render(content: str) -> bool`：True 表示需要浏览器渲染（空、短于 100 字、或含加载占位词）；
 - `content_is_too_short(content: str) -> bool`：True 表示正文短于 `MIN_CONTENT_LENGTH`（100 字）；
-- `extract_article(url, extractor, *, allow_browser: bool = True, url_validator=None, title_xpath: str = "", publish_time_xpath: str = "") -> dict | None`：单 URL 完整流程；`allow_browser=False` 时禁用浏览器渲染回退（API 的 extract 默认如此）；`title_xpath`/`publish_time_xpath` 透传给 GNE 抽取（crawler 与 API extract 作业共用）；
+- `ContentExtractor._resolve_body(selector: HtmlElement, body_xpath: str) -> HtmlElement`：按 `body_xpath` 选正文容器；属性/文本表达式（`//div/@id`、`//div/text()`）、XPath 执行异常、未命中、命中空容器都记 WARNING 并回退整页 `//body`，避免配置写错时整站每篇都记 `error`；
+- `load_source_xpaths(config_path: str) -> dict[str, str]`（`backfill_raw_content.py`）：读站点配置的 `article_body_xpath`，返回 `{站点名: xpath}`；配置缺失/损坏返回空字典（按 GNE 默认抽取），由 `backfill(..., source_xpaths=...)` 逐条透传；
+- `extract_article(url, extractor, *, allow_browser: bool = True, url_validator=None, title_xpath: str = "", publish_time_xpath: str = "", body_xpath: str = "") -> dict | None`：单 URL 完整流程；`allow_browser=False` 时禁用浏览器渲染回退（API 的 extract 默认如此）；`title_xpath`/`publish_time_xpath`/`body_xpath` 透传给 GNE 抽取（crawler 与 API extract 作业共用）；`body_xpath` 未命中时 GNE 回退整页 `//body`；
 - `TitleExtractor.extract_with_source(element, title_xpath: str = "") -> tuple[str, str]`：返回 `(title, title_source)`，`title_source` 为 `article_title_xpath`（配置的 XPath 实际命中）或 `gne_default`；
 - `TimeExtractor.extract_with_source(element, publish_time_xpath: str = "") -> tuple[str, str]`：返回 `(publish_time, source)`，`source` 为 `xpath`/`labeled_text`/`meta`/`json_ld`/`time_tag`/`text` 等内部来源；
 - `publish_source_for(raw: str) -> str`：把 GNE 内部来源映射为落库值 `xpath`/`labeled_text`/`meta`/`text`/`video_meta`/`detail`/`list`，未知值记 `detail`；

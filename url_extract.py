@@ -876,6 +876,7 @@ def extract_from_html(
     already_rendered: bool = False,
     title_xpath: str = "",
     publish_time_xpath: str = "",
+    body_xpath: str = "",
 ) -> dict | None:
     """Extract one article already-fetched HTML (shared by CLI and crawler).
 
@@ -894,6 +895,7 @@ def extract_from_html(
             html,
             title_xpath=title_xpath,
             publish_time_xpath=publish_time_xpath,
+            body_xpath=body_xpath,
         )
     except NoContentException:
         result = None
@@ -925,6 +927,7 @@ def extract_from_html(
                     html,
                     title_xpath=title_xpath,
                     publish_time_xpath=publish_time_xpath,
+                    body_xpath=body_xpath,
                 )
             except NoContentException:
                 result = None
@@ -950,6 +953,7 @@ def extract_article(
     url_validator: Callable[[str], None] | None = None,
     title_xpath: str = "",
     publish_time_xpath: str = "",
+    body_xpath: str = "",
 ) -> dict | None:
     """抓取单个 URL 并抽取正文；必要时回退浏览器，失败或正文为空时返回 None。"""
     LOG.info("正在抓取: %s", url)
@@ -989,6 +993,7 @@ def extract_article(
         already_rendered=already_rendered,
         title_xpath=title_xpath,
         publish_time_xpath=publish_time_xpath,
+        body_xpath=body_xpath,
     )
 
 
