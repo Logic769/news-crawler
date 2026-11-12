@@ -974,6 +974,46 @@ class ProjectApplicationTest(unittest.TestCase):
         assert parsed is not None
         self.assertEqual(parsed.strftime("%Y-%m-%d"), "2024-02-29")
 
+    def test_deadline_closed_candidates_cover_window_upper_bound(self) -> None:
+        tz = ZoneInfo("Asia/Shanghai")
+        # 发布日期距抓取时刻超过三年时，候选年份必须覆盖窗口上界；
+        # 只回看 reference.year + 3 会误取 2024-10-01。
+        parsed = news_crawler.parse_deadline_after(
+            "10月01日",
+            None,
+            dt.datetime(2021, 12, 20, tzinfo=tz),
+            "Asia/Shanghai",
+            allow_past=True,
+            not_before=dt.datetime(2021, 12, 20, tzinfo=tz),
+            not_after=dt.datetime(2026, 11, 12, tzinfo=tz),
+        )
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.strftime("%Y-%m-%d"), "2026-10-01")
+        now = dt.datetime.now(tz)
+        list_date = (now - dt.timedelta(days=365 * 5)).date()
+        html = (
+            "<html><body><table><tbody>"
+            '<tr class="ant-table-row"><td><a class="detailLink" '
+            'href="/project/detail/closed-long-window">2022年度项目申报指南</a></td>'
+            f"<td>10月01日</td><td>已截止</td><td>{list_date.isoformat()}</td></tr>"
+            "</tbody></table></body></html>"
+        )
+        source = _source(date_xpath="./td[4]", date_format="%Y-%m-%d")
+        entries = news_crawler.parse_list_items(
+            html, source, "https://svc20.stcsm.sh.gov.cn/project"
+        )
+        self.assertEqual(len(entries), 1)
+        deadline = entries[0]["deadline"]
+        self.assertIsNotNone(deadline)
+        assert deadline is not None
+        # 端到端窗口上界是抓取时刻，只断言不变量，精确值由上面的固定窗口锁定。
+        # 列表日期取五年前：旧实现候选年只到 reference+3（约两年前），会被下面这条拦下。
+        self.assertEqual((deadline.month, deadline.day), (10, 1))
+        self.assertGreaterEqual(deadline.date(), list_date)
+        self.assertLessEqual(deadline.date(), now.date())
+        self.assertGreaterEqual(deadline.year, now.year - 1)
+
     def test_refresh_updates_title_without_fetching_detail(self) -> None:
         conn, tmp = _new_conn()
         try:

@@ -529,15 +529,28 @@ def parse_deadline_after(
         if reference.tzinfo is None
         else reference.astimezone(tz)
     )
+    def _local(value: dt.datetime) -> dt.datetime:
+        return value.replace(tzinfo=tz) if value.tzinfo is None else value.astimezone(tz)
+
+    lower = _local(not_before).date() if (allow_past and not_before is not None) else None
+    upper = (
+        _local(not_after).date()
+        if (allow_past and not_after is not None)
+        else local_reference.date()
+    )
     candidates: list[dt.datetime] = []
     # 闰日（2 月 29 日）可能隔两年才出现，多试到第三个后续年份；
     # allow_past 还要回看四年，否则“已截止 + 2月29日”在非闰年附近会解析失败。
+    # 已截止且给了 not_before/not_after 时，候选年份必须覆盖整个可信区间
+    # （发布日期可能距抓取时刻超过三年），否则选不到区间上界附近的年份。
     if allow_past:
-        years = tuple(
-            local_reference.year + offset for offset in (-4, -3, -2, -1, 0, 1, 2, 3)
+        first_year = min(
+            local_reference.year - 4, lower.year if lower is not None else local_reference.year
         )
+        last_year = max(local_reference.year + 3, upper.year)
+        years = range(first_year, last_year + 1)
     else:
-        years = tuple(local_reference.year + offset for offset in (0, 1, 2, 3))
+        years = range(local_reference.year, local_reference.year + 4)
     for year in years:
         parsed = parse_datetime(
             text,
@@ -549,13 +562,9 @@ def parse_deadline_after(
         )
         if parsed is not None:
             candidates.append(parsed)
-    def _local(value: dt.datetime) -> dt.datetime:
-        return value.replace(tzinfo=tz) if value.tzinfo is None else value.astimezone(tz)
 
     if allow_past:
         if not_before is not None or not_after is not None:
-            lower = _local(not_before).date() if not_before is not None else None
-            upper = _local(not_after).date() if not_after is not None else local_reference.date()
             windowed = [
                 candidate
                 for candidate in candidates
