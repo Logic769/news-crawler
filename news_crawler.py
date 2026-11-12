@@ -1079,9 +1079,12 @@ def parse_list_items(html: str, source: dict, base_url: str) -> list[dict]:
         elif date_xpath:
             date_text = xpath_text(node, date_xpath)
             parsed = parse_datetime(date_text, date_format, tz_name)
-            if parsed is None:
+            if parsed is None and not is_project:
                 # Some sites put the publish date in the article URL instead,
                 # for example https://.../2026/09/05/article.shtml
+                # 项目行不认 URL 日期：date_xpath 取到“待定”时回退 URL 会把
+                # 链接里的 /2025/11/01/ 当成列表发布日期写进 publish_time，
+                # 并在后续刷新中覆盖已有的有效列表日期。
                 parsed = parse_datetime(url, None, tz_name)
         else:
             # 未配置 date_xpath 时，URL 中的日期比整节点文本更权威；
@@ -1927,8 +1930,8 @@ def _refresh_project_listing(
     row = conn.execute(
         "SELECT status, title, deadline, deadline_raw, project_status, "
         "publish_time, publish_time_utc, content_length, title_source, "
-        "publish_time_source, publish_time_raw, list_publish_time FROM articles "
-        "WHERE source = ? AND url = ?",
+        "publish_time_source, publish_time_raw, list_publish_time, timezone "
+        "FROM articles WHERE source = ? AND url = ?",
         (source_name, url),
     ).fetchone()
     if row is None or row[0] not in ("ok", "old"):
@@ -1949,6 +1952,10 @@ def _refresh_project_listing(
     old_publish_source = str(row[9] or "")
     old_publish_raw = str(row[10] or "")
     old_list_publish = str(row[11] or "")
+    # 行内记录的时区是旧墙钟的解释口径：站点 timezone 配置被修正后，沿用旧
+    # 墙钟时必须按它换算 UTC，否则同一串墙钟会被当成新时区的本地时间（差 8
+    # 小时以上），API 展示与 published_from/published_to 过滤都会错位。
+    old_timezone = str(row[12] or "")
     # content_required 从 false 改成 true 后，之前以“列表字段完整”入库的 ok 行
     # 正文仍为空；必须按正文要求重新抓详情，不能因为列表字段没变就 skip。
     content_missing = content_required and old_content_length < MIN_CONTENT_LENGTH
@@ -1983,7 +1990,32 @@ def _refresh_project_listing(
         new_publish_source = ""
         new_publish_raw = ""
         new_list_publish = ""
-    new_publish_utc = publish_time_to_utc(new_publish, timezone_name) or ""
+    # 接受本次列表日期时按站点当前时区换算，并把它同步写入行内 timezone，
+    # 让墙钟与 UTC 换算口径始终自洽；沿用旧墙钟时用行内记录的时区，配置改过
+    # 也不会把旧墙钟按新时区重算。
+    # 行内 timezone 为空表示写入时的口径未知（v6 之前的历史行迁移不会回填）：
+    # 已有 publish_time_utc 就原样沿用，没有才按站点配置换算，且都不把这个猜测
+    # 回写进行内——否则「未知」会被固化成一个确定的时区，之后每轮都 skip，
+    # 换算错误再也无法纠正（站点 timezone 配置被修正过的历史行就是这条路径）。
+    tz_guessed = False
+    if publish_text:
+        new_publish_utc = publish_time_to_utc(new_publish, timezone_name) or ""
+        new_timezone = timezone_name
+    elif new_publish:
+        if old_timezone:
+            new_publish_utc = publish_time_to_utc(new_publish, old_timezone) or ""
+            new_timezone = old_timezone
+        elif old_publish_utc:
+            new_publish_utc = old_publish_utc
+            new_timezone = ""
+        else:
+            new_publish_utc = publish_time_to_utc(new_publish, timezone_name) or ""
+            new_timezone = ""
+            tz_guessed = True
+    else:
+        # 没有本地墙钟的行不必补一个时区，否则排查时会误以为它带可信发布时间。
+        new_publish_utc = ""
+        new_timezone = old_timezone
     # 本次没有给出截止原文时保留旧解析值；给出了就与原文同步，解析失败
     # 意味着旧截止时间已经失效，必须清空而不是继续沿用。
     new_deadline = deadline_text if deadline_raw else old_deadline
@@ -2024,6 +2056,10 @@ def _refresh_project_listing(
         # 值相同但来源/原文不同的历史新闻行（publish_time_source=xpath）也要刷新，
         # 否则项目行永远带着新闻模式的来源标记，无法自愈成 list。
         unchanged = False
+    if new_timezone != old_timezone:
+        # 接受本次列表日期时补写行内 timezone，让墙钟与 UTC 的换算依据可自证；
+        # 沿用旧墙钟且行内时区缺失时 new_timezone 保持空，不把猜测写库。
+        unchanged = False
     if unchanged:
         if new_status == "ok" and content_missing:
             return "retry"
@@ -2039,6 +2075,17 @@ def _refresh_project_listing(
             new_publish,
             new_publish_source or "空",
         )
+    if tz_guessed:
+        # 行内时区缺失属于历史数据（v6 之前入库），只能按站点当前配置猜一次
+        # UTC；不写回 timezone，站点配置日后被修正时还能靠 --force 重算。
+        LOG.warning(
+            "站点 %r 的项目行 %s 沿用旧发布时间 %r 但缺少行内时区，"
+            "按站点当前时区 %r 换算 publish_time_utc",
+            source_name,
+            url,
+            new_publish,
+            timezone_name,
+        )
     # publish_time 在这里按 source 一起写：只有配置了 date_xpath 的站点才有值，
     # 其余站点写空串，与「项目行不伪装发布时间」的语义保持一致。
     utc_value = new_publish_utc or None
@@ -2046,7 +2093,8 @@ def _refresh_project_listing(
         "UPDATE articles SET title = ?, list_title = ?, deadline = ?, deadline_raw = ?, "
         "project_status = ?, status = ?, publish_time = ?, publish_time_utc = ?, "
         "publish_time_source = ?, publish_time_raw = ?, list_publish_time = ?, "
-        "title_source = 'list_title', updated_at = ? WHERE source = ? AND url = ?",
+        "timezone = ?, title_source = 'list_title', updated_at = ? "
+        "WHERE source = ? AND url = ?",
         (
             new_title,
             new_title,
@@ -2059,6 +2107,8 @@ def _refresh_project_listing(
             new_publish_source,
             new_publish_raw,
             new_list_publish,
+            # 空串写成 NULL：行内时区缺失保持「口径未知」，不要留一个空串值。
+            new_timezone or None,
             now_iso(),
             source_name,
             url,
