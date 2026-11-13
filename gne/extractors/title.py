@@ -23,6 +23,11 @@ from ..text import get_longest_common_sub_string
 LOG = logging.getLogger(__name__)
 
 
+def _normalized_style(node: HtmlElement) -> str:
+    """把内联 style 归一成无空白的小写串，便于子串判断。"""
+    return re.sub(r"\s+", "", node.get("style") or "").lower()
+
+
 class TitleExtractor:
     """Extract a news title with the legacy fallback chain."""
 
@@ -123,26 +128,44 @@ class TitleExtractor:
         return any(text.endswith(hint) for hint in SITE_NAME_HINTS)
 
     @staticmethod
+    def _raw_title(element: HtmlElement) -> str:
+        """<title> 的原始文本，不按 TITLE_SPLIT_CHAR_PATTERN 切分。
+
+        站点名判断必须看完整 <title>：extract_by_title 会把「文章标题 - 站点名」
+        切成前半段，切完的片段既看不到分隔符、又更容易以站点类词汇结尾，于是
+        「关于启用申报平台 - 某某官网」会被误判成站点名，反过来用机构名 h1
+        覆盖掉本来正确的文章标题。
+        """
+        return " ".join("".join(element.xpath("//title/text()")).split())
+
+    @staticmethod
     def _is_hidden_heading(node: HtmlElement) -> bool:
         """h1 自身或任一祖先不可见时，不能当作页面标题。
 
-        门户/详情页最常见的隐藏写法是外面包一层 `<div style="display:none">`
+        门户/详情页最常见的隐藏写法是外面包一层 display:none 的容器
         （右侧栏、SEO 块、未激活的 Tab 面板），只查 h1 自身会漏掉这一整类。
         style 里的空白可能是制表符或换行，统一把所有空白字符剥掉再匹配。
-        CSS class 隐藏（如 `sr-only`）或外部样式表不在内联 style 里，无法判定，
-        属已知取舍。
-        `visibility:hidden` 查的是整条祖先链：CSS 允许子元素用 `visibility:visible`
-        恢复可见，这里仍按隐藏处理——方向是安全的（退化成不兜底、保留站点名，
-        不会取错标题），而 `display:none` 本来就无法由子元素恢复。
+
+        分两类处理：hidden 属性、aria-hidden="true"、display:none 都不能由后代
+        恢复，出现在 h1 自身或任一祖先上都判隐藏；visibility 会被后代覆盖
+        （祖先 visibility:hidden + h1 visibility:visible 时 h1 实际可见），
+        所以只看离 h1 最近的显式声明，声明成 hidden/collapse 才算隐藏。
+
+        按 class/外部样式表隐藏（如 sr-only）不在内联 style 里，无法判定，属已知取舍。
         """
         for current in (node, *node.iterancestors()):
             if current.get("hidden") is not None:
                 return True
             if (current.get("aria-hidden") or "").strip().lower() == "true":
                 return True
-            style = re.sub(r"\s+", "", current.get("style") or "").lower()
-            if "display:none" in style or "visibility:hidden" in style:
+            if "display:none" in _normalized_style(current):
                 return True
+        for current in (node, *node.iterancestors()):
+            match = re.search(
+                r"visibility:(visible|hidden|collapse)", _normalized_style(current)
+            )
+            if match:
+                return match.group(1) != "visible"
         return False
 
     def extract_by_sole_heading(self, element: HtmlElement) -> str:
@@ -194,8 +217,11 @@ class TitleExtractor:
         if not title:
             # <title> 只是站点名时（政务 CMS 常见），原来的回退链会把它当成
             # 文章标题。这类页面真标题往往就在唯一 h1 里，先试 h1 再退回 <title>。
+            # 站名判断必须用未切分的原始 <title>：extract_by_title 会按「- _ |」切成
+            # 前半段，「关于启用申报平台 - 某某官网」切完只剩「关于启用申报平台」，
+            # 既看不到分隔符又恰好以「平台」结尾，会被误判成站点名而丢掉正确标题。
             by_title = self.extract_by_title(element)
-            if by_title and self._looks_like_site_name(by_title):
+            if by_title and self._looks_like_site_name(self._raw_title(element)):
                 sole_heading = self.extract_by_sole_heading(element)
                 if sole_heading:
                     # 底层库不逐篇刷 INFO：批量抓取时每命中一篇就是一条。

@@ -6,7 +6,7 @@
 而 htag_and_title 因为最长公共子串不足 5 字被丢弃。
 
 修复只加一条窄路径：前三级都没命中、且 <title> 「像站点名」、且页面
-恰好只有一个「不像站点名」的 h1 时才覆盖。下面 19 个用例逐个守住这些守卫，
+恰好只有一个「不像站点名」的 h1 时才覆盖。下面 24 个用例逐个守住这些守卫，
 不能为了多修而放宽——tests/shanxi 的单 h1 含「网站」、tests/mingridapan 的
 单 h1 是 62 字含「 - 」的 SEO 串，两个上游样本都因此被挡在兜底之外。
 """
@@ -146,6 +146,54 @@ class SoleHeadingFallbackTest(unittest.TestCase):
         )
         title, _ = self.extractor.extract_with_source(fromstring(html), "")
         self.assertEqual(title, REAL_TITLE)
+
+    def test_visibility_visible_heading_counts_as_candidate(self) -> None:
+        # 祖先 visibility:hidden + h1 visibility:visible 的 h1 实际可见，必须计入
+        # 唯一性：若把它当隐藏，剩下的栏目标题就成了「唯一 h1」，会被错当成文章标题。
+        html = _page(
+            SITE_TITLE,
+            "<div style='visibility:hidden'><h1 style='visibility:visible'>"
+            f"{REAL_TITLE}</h1></div>"
+            "<h1>栏目导航与政策信息</h1>",
+        )
+        title, _ = self.extractor.extract_with_source(fromstring(html), "")
+        self.assertEqual(title, SITE_TITLE)
+
+    def test_visibility_visible_heading_is_not_treated_as_hidden(self) -> None:
+        # CSS 允许子元素用 visibility:visible 恢复可见，这种 h1 不能被排除。
+        html = _page(
+            SITE_TITLE,
+            "<div style='visibility:hidden'><h1 style='visibility:visible'>"
+            f"{REAL_TITLE}</h1></div>",
+        )
+        title, _ = self.extractor.extract_with_source(fromstring(html), "")
+        self.assertEqual(title, REAL_TITLE)
+
+    def test_visibility_hidden_without_override_keeps_site_name(self) -> None:
+        # 祖先 visibility:hidden、h1 没有显式声明时按继承算隐藏，不猜。
+        html = _page(
+            SITE_TITLE,
+            f"<div style='visibility:hidden'><h1>{REAL_TITLE}</h1></div>",
+        )
+        title, _ = self.extractor.extract_with_source(fromstring(html), "")
+        self.assertEqual(title, SITE_TITLE)
+
+    def test_display_none_ancestor_wins_over_visibility_visible(self) -> None:
+        # display:none 不能由后代恢复，h1 的 visibility:visible 救不回来。
+        html = _page(
+            SITE_TITLE,
+            f"<div style='display:none'><h1 style='visibility:visible'>{REAL_TITLE}</h1></div>",
+        )
+        title, _ = self.extractor.extract_with_source(fromstring(html), "")
+        self.assertEqual(title, SITE_TITLE)
+
+    def test_title_with_site_suffix_keeps_original_split_result(self) -> None:
+        # 站名判断必须用未切分的原始 <title>：切成前半段的「关于启用申报平台」
+        # 以「平台」结尾会被误判成站点名，反过来用机构名 h1 盖掉正确标题。
+        html = _page("关于启用申报平台 - 某某官网", "<h1>省级科学技术管理部门</h1>")
+        title, _ = self.extractor.extract_with_source(fromstring(html), "")
+        self.assertEqual(title, "关于启用申报平台")
+
 
     def test_heading_looking_like_site_name_keeps_site_name(self) -> None:
         # 与 tests/shanxi/1.html 同形：h1 是「山西省人民政府网站」。
