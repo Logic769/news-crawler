@@ -1915,9 +1915,21 @@ def _api_item_to_entry(
     # 由 urljoin(base_url, href) 补全，接口路径没有列表页可锚定，改用接口
     # 自身（或显式 base_url）作基准，否则详情抓取与入库 URL 都是不可访问
     # 的相对串。
-    url = raw_url if urlsplit(raw_url).scheme else urljoin(
-        settings["base_url"], raw_url
-    )
+    # 接口数据里的畸形链接（如 "https://[broken/p"）会让 urlsplit 抛
+    # ValueError：一条坏链接不该中断整次采集——之前页累积的 all_items 会跟着
+    # 一起丢掉，所以按条目跳过并告警。
+    try:
+        url = raw_url if urlsplit(raw_url).scheme else urljoin(
+            settings["base_url"], raw_url
+        )
+    except ValueError:
+        LOG.warning(
+            "站点 %r 的接口条目链接无法解析，已跳过：%r（%r）",
+            source.get("name"),
+            title,
+            raw_url,
+        )
+        return None
     date_text = clean_text(_dig(item, settings["date_field"]))
     parsed = parse_datetime(date_text, settings["date_format"], tz_name)
     if parsed is None:

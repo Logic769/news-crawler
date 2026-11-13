@@ -507,7 +507,7 @@ cp sources.json sources.local.json
 
 **不支持与项目申报模式组合**：`listing_type: project_application` 与 `api` 同时配置时，`load_config` 会记一条 WARNING。项目申报走的是列表字段路径，不读接口给的正文、也没有截止时间字段映射，结果是正文被丢弃、`deadline` 为空；需要这种数据源时请改用新闻模式，或等后续补上 `deadline_field` 映射。
 
-**GET 模式的页码**：只有 `method: POST` 会把 `page_param`/`page_size_param` 合并进请求体；`GET` 模式不拼查询串，页码只能靠 `url` 里的 `{page}` 占位符（例如 `https://example.com/api/list?page={page}&size=50`）。两者都没有时每页都会请求同一个 URL，靠跨页 URL 去重后第一页就因“没有新条目”停止，只会拿到首页数据。
+**GET 模式的页码**：只有 `method: POST` 会把 `page_param`/`page_size_param` 合并进请求体；`GET` 模式不拼查询串，页码只能靠 `url` 里的 `{page}` 占位符（例如 `https://example.com/api/list?page={page}&size=50`）。两者都没有时每页都会请求同一个 URL，靠跨页 URL 去重后第一页就因“没有新条目”停止，只会拿到首页数据。GET 模式同样不发送 `page_size`，但采集器仍用它判断末页（本页条数少于 `page_size` 即视为最后一页），所以 `page_size` 必须设成接口每页实际返回的条数，否则第一页就会被当成末页。
 
 **与列表页配置的关系**：`api` 与 `list_url`/`list_urls`/`pagination` 互斥，同时配置时以 `api` 为准并记一条 debug 日志。接口请求与 HTML 抓取共用同一套网络层（总时限、解压体积上限、`NEWS_INSECURE_SSL` 降级），响应编码按 `Content-Type` 的 charset → UTF-8 → GB18030 依次尝试（政务系统的 GBK 接口很常见，直接 UTF-8 硬解会让整批字段静默变乱码；声明的 charset 解不开而降级成功时记一条 INFO 日志，便于排查到底按哪个编码解的）。`headers` 只用于补正 `Referer`/`Cookie` 这类站点要求的头，它会覆盖默认 `User-Agent`，写错会直接导致接口拒绝。
 

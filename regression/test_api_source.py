@@ -348,6 +348,19 @@ class ApiCollectTest(unittest.TestCase):
         self.assertEqual(result["items"], [])
         self.assertTrue(any("缺少 id 字段" in line for line in logs.output))
 
+    def test_malformed_url_is_skipped_without_aborting_page(self) -> None:
+        source = _api_source()
+        broken = _item(1)
+        # urlsplit 对不匹配的 IPv6 方括号会抛 ValueError（Python 3.10+ 明确行为）：
+        # 一条坏链接不能中断整次采集，否则之前页累积的条目也会一起丢掉。
+        broken["originalURL"] = "https://[broken/p"
+        good = _item(2)
+        with self.assertLogs("news_crawler", level="WARNING") as logs:
+            result, _ = self._collect(source, [_page(broken, good)])
+
+        self.assertEqual([item["url"] for item in result["items"]], [good["originalURL"]])
+        self.assertTrue(any("链接无法解析" in line for line in logs.output))
+
 
 class ApiSettingsTest(unittest.TestCase):
     def test_defaults_and_overrides(self) -> None:
