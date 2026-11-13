@@ -1019,9 +1019,17 @@ def _api_settings(source: dict) -> dict[str, Any] | None:
             "站点 %r 的 api.items_path 为空：无法定位条目数组，该站点不会有数据",
             name,
         )
+    api_url = str(raw.get("url") or "").strip()
+    base_url = str(raw.get("base_url") or "").strip()
+    if not base_url:
+        # 接口返回的链接常是 "/p/1.html" 这类相对路径，没有列表页可锚定。
+        # 默认取接口自身的 scheme://host[:port]/ 作基准；与接口不同域时
+        # 由显式 base_url 覆盖。
+        base_url = _origin_prefix(api_url)
     return {
         _API_NORMALIZED_FLAG: True,
-        "url": str(raw.get("url") or "").strip(),
+        "url": api_url,
+        "base_url": base_url,
         "method": method,
         "payload": payload,
         "headers": headers,
@@ -1427,21 +1435,56 @@ def _url_origin(value: str) -> tuple[str, str, int] | None:
     return scheme, host, port
 
 
+def _origin_prefix(value: str) -> str:
+    """返回 URL 的 "scheme://host[:port]/"，用于补全接口返回的相对链接。"""
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return ""
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").strip("[]")
+    if scheme not in ("http", "https") or not host:
+        return ""
+    try:
+        port = parts.port
+    except ValueError:
+        return ""
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None and port != (443 if scheme == "https" else 80):
+        netloc = f"{netloc}:{port}"
+    return f"{scheme}://{netloc}/"
+
+
 _TRUSTED_ENDPOINT_RETRY_SECONDS = 60.0
 
 
 def _pagination_url_validator(source: dict) -> Callable[[str], None]:
-    """Build an SSRF guard for a site's list pages and browser subrequests.
-
-    配置里的 list_url/list_urls 是唯一可信目标，且必须 scheme + host + port
-    完全一致才允许内网地址。其他目标必须是公网地址，并且只允许 http 80 /
-    https 443。这样攻击者即使改下一页链接，也不能借爬虫访问配置主机的其他
-    端口；同端口无法按路径区分，配置主机本身视为可信。连接层解析出的可信
-    主机 IP 只在与该主机的配置端口组合时放行，不构成独立的 URL 白名单。
-    """
+    """Build an SSRF guard for a site's list pages and browser subrequests."""
     configured: list[Any] = list(source.get("list_urls") or [])
     if source.get("list_url"):
         configured.append(source["list_url"])
+    return _trusted_url_validator(configured)
+
+
+def _api_url_validator(settings: dict[str, Any]) -> Callable[[str], None]:
+    """接口型源的重定向目标校验，以配置的 api.url 为可信锚点。
+
+    接口型源没有 list_url，不能复用 _pagination_url_validator；但 api.url
+    同样是配置里写死的可信目标，用它承接受同一套策略：只有该 origin 允许
+    内网地址，其余目标必须是公网 http 80 / https 443。
+    """
+    return _trusted_url_validator([str(settings.get("url") or "")])
+
+
+def _trusted_url_validator(configured: list[Any]) -> Callable[[str], None]:
+    """Build an SSRF guard anchored on the given configured URLs.
+
+    配置里的 URL 是唯一可信目标，且必须 scheme + host + port 完全一致才允许
+    内网地址。其他目标必须是公网地址，并且只允许 http 80 / https 443。这样
+    攻击者即使改下一页链接（或让接口 302 到内网），也不能借爬虫访问未配置
+    主机的端口；同端口无法按路径区分，配置主机本身视为可信。连接层解析出
+    的可信主机 IP 只在与该主机的配置端口组合时放行，不构成独立的 URL 白名单。
+    """
     trusted_origins: set[tuple[str, str, int]] = set()
     trusted_ports: dict[str, set[int]] = {}
     for raw in configured:
@@ -1868,7 +1911,13 @@ def _api_item_to_entry(
             title,
         )
         return None
-    url = raw_url
+    # 接口常返回 "/p/1.html" 这类相对路径：HTML 路径在 parse_list_items 里
+    # 由 urljoin(base_url, href) 补全，接口路径没有列表页可锚定，改用接口
+    # 自身（或显式 base_url）作基准，否则详情抓取与入库 URL 都是不可访问
+    # 的相对串。
+    url = raw_url if urlsplit(raw_url).scheme else urljoin(
+        settings["base_url"], raw_url
+    )
     date_text = clean_text(_dig(item, settings["date_field"]))
     parsed = parse_datetime(date_text, settings["date_format"], tz_name)
     if parsed is None:
@@ -1916,6 +1965,7 @@ def _collect_api_entries(
     """
     from url_extract import fetch_json
 
+    api_validator = _api_url_validator(settings)
     tz_name = source.get("timezone") or "Asia/Shanghai"
     is_project = source.get("listing_type") == "project_application"
     delay = float(source.get("delay", 0) or 0)
@@ -1945,6 +1995,10 @@ def _collect_api_entries(
                 method=settings["method"],
                 payload=payload,
                 headers=settings["headers"],
+                # 接口型源没有 list_url 可锚定分页白名单，改以配置的 api.url
+                # 为可信目标：重定向到未配置主机一律按公网策略校验，避免
+                # 可信接口被篡改后把爬虫导向内网。
+                url_validator=api_validator,
             )
         except Exception as exc:
             LOG.warning("接口翻页失败（第 %d 页）：%s", page, exc)
@@ -1969,19 +2023,26 @@ def _collect_api_entries(
         if not raw_items:
             stop_reason = "empty"
             break
+        # page_items 保留本页全部有效条目（含与前面页重复的），早停判断要用
+        # 它的完整视图；fresh_items 才是跨页去重后真正新增的条目。
+        # 只拿去重结果判早停会漏抓：例如第 2 页是「重复的 A + 已入库的 B」，
+        # 去重后只剩 B，stop_after_known_pages=1 会误判整页已入库而停止，
+        # 后面的页再也走不到；整页日期都早于窗口的判断同样会被去重削弱。
         page_items: list[dict] = []
+        fresh_items: list[dict] = []
         for item in raw_items:
             entry = _api_item_to_entry(item, settings, source, tz_name)
             if entry is None:
                 continue
+            page_items.append(entry)
             if entry["url"] in seen_urls:
                 continue
             seen_urls.add(entry["url"])
-            page_items.append(entry)
-        if not page_items:
+            fresh_items.append(entry)
+        if not page_items or not fresh_items:
             stop_reason = "empty"
             break
-        all_items.extend(page_items)
+        all_items.extend(fresh_items)
 
         parsed_dates = [item["parsed"] for item in page_items if item.get("parsed")]
         # 与 HTML 分页同一口径：项目申报页的日期是公告发布日期，整页都在

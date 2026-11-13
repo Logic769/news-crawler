@@ -52,9 +52,13 @@ class ApiCollectTest(unittest.TestCase):
 
     def _collect(self, source: dict, pages: list[dict], **kwargs):
         calls: list[tuple[str, dict | None]] = []
+        self.validators: list = []
 
-        def fake_fetch(url, *, method="GET", payload=None, headers=None):
+        def fake_fetch(
+            url, *, method="GET", payload=None, headers=None, url_validator=None
+        ):
             calls.append((url, payload))
+            self.validators.append(url_validator)
             if len(calls) > len(pages):
                 raise AssertionError("请求页数超出预期")
             return pages[len(calls) - 1]
@@ -256,6 +260,83 @@ class ApiCollectTest(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "done")
         self.assertEqual(len(result["items"]), 3)
 
+    def test_relative_url_is_completed_with_api_origin(self) -> None:
+        # 接口常返回 "/p/1.html"：没有列表页可锚定，必须用 api.url 的
+        # origin 补全，否则入库与详情抓取都是不可访问的相对串。
+        source = _api_source(page_size=5)
+        item = _item(1)
+        item["originalURL"] = "/p/1.html"
+        result, _ = self._collect(source, [_page(item)])
+
+        self.assertEqual(result["items"][0]["url"], "https://example.com/p/1.html")
+
+    def test_explicit_base_url_overrides_api_origin(self) -> None:
+        # 接口与详情页不同域时由 base_url 覆盖，不能被 api.url 抢走。
+        source = _api_source(page_size=5, base_url="https://detail.example.org/news/")
+        item = _item(1)
+        item["originalURL"] = "p/1.html"
+        result, _ = self._collect(source, [_page(item)])
+
+        self.assertEqual(
+            result["items"][0]["url"], "https://detail.example.org/news/p/1.html"
+        )
+
+    def test_known_pages_uses_deduped_page_items(self) -> None:
+        # 第 2 页是「重复的 A + 已入库的 B」：去重后只剩已入库的 B，
+        # 若拿去重结果判早停会误判整页已入库而漏掉后面的页。
+        source = _api_source(page_size=2, max_pages=5, stop_after_known_pages=1)
+        pages = [
+            _page(_item(1), _item(9)),
+            _page(_item(1), _item(2)),
+            _page(_item(3)),
+        ]
+        known = {"https://example.com/p/2.html"}
+        result, calls = self._collect(source, pages, known_urls=known)
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(result["stop_reason"], "done")
+        self.assertEqual(
+            [entry["url"] for entry in result["items"]],
+            [
+                "https://example.com/p/1.html",
+                "https://example.com/p/9.html",
+                "https://example.com/p/2.html",
+                "https://example.com/p/3.html",
+            ],
+        )
+
+    def test_cutoff_uses_deduped_page_items(self) -> None:
+        # 第 2 页去重后只剩旧条目，但重复的那条本身是新的：
+        # 用去重结果判断会把整页误判成「都早于窗口」而提前停。
+        source = _api_source(page_size=2, max_pages=5)
+        pages = [
+            _page(_item(1, date="2026-11-10 12:00:00"), _item(9, date="2026-11-11 12:00:00")),
+            _page(_item(1, date="2026-11-10 12:00:00"), _item(2, date="2025-01-02 00:00:00")),
+            _page(_item(3, date="2026-11-12 12:00:00")),
+        ]
+        result, calls = self._collect(source, pages, cutoff=CUTOFF)
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(result["stop_reason"], "done")
+        self.assertEqual(len(result["items"]), 4)
+
+    def test_fetch_json_receives_api_anchored_validator(self) -> None:
+        # 接口型源没有 list_url，必须以 api.url 为锚点做重定向校验，
+        # 否则被篡改的接口 302 能把爬虫导向内网。
+        source = _api_source(page_size=5)
+        self._collect(source, [_page(_item(1))])
+
+        validator = self.validators[0]
+        self.assertTrue(callable(validator))
+        validator("https://example.com/api/list")  # 配置目标本身放行
+        with mock.patch.object(
+            news_crawler.socket,
+            "getaddrinfo",
+            side_effect=OSError("dns blocked in test"),
+        ):
+            with self.assertRaises(ValueError):
+                validator("http://127.0.0.1/admin")
+
     def test_url_template_without_item_id_is_skipped(self) -> None:
         source = _api_source(url_field="", url_template="https://example.com/detail/{id}")
         first = _item(1)
@@ -366,6 +447,105 @@ class ApiSettingsTest(unittest.TestCase):
         self.assertNotIn("color:red", text)
         # 单元格之间必须有分隔，否则会粘成「材料A材料B」。
         self.assertIn("材料A\n材料B", text)
+
+
+class ApiTransportTest(unittest.TestCase):
+    """fetch_json 的传输层：重定向校验与跨源凭据剥离。"""
+
+    def _redirect(self, req, newurl: str, seen: list[str]):
+        import url_extract
+
+        handler = url_extract._ValidatingRedirectHandler(seen.append)
+        return handler.redirect_request(req, None, 302, "Found", {}, newurl)
+
+    def test_redirect_strips_credentials_across_origins(self) -> None:
+        # api.headers 里常放 Cookie/Authorization：urllib 默认把它们原样
+        # 复制给重定向目标（只去掉 Content-Length/Content-Type），一个恶意
+        # 302 就能把接口凭据交给第三方。
+        import urllib.request
+
+        req = urllib.request.Request(
+            "https://api.example.com/list",
+            headers={
+                "Cookie": "session=1",
+                "Authorization": "Bearer token",
+                "X-Trace": "keep",
+            },
+            method="POST",
+            data=b"{}",
+        )
+        seen: list[str] = []
+        new_req = self._redirect(req, "https://evil.example.net/steal", seen)
+
+        assert new_req is not None
+        self.assertEqual(seen, ["https://evil.example.net/steal"])
+        merged = {k.lower() for k in list(new_req.headers) + list(new_req.unredirected_hdrs)}
+        self.assertNotIn("cookie", merged)
+        self.assertNotIn("authorization", merged)
+        self.assertIn("x-trace", merged)
+
+    def test_redirect_keeps_credentials_on_same_origin(self) -> None:
+        # 同源跳转（如 /list -> /list/v2）必须保留凭据，否则正常接口直接 401。
+        import urllib.request
+
+        req = urllib.request.Request(
+            "https://api.example.com/list",
+            headers={"Cookie": "session=1", "Authorization": "Bearer token"},
+            method="GET",
+        )
+        new_req = self._redirect(req, "https://api.example.com/v2/list", [])
+
+        assert new_req is not None
+        merged = {k.lower() for k in list(new_req.headers) + list(new_req.unredirected_hdrs)}
+        self.assertIn("cookie", merged)
+        self.assertIn("authorization", merged)
+
+    def test_redirect_rejects_target_before_following(self) -> None:
+        import urllib.request
+
+        req = urllib.request.Request("https://api.example.com/list", method="GET")
+
+        def reject(target: str) -> None:
+            raise ValueError(f"拒绝: {target}")
+
+        import url_extract
+
+        handler = url_extract._ValidatingRedirectHandler(reject)
+        with self.assertRaises(ValueError):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://127.0.0.1/")
+
+    def test_fetch_json_installs_pinned_handlers_with_validator(self) -> None:
+        # 只装 HTTPSHandler 时 build_opener 会补上默认的重定向处理器，
+        # 接口就能被 302 引到内网；传 validator 必须换成带钉扎的整套。
+        import url_extract
+
+        with mock.patch.object(url_extract.urllib.request, "build_opener") as opener:
+            opener.return_value.open.side_effect = OSError("boom")
+            with self.assertRaises(OSError):
+                url_extract.fetch_json(
+                    "https://example.com/api", url_validator=lambda url: None
+                )
+        handlers = [type(item).__name__ for item in opener.call_args.args]
+        self.assertEqual(
+            handlers,
+            [
+                "ProxyHandler",
+                "_ValidatingRedirectHandler",
+                "_PinnedHTTPSHandler",
+                "_PinnedHTTPHandler",
+            ],
+        )
+
+    def test_fetch_json_without_validator_keeps_default_handlers(self) -> None:
+        # 反向守护：直接调用（无 url_validator）不该被强行钉扎/禁代理。
+        import url_extract
+
+        with mock.patch.object(url_extract.urllib.request, "build_opener") as opener:
+            opener.return_value.open.side_effect = OSError("boom")
+            with self.assertRaises(OSError):
+                url_extract.fetch_json("https://example.com/api")
+        handlers = [type(item).__name__ for item in opener.call_args.args]
+        self.assertEqual(handlers, ["HTTPSHandler"])
 
 
 class ApiProcessEntryTest(unittest.TestCase):

@@ -106,8 +106,38 @@ def normalize_images_for_update(images, base_url: str) -> list[str] | None:
     return normalize_images(images, base_url) or None
 
 
+_SENSITIVE_REDIRECT_HEADERS = frozenset(
+    {"cookie", "authorization", "proxy-authorization"}
+)
+
+
+def _same_origin(left: str, right: str) -> bool:
+    """两个 URL 的 scheme + host + port 是否一致（用于判断能否带凭据跟转）。"""
+    origins: list[tuple[str, str, int]] = []
+    for value in (left, right):
+        try:
+            parts = urlsplit(value)
+        except ValueError:
+            return False
+        scheme = parts.scheme.lower()
+        host = (parts.hostname or "").lower().strip("[]")
+        try:
+            port = parts.port or (443 if scheme == "https" else 80)
+        except ValueError:
+            return False
+        if not host:
+            return False
+        origins.append((scheme, host, port))
+    return origins[0] == origins[1]
+
+
 class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Re-check every redirect target before urllib follows it."""
+    """Re-check every redirect target before urllib follows it.
+
+    跨 origin 的重定向还会剥掉 Cookie/Authorization：urllib 默认把原请求头
+    原样复制给新目标（只去掉 Content-Length/Content-Type），一个恶意 302
+    就能把接口凭据送到第三方。
+    """
 
     def __init__(self, validator: Callable[[str], None]) -> None:
         super().__init__()
@@ -115,7 +145,13 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
         self._validator(newurl)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is not None and not _same_origin(req.full_url, newurl):
+            for store in (new_req.headers, new_req.unredirected_hdrs):
+                for name in list(store):
+                    if name.lower() in _SENSITIVE_REDIRECT_HEADERS:
+                        del store[name]
+        return new_req
 
 
 def _ip_literal_url(ip: str, *, port: int | None = None, scheme: str = "https") -> str:
@@ -775,6 +811,7 @@ def fetch_json(
     method: str = "GET",
     payload: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
+    url_validator: Callable[[str], None] | None = None,
 ) -> Any:
     """按 JSON 协议请求一个接口，返回解析后的对象。
 
@@ -787,6 +824,10 @@ def fetch_json(
     加 Content-Type；两者独立，method="GET" 配 payload 会发出带 body 的 GET。
     响应必须是合法 JSON，解析失败抛 ValueError（调用方按抓取失败处理，
     不做静默重试）。
+
+    url_validator 与 fetch_html 同义：每个重定向目标先按 URL 策略校验，
+    连接时再按真实解析出的 IP 校验。不传时只装默认处理器（跟随任意
+    重定向），调用方若配置来自不可信来源必须传。
     """
     body_bytes = (
         json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -800,7 +841,18 @@ def fetch_json(
         request_headers.update(headers)
 
     def _fetch(context: ssl.SSLContext) -> tuple[bytes, str | None]:
-        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
+        handlers: list[urllib.request.BaseHandler] = []
+        if url_validator is not None:
+            # 与 fetch_html 的校验路径一致：先按 URL 策略校验，再在连接层按
+            # 真实解析出的 IP 校验（防 DNS rebinding）。接口型源没有 list_url
+            # 可锚定，调用方传入以 api.url 为锚点的策略。
+            handlers.append(urllib.request.ProxyHandler({}))
+            handlers.append(_ValidatingRedirectHandler(url_validator))
+            handlers.append(_PinnedHTTPSHandler(url_validator, context))
+            handlers.append(_PinnedHTTPHandler(url_validator))
+        else:
+            handlers.append(urllib.request.HTTPSHandler(context=context))
+        opener = urllib.request.build_opener(*handlers)
         req = urllib.request.Request(
             url, data=body_bytes, headers=request_headers, method=method.upper()
         )

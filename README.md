@@ -482,8 +482,9 @@ cp sources.json sources.local.json
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `url` | 必填 | 接口地址；含 `{page}` 时按页替换 |
-| `method` | `POST` | `GET` 或 `POST`；其他值记 WARNING 并回退 `POST`。请求方法只看这个字段，与 `payload` 无关（`GET` 配 `payload` 会发出带 body 的 GET） |
-| `payload` | 空 | 请求体基础字段；非空时带 JSON body 并加 `Content-Type`，页码与每页条数会合并进去 |
+| `method` | `POST` | `GET` 或 `POST`；其他值记 WARNING 并回退 `POST`。请求方法只看这个字段，与 `payload` 无关 |
+| `payload` | 空 | 请求体基础字段，**只在 `POST` 模式生效**（`GET` 模式不会传递 `payload`，写进去的筛选条件会被静默丢弃）；页码与每页条数会合并进去。带 body 的 `GET` 只属于直接调用 `fetch_json` 的底层契约，源配置里做不到 |
+| `base_url` | 接口地址的 `scheme://host/` | 补全接口返回的相对链接（`"/p/1.html"`）时用的基准；接口与详情页不同域时显式写，例如 `https://www.example.com/` |
 | `headers` | 空 | 额外请求头，如 `Referer`（不少接口校验来源） |
 | `items_path` | 必填 | 条目数组的点号路径，支持数组下标（如 `data.list.0.items`）；为空记 ERROR，该站点不会有数据 |
 | `total_path` | 空 | 总数点号路径，用于提前判断是否还有下一页 |
@@ -508,7 +509,9 @@ cp sources.json sources.local.json
 
 **GET 模式的页码**：只有 `method: POST` 会把 `page_param`/`page_size_param` 合并进请求体；`GET` 模式不拼查询串，页码只能靠 `url` 里的 `{page}` 占位符（例如 `https://example.com/api/list?page={page}&size=50`）。两者都没有时每页都会请求同一个 URL，靠跨页 URL 去重后第一页就因“没有新条目”停止，只会拿到首页数据。
 
-**与列表页配置的关系**：`api` 与 `list_url`/`list_urls`/`pagination` 互斥，同时配置时以 `api` 为准并记一条 debug 日志。接口请求与 HTML 抓取共用同一套网络层（总时限、解压体积上限、`NEWS_INSECURE_SSL` 降级），响应编码按 `Content-Type` 的 charset → UTF-8 → GB18030 依次尝试（政务系统的 GBK 接口很常见，直接 UTF-8 硬解会让整批字段静默变乱码；声明的 charset 解不开而降级成功时记一条 INFO 日志，便于排查到底按哪个编码解的）；但**不启用分页 SSRF 白名单**——白名单是围绕 `list_url` 的可信目标设计的，接口型源没有列表页可锚定，请只在配置里写你自己信任的接口地址。`headers` 只用于补正 `Referer`/`Cookie` 这类站点要求的头，它会覆盖默认 `User-Agent`，写错会直接导致接口拒绝。
+**与列表页配置的关系**：`api` 与 `list_url`/`list_urls`/`pagination` 互斥，同时配置时以 `api` 为准并记一条 debug 日志。接口请求与 HTML 抓取共用同一套网络层（总时限、解压体积上限、`NEWS_INSECURE_SSL` 降级），响应编码按 `Content-Type` 的 charset → UTF-8 → GB18030 依次尝试（政务系统的 GBK 接口很常见，直接 UTF-8 硬解会让整批字段静默变乱码；声明的 charset 解不开而降级成功时记一条 INFO 日志，便于排查到底按哪个编码解的）。`headers` 只用于补正 `Referer`/`Cookie` 这类站点要求的头，它会覆盖默认 `User-Agent`，写错会直接导致接口拒绝。
+
+**地址校验**：接口型源以配置的 `api.url` 作可信锚点——只有该 origin 允许指向内网地址，其余重定向目标必须是公网 http 80 / https 443，连接层还会按真实解析出的 IP 再校验一次（防 DNS rebinding）。重定向到不同 origin 时会剥掉 `Cookie`/`Authorization` 请求头，避免接口凭据被恶意 302 送到第三方。这条校验路径会禁用环境代理（直连），与 API extract 的 `url_validator` 路径同一取舍。
 
 `test` 命令会打印接口采集页数、停止原因（`cutoff`/`known_pages`/`done`/`empty`/`fetch_failed`/`max_pages`）与解析条数：
 
