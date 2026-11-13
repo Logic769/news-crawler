@@ -56,6 +56,16 @@ TITLE_HTAG_AND_TITLE_XPATH = (
 )
 TITLE_SPLIT_CHAR_PATTERN = "[-_|]"
 
+# <title> 只写了站点名时的识别线索：政务 CMS 常把 <title> 固定成
+# 「XX省人民政府门户网站」这类名字，真标题只在正文 h1 里。命中这些词
+# 且总长度很短时，才允许用「页面唯一的 h1」覆盖 <title>（见 TitleExtractor）。
+SITE_NAME_HINTS = ("网站", "门户", "官网", "平台", "系统", "首页", "新闻网")
+SITE_NAME_MAX_LEN = 24
+# 兜底用的 h1 长度区间：太短（"通知"/"公告"）没有信息量，太长多半是
+# 关键词堆砌或整段摘要。见 TitleExtractor.extract_by_sole_heading。
+SITE_FALLBACK_MIN_LEN = 8
+SITE_FALLBACK_MAX_LEN = 200
+
 USELESS_TAG = [
     "style",
     "script",
