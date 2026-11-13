@@ -741,6 +741,137 @@ def _response_socket(resp: Any) -> socket.socket | None:
     return None
 
 
+def _decode_bytes(raw: bytes, charset: str | None, *, sniff_html: bool = False) -> str:
+    """按候选编码依次解码响应体，全部失败时用 utf-8 ignore 兜底。
+
+    charset 通常来自响应头的 Content-Type；HTML 还会在文档头部声明 charset，
+    因此 sniff_html=True 时再从内容前 4KB 里嗅一次。JSON 没有这种声明，
+    只能靠响应头 + 编码试探。政务系统常见 GBK 接口：直接
+    utf-8 + replace 会把整批字段变成乱码，而 json.loads 仍能解析成功，
+    从日志里完全看不出问题。
+    """
+    if not charset and sniff_html:
+        head = raw[:4096].decode("ascii", "ignore")
+        match = re.search(r'charset\s*=\s*["\']?([\w-]+)', head, re.IGNORECASE)
+        charset = match.group(1) if match else None
+    for encoding in (charset, "utf-8", "gb18030"):
+        if not encoding:
+            continue
+        try:
+            text = raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        if charset and encoding.lower() != charset.lower():
+            # 声明与实际不符：不记一条日志的话，运维只能看到"不报错"，
+            # 无法判断某接口最终是按哪个编码解的。
+            LOG.info("响应按 %s 解码（响应头声明 %r）", encoding, charset)
+        return text
+    return raw.decode("utf-8", "ignore")
+
+
+def fetch_json(
+    url: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+) -> Any:
+    """按 JSON 协议请求一个接口，返回解析后的对象。
+
+    只给"列表需要走后端接口"的站点用（页面本身是 SPA，DOM 里没有可抓的
+    详情链接）。行为刻意与 fetch_html 对齐：同样的总时限、同样的解压与
+    体积上限、同样的 NEWS_INSECURE_SSL 降级策略，避免接口型站点成为
+    绕开这些保护的旁路。
+
+    method 决定请求方法（默认 GET），payload 非空时带上 JSON body 并
+    加 Content-Type；两者独立，method="GET" 配 payload 会发出带 body 的 GET。
+    响应必须是合法 JSON，解析失败抛 ValueError（调用方按抓取失败处理，
+    不做静默重试）。
+    """
+    body_bytes = (
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if payload is not None
+        else None
+    )
+    request_headers = dict(HEADERS)
+    if body_bytes is not None:
+        request_headers["Content-Type"] = "application/json;charset=UTF-8"
+    if headers:
+        request_headers.update(headers)
+
+    def _fetch(context: ssl.SSLContext) -> tuple[bytes, str | None]:
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
+        req = urllib.request.Request(
+            url, data=body_bytes, headers=request_headers, method=method.upper()
+        )
+        deadline = time.monotonic() + MAX_FETCH_TOTAL_SECONDS
+        open_timeout = min(PER_OP_TIMEOUT, deadline - time.monotonic())
+        if open_timeout <= 0:
+            raise TimeoutError(f"请求超过 {MAX_FETCH_TOTAL_SECONDS} 秒总时限：{url}")
+        with opener.open(req, timeout=open_timeout) as resp:
+            sock = _response_socket(resp)
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"请求超过 {MAX_FETCH_TOTAL_SECONDS} 秒总时限：{url}"
+                    )
+                if sock is not None:
+                    try:
+                        sock.settimeout(min(PER_OP_TIMEOUT, remaining))
+                    except OSError:
+                        pass
+                try:
+                    read_chunk = getattr(resp, "read1", None) or resp.read
+                    chunk = read_chunk(65536)
+                except TimeoutError as exc:
+                    raise TimeoutError(
+                        f"请求超过 {MAX_FETCH_TOTAL_SECONDS} 秒总时限：{url}"
+                    ) from exc
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_DECODED_BYTES:
+                    raise UnsupportedContentEncoding(
+                        f"响应体超过 {MAX_DECODED_BYTES} 字节上限，拒绝该响应"
+                    )
+                chunks.append(chunk)
+            compressed = b"".join(chunks)
+            ce_headers = resp.headers.get_all("Content-Encoding") or []
+            decompressed = _decompress(
+                compressed, ",".join(ce_headers) if ce_headers else None
+            )
+            return decompressed, resp.headers.get_content_charset()
+
+    try:
+        raw, charset = _fetch(_SSL_CONTEXT)
+    except urllib.error.URLError as exc:
+        if not isinstance(exc.reason, ssl.SSLCertVerificationError):
+            raise
+        if not _insecure_ssl_allowed():
+            LOG.error(
+                "SSL 证书校验失败，按默认严格策略中止：%s。"
+                "确认该站点可信后可设置 %s=1 允许降级。",
+                url,
+                INSECURE_SSL_ENV,
+            )
+            raise
+        LOG.warning(
+            "SSL 证书校验失败，已按 %s=1 降级为不校验重试（存在中间人风险）：%s",
+            INSECURE_SSL_ENV,
+            url,
+        )
+        raw, charset = _fetch(_unverified_ssl_context())
+
+    text = _decode_bytes(raw, charset)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"接口返回的不是合法 JSON（{url}）：{exc}") from exc
+
+
 def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) -> str:
     """Fetch a page and decode it using the charset from headers/meta tags.
 
@@ -851,19 +982,7 @@ def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) 
         )
         raw, charset = _fetch(_unverified_ssl_context())
 
-    if not charset:
-        head = raw[:4096].decode("ascii", "ignore")
-        match = re.search(r'charset\s*=\s*["\']?([\w-]+)', head, re.IGNORECASE)
-        charset = match.group(1) if match else None
-
-    for encoding in (charset, "utf-8", "gb18030"):
-        if not encoding:
-            continue
-        try:
-            return raw.decode(encoding)
-        except (UnicodeDecodeError, LookupError):
-            continue
-    return raw.decode("utf-8", "ignore")
+    return _decode_bytes(raw, charset, sniff_html=True)
 
 
 def extract_from_html(

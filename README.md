@@ -408,8 +408,9 @@ cp sources.json sources.local.json
 | `project_status_xpath` | 可选 | 项目申报：申报状态所在单元格 XPath |
 | `content_required` | 可选 | 项目申报：是否必须抓到详情正文。默认 `false`（登录墙/无正文仍记 `ok` 并存列表字段）；设为 `true` 退回新闻语义（无正文记 `no_content`/`error`） |
 | `pagination` | 可选 | 自动分页配置对象，见下方“自动分页（可选）”；只对单个 `list_url` 生效，配置 `list_urls` 时仍按固定地址列表抓取（不受 `max_pages`/`stop_when_older_than_cutoff` 影响） |
+| `api` | 可选 | 接口型源配置对象，见下方“接口型源（可选）”。配置后不再抓列表页 HTML，改为直接请求 JSON 接口翻页；与 `list_url`/`list_urls`/`pagination` 互斥（同时配置时以 `api` 为准并记一条 debug 日志） |
 | `render` | 可选 | 设为 `true` 表示列表页需要用 Chrome 渲染后再解析 |
-| `delay` | 可选 | 每个请求之间的等待秒数，默认 0.3 |
+| `delay` | 可选 | 每个请求之间的等待秒数，默认 0.3（接口型源同样是"两次请求之间"，最后一页抓完不再等待） |
 
 > 顶层还可以配置 `workers`（同时处理几个站点，默认 16）和 `days`（默认抓取天数）。
 >
@@ -446,6 +447,74 @@ cp sources.json sources.local.json
 未配置 `render: true` 时，列表页解析为空会自动用 Chrome 渲染一次，并基于渲染后的 DOM 重新解析与继续翻页。自动分页会在页内按 URL 去重，并在 `test` 命令输出页数与停止原因（如 `cutoff`、`known_pages`、`no_next`、`max_pages`、`empty`、`fetch_failed`、`done`）。
 
 自动分页会为列表页启用 SSRF 地址白名单：配置的 `list_url`/`list_urls` 是唯一可信目标，且要求 scheme + host + port 完全一致；其他目标必须是公网地址，并且只允许 http 80 / https 443 端口。指向配置主机其他端口的链接会被拒绝；同端口无法按路径区分，配置主机本身视为可信。带地址校验的列表页请求为直连（不读取 `HTTP(S)_PROXY`），文章详情页保持原有代理行为。浏览器回退时每个请求都会重新校验，但 Playwright 自行解析 DNS，无法像 HTTP 路径那样在连接层钉扎 IP，残余 DNS rebinding 风险需由出口网络策略兜底。
+
+#### 接口型源（可选）
+
+有些站点的列表页是纯前端渲染（SPA），DOM 里连详情链接都没有，只有后端 JSON 接口能拿到数据。这类站点用 `api` 声明成接口型源：爬虫不再抓列表页 HTML，而是按接口翻页取条目；**接口返回的正文随条目一起进库，不再请求详情页、也不跑 GNE**（详情页往往还是同一个 SPA，抓下来同样没有正文）。此时条目的 `title_source` 记为 `api_field`，便于下游区分「接口列表给的标题」与「详情页抽取的标题」。
+
+```json
+{
+  "name": "shpolicy_ssme",
+  "api": {
+    "url": "https://shpolicy.ssme.sh.gov.cn/governmentCloudApi/chatSNet/policyDoc",
+    "method": "POST",
+    "payload": {"area": "上海市", "newsCategory": null, "name": null, "department": null},
+    "headers": {"Referer": "https://shpolicy.ssme.sh.gov.cn/knowledge/"},
+    "items_path": "data.respData.dataList",
+    "total_path": "data.respData.total",
+    "page_param": "pageNum",
+    "page_size_param": "pageSize",
+    "page_size": 100,
+    "start_page": 1,
+    "max_pages": 20,
+    "url_field": "originalURL",
+    "id_field": "id",
+    "title_field": "name",
+    "date_field": "publishTime",
+    "content_field": "content",
+    "content_is_html": true
+  },
+  "timezone": "Asia/Shanghai",
+  "delay": 0.8
+}
+```
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `url` | 必填 | 接口地址；含 `{page}` 时按页替换 |
+| `method` | `POST` | `GET` 或 `POST`；其他值记 WARNING 并回退 `POST`。请求方法只看这个字段，与 `payload` 无关（`GET` 配 `payload` 会发出带 body 的 GET） |
+| `payload` | 空 | 请求体基础字段；非空时带 JSON body 并加 `Content-Type`，页码与每页条数会合并进去 |
+| `headers` | 空 | 额外请求头，如 `Referer`（不少接口校验来源） |
+| `items_path` | 必填 | 条目数组的点号路径，支持数组下标（如 `data.list.0.items`）；为空记 ERROR，该站点不会有数据 |
+| `total_path` | 空 | 总数点号路径，用于提前判断是否还有下一页 |
+| `page_param` | `pageNum` | 页码参数名（仅 POST 生效，见下方“GET 模式的页码”） |
+| `page_size_param` | `pageSize` | 每页条数参数名（仅 POST 生效） |
+| `page_size` | `20` | 每页条数，范围 1–500；超出接口实际上限时以接口返回条数为准（偏大会导致“不足一页即末页”的判断提前触发） |
+| `start_page` | `1` | 起始页码，范围 1–10000 |
+| `max_pages` | `20` | 最多请求页数，范围 1–500 |
+| `url_field` | `originalURL` | 详情链接字段名；取不到时用 `url_template` 的 `{id}` 兜底，两者都没有则跳过该条并记 WARNING |
+| `url_template` | 空 | 详情链接模板，如 `https://example.com/detail/{id}`，`{id}` 由 `id_field` 填充 |
+| `id_field` | `id` | 条目 ID 字段名（供 `url_template` 使用，也写进 `entry`） |
+| `title_field` | `name` | 标题字段名，经 `clean_title()` 清洗后入库 |
+| `date_field` | `publishTime` | 发布日期字段名；**字段为空**时才回退解析详情链接里的日期路径（字段有值但解析失败则留给 `process_entry` 按 `unknown_date` 处理，不猜） |
+| `date_format` | 空 | 日期格式，默认交给 `parse_datetime` 自动识别 |
+| `content_field` | `content` | 正文字段名；有值时随条目入库，跳过详情页抓取 |
+| `content_is_html` | `true` | 正文字段是 HTML 时先转纯文本（保留段落换行，顺带取出 `<img>` 配图） |
+| `author_field` | 空 | 作者字段名 |
+| `stop_when_older_than_cutoff` | `true` | 整页日期都早于抓取窗口时停止翻页（与 HTML 分页同口径；项目申报模式不据此早停） |
+| `stop_after_known_pages` | `0` | 连续 N 页条目都已入库时停止；范围 0–100，默认关闭 |
+
+**不支持与项目申报模式组合**：`listing_type: project_application` 与 `api` 同时配置时，`load_config` 会记一条 WARNING。项目申报走的是列表字段路径，不读接口给的正文、也没有截止时间字段映射，结果是正文被丢弃、`deadline` 为空；需要这种数据源时请改用新闻模式，或等后续补上 `deadline_field` 映射。
+
+**GET 模式的页码**：只有 `method: POST` 会把 `page_param`/`page_size_param` 合并进请求体；`GET` 模式不拼查询串，页码只能靠 `url` 里的 `{page}` 占位符（例如 `https://example.com/api/list?page={page}&size=50`）。两者都没有时每页都会请求同一个 URL，靠跨页 URL 去重后第一页就因“没有新条目”停止，只会拿到首页数据。
+
+**与列表页配置的关系**：`api` 与 `list_url`/`list_urls`/`pagination` 互斥，同时配置时以 `api` 为准并记一条 debug 日志。接口请求与 HTML 抓取共用同一套网络层（总时限、解压体积上限、`NEWS_INSECURE_SSL` 降级），响应编码按 `Content-Type` 的 charset → UTF-8 → GB18030 依次尝试（政务系统的 GBK 接口很常见，直接 UTF-8 硬解会让整批字段静默变乱码；声明的 charset 解不开而降级成功时记一条 INFO 日志，便于排查到底按哪个编码解的）；但**不启用分页 SSRF 白名单**——白名单是围绕 `list_url` 的可信目标设计的，接口型源没有列表页可锚定，请只在配置里写你自己信任的接口地址。`headers` 只用于补正 `Referer`/`Cookie` 这类站点要求的头，它会覆盖默认 `User-Agent`，写错会直接导致接口拒绝。
+
+`test` 命令会打印接口采集页数、停止原因（`cutoff`/`known_pages`/`done`/`empty`/`fetch_failed`/`max_pages`）与解析条数：
+
+```bash
+docker compose run --rm crawler test --config sources.local.json --name shpolicy_ssme
+```
 
 #### 项目申报列表（`listing_type: project_application`）
 
