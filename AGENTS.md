@@ -274,6 +274,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | `project_status_xpath` | 否 | 项目申报：申报状态单元格 XPath |
 | `content_required` | 否 | 项目申报：是否必须抓到详情正文；默认 `false`（登录墙/短正文仍记 `ok`，只存列表字段），`true` 退回新闻语义 |
 | `pagination` | 否 | 自动分页配置对象，见下方“自动分页”；只对单个 `list_url` 生效，配置 `list_urls` 时仍按固定地址列表抓取 |
+| `api` | 否 | 接口型源配置对象，见下方“接口型源”；配置后不抓列表页 HTML，改为请求 JSON 接口翻页，正文随条目入库；与 `list_url`/`list_urls`/`pagination` 互斥（同时配置时以 `api` 为准并记 debug） |
 | `timezone` | 否 | 默认 `Asia/Shanghai`；未配置时继承顶层 `timezone`，空串/非法值在 `load_config` 中同样回退到顶层（默认 `Asia/Shanghai`），其中非法值会记 WARNING |
 | `render` | 否 | 列表页是否强制 Chrome 渲染 |
 | `delay` | 否 | 请求间隔秒数，默认 0.3；列表页与文章详情页请求前都会等待 |
@@ -309,6 +310,37 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 未配置 `render: true` 时，列表页解析为空会自动用 Chrome 渲染一次，并基于渲染后的 DOM 重新解析与继续翻页。自动分页在页内按 URL 去重；`test` 命令输出页数与停止原因（`cutoff`/`known_pages`/`no_next`/`max_pages`/`empty`/`fetch_failed`/`done`）。实现入口：`collect_list_entries_detailed(source, *, cutoff=None, known_urls=None) -> dict`，返回 `items/pages/page_urls/stop_reason`；`collect_list_entries` 保留旧返回类型。
 
 自动分页会为列表页启用 SSRF 地址白名单：配置的 `list_url`/`list_urls` 是唯一可信目标，且要求 scheme + host + port 完全一致；其他目标必须是公网地址，并且只允许 http 80 / https 443 端口。指向配置主机其他端口的链接会被拒绝；同端口无法按路径区分，配置主机本身视为可信。带地址校验的列表页请求为直连（不读取 `HTTP(S)_PROXY`），文章详情页保持原有代理行为。浏览器回退时每个请求都会重新校验，但 Playwright 自行解析 DNS，无法像 HTTP 路径那样在连接层钉扎 IP，残余 DNS rebinding 风险需由出口网络策略兜底。
+
+### 接口型源
+
+有些站点的列表页是纯前端渲染（SPA），DOM 里连详情链接都没有，只有后端 JSON 接口能拿到数据。这类站点用 `api` 声明成接口型源：`collect_list_entries_detailed` 检测到 `source["api"]` 后直接走 `_collect_api_entries`，不抓列表页 HTML；**接口返回的正文随条目进 `entry["content"]`/`entry["raw_content"]`，`process_entry` 见到自带正文就跳过详情抓取、也不跑 GNE**（详情页往往还是同一个 SPA），此时 `title_source` 记为 `api_field`（已加入白名单，与 `article_title_xpath`/`gne_default` 并列）。
+
+```json
+"api": {
+  "url": "https://shpolicy.ssme.sh.gov.cn/governmentCloudApi/chatSNet/policyDoc",
+  "method": "POST",
+  "payload": {"area": "上海市", "newsCategory": null},
+  "headers": {"Referer": "https://shpolicy.ssme.sh.gov.cn/knowledge/"},
+  "items_path": "data.respData.dataList",
+  "total_path": "data.respData.total",
+  "page_param": "pageNum",
+  "page_size_param": "pageSize",
+  "page_size": 100,
+  "url_field": "originalURL",
+  "title_field": "name",
+  "date_field": "publishTime",
+  "content_field": "content"
+}
+```
+
+各字段的含义与默认值见 README「接口型源」一节的完整表格（`url`/`method`/`payload`/`headers`/`items_path`/`total_path`/`page_param`/`page_size_param`/`page_size`/`start_page`/`max_pages`/`url_field`/`url_template`/`id_field`/`title_field`/`date_field`/`date_format`/`content_field`/`content_is_html`/`author_field`/`stop_when_older_than_cutoff`/`stop_after_known_pages`）。要点：
+
+- **GET 模式不拼查询串、也不发 `payload`**：只有 POST 会把 `page_param`/`page_size_param` 合并进请求体（源配置的 `payload` 同理只在 POST 生效，GET 下写筛选条件会被静默丢弃）；GET 的页码只能靠 `url` 里的 `{page}`，否则每页都请求同一 URL，靠跨页 URL 去重后第一页就因「没有新条目」停止；GET 模式同样不发送 `page_size`，但采集器仍用它判断末页（本页条数少于 `page_size` 即视为最后一页），需把它设为接口每页实际返回的条数；
+- **`_api_settings` 幂等**：返回的 dict 带 `_API_NORMALIZED_FLAG`，`load_config` 与 `collect_list_entries_detailed` 各调一次不会重复告警。直接构造 `source` 的调用方也靠 collect 入口兜底归一，**不要用 `source.get("api")` 判断是否接口型**（裸配置缺 `start_page` 会 KeyError）；
+- **与列表页配置互斥**：同时配 `list_url`/`pagination` 时以 `api` 为准并记 debug；
+- **重定向校验以 `api.url` 为锚点**：接口型源没有 `list_url`，不能复用 `_pagination_url_validator`；`_api_url_validator(settings)` 把配置的 `api.url` 交给同一套 `_trusted_url_validator`（只有该 origin 允许内网地址，其余必须是公网 http 80 / https 443，连接层再按真实解析 IP 校验一次），`fetch_json` 收到 `url_validator` 时会装 `_ValidatingRedirectHandler` + `_PinnedHTTPSHandler`/`_PinnedHTTPHandler` 并禁用环境代理（与 API extract 路径同一取舍）。跨 origin 重定向会剥掉 `Cookie`/`Authorization`/`Proxy-Authorization`（urllib 默认会把这些头原样复制给新目标）。请求复用 `url_extract.fetch_json`（同一套总时限、解压体积上限、`NEWS_INSECURE_SSL` 降级），响应编码统一走 `url_extract._decode_bytes`（charset → UTF-8 → GB18030，`fetch_html` 与 `fetch_json` 共用），GBK 接口不会静默变乱码；
+- **不支持与 `listing_type=project_application` 组合**：`load_config` 对这种组合记 WARNING 但不阻止启动——`process_entry` 会先分派到 `_process_project_entry`，那条路径不读 `entry` 里的接口正文、也没有 `deadline` 字段映射，结果是正文被丢弃、`deadline` 为空。要支持需要另加 `deadline_field` 并在项目路径优先取 inline 正文；
+- 停止原因：`cutoff`/`known_pages`/`done`（total 用尽或不足一页）/`empty`（items_path 非数组或本页无新条目）/`fetch_failed`/`max_pages`（`for` 循环正常走完，即没有触发任何更明确的终止条件）。
 
 ### 项目申报列表
 
@@ -596,6 +628,7 @@ curl http://localhost:8000/v1/health
 | `regression/test_extract_job_dates.py` | 7 个用例：API extract 作业超 skew 回退库内列表日期、无年份兜底、跨年无年份取上一年、跨年正方向保留时刻、详情不可解析兜底、无列表日期记 unknown_date |
 | `regression/test_project_application.py` | 65 个用例：`listing_type` 默认值/非法值回退、`deadline_xpath`/`project_status_xpath` 解析且不把截止时间当发布时间、详情缺失或登录墙短正文仍存列表字段（标题取列表标题、`title_source=list_title`）、`content_required=true` 走 `no_content`、截止时间早于窗口记 `old`、v7→v8 迁移补三列、deadline 不回退发布时间、不可解析截止时间保留原文、项目 `old` 行二次运行 skip、`--force` 仍抓详情、长正文成功入库、`content_required` 字符串值归一、deadline 过滤与排序、已入库 `ok`/`old` 行刷新列表字段（`title`/`list_title`/延期/截止/不可解析清空）且不抓详情、`old` 恢复 `ok` 且 `content_required=true` 时继续抓正文、新闻切项目清空 `publish_time*`、无年份未来截止保留当年、无年份 `deadline_format` 按基准年补齐、闰日隔两年取最近合法年、deadline 边界按站点墙钟、无分隔符 `deadline_format`（`%m%d`）按基准年补齐、已截止状态把无年份截止约束到过去、`content_required` 由 false 改 true 后 `ok` 行按正文缺失重抓、已截止状态下闰日回看四年、旧新闻行刷新时补写 `title_source=list_title`、已截止状态文本含内部空白（半角/全角空格、NBSP）时仍按过去方向解析、已截止时截止时间须落在列表发布日期与抓取时刻之间（区间无候选保留原文）、公告发布当天截止仍能解析、候选年份覆盖抓取时刻上界（发布日期距抓取超过三年）、配置 `date_xpath` 的项目行把列表发布日期写入 `publish_time`/`publish_time_utc`/`list_publish_time` 且不影响 `deadline`、未配置 `date_xpath` 时 `publish_time` 保持空、增量刷新改写列表发布日期且不抓详情、列表日期本次不可解析时保留旧发布日期、正文重试期间（首轮 `no_content` + 次轮列表日期降级）不抹掉已保留的列表发布日期、日期值不变但来源为历史详情来源时刷新归一为 `list`、列表日期降级沿用非 `list` 旧值时会记 WARNING（未变化的行不重复告警）、没有任何可沿用的本地墙钟时连同来源/原文/`list_publish_time` 一并清空、`publish_time` 为空而 `publish_time_utc` 有值的脏行不会被当成本地墙钟写回、行内 `timezone` 为空时已有 `publish_time_utc` 直接沿用且不写回时区（幂等 skip）、行内既无时区也无 UTC 时按站点配置换算并记 WARNING 且不写回时区（猜出的 UTC 下一轮被沿用、幂等 skip）、站点配置缺 `timezone`（空串）时改用行内时区换算并记 WARNING 且不清空行内已知时区（未变化的行不重复告警、端到端经 `process_entry` 接线仍按行内时区换算）、`load_config` 把站点空串/非法 `timezone` 归一为顶层时区（缺失/非法值同样回退并告警）、端到端用 `parse_list_items` + `process_entry` 验证墙钟格式化与 UTC 换算使用同一时区、行内 `timezone` 为历史非法值（如 `Asia/Shangha`）时刷新按归一值换算并把合法名写回（只修一次、幂等 skip；接受本次列表日期与沿用旧墙钟两条分支都覆盖）、`should_skip_stored` 对 `old` 行的非法行内时区按归一值判窗口（不回落运行环境时区）、行内时区首尾带空白时同样写回一次合法名、纯空白归一成 NULL（不污染时区分组）、列表日期与旧值完全相同时脏时区仍能靠时区判定单独触发一次写回、正文重试保留旧发布时间时不覆盖行内时区（`publish_time`/`publish_time_utc`/`timezone` 三字段一致、下一轮按行内时区换算） |
 | `regression/test_pagination.py` | 40 个用例：模板分页按截止日期停止、模板生成后续页、max_pages 含首页语义、last_url_xpath 多候选取最大页码、跟随 onclick/忽略 # 锚点、渲染后 DOM 找下一页、未知日期不触发 cutoff、已入库页连续早停、旧 list_urls 行为、非法 mode 回退、固定列表忽略 max_pages/分页配置/cutoff、固定页抓取失败不误报、固定列表全空报 empty、置顶旧文不提前停、next XPath 无 href 文本忽略、next XPath 属性 onclick 解析（含 JavaScript: 前缀）、模板缺 {page} 回退、collect_list_entries 包装、分页 URL SSRF 校验（可信内网主机/可信主机 DNS 解析出的内网 IP/公网 IP/未信任私网拒绝）、连接层 IP 字面量保留 scheme+port（`_PinnedHTTPConnection`/`_PinnedHTTPSConnection` 的 `connect` 真实路径）、可信端点 DNS 失败冷却后重试、列表抓取确实收到 validator |
+| `regression/test_api_source.py` | 42 个用例：接口型源采集（条目带正文与日期、total 用尽/不足一页/cutoff/known_pages/max_pages 五种停止原因、抓取失败 stop_reason、items_path 非数组、url_template 兜底、无 url 跳过、畸形条目链接（`https://[broken/p`，`urlsplit` 抛 `ValueError`）只告警跳过而不中断整页采集、跨页去重、相对链接按 `api.url` 的 origin 补全（显式 `base_url` 可覆盖）、早停判断用去重前的本页条目（`page_items`）而非 `fresh_items`、GET 不发请求体、delay 只在两次请求之间等待且末页不等、`fetch_json` 收到以 `api.url` 为锚点的 `url_validator`）、`_api_settings` 归一（默认值与覆盖、无 api 返回 None、非法 method 回退 POST、`_dig` 列表下标、`_html_to_text` 段落与图片/剔 script·style/表格单元格换行、`_decode_bytes` 的 GBK 回退·meta 嗅探·声明 charset 解不开时记 INFO 日志）、传输层（跨 origin 重定向剥掉 Cookie/Authorization 但保留 `X-Trace`、同源重定向保留凭据、校验器拒绝时在跟随之前抛错、传 `url_validator` 时装 `ProxyHandler`+`_ValidatingRedirectHandler`+`_PinnedHTTPSHandler`+`_PinnedHTTPHandler`、不传时只装 `HTTPSHandler`）、`process_entry` 自带正文跳过详情抓取（`title_source=api_field`）与无正文仍抓详情、`load_config` 归一接口型源（timezone 空串→Asia/Shanghai、method 小写→POST）与 api+项目申报模式告警、纯新闻源不告警 |
 
 运行方式：`python -X utf8 -m unittest discover -s regression -t . -p "test_*.py" -v`（约 15 秒，无需网络）。
 
@@ -696,6 +729,8 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 ### 12.4 共享接口约定
 
 - `fetch_html(url, *, url_validator: Callable[[str], None] | None = None) -> str`：失败时抛出异常；请求带 `Accept-Encoding: gzip` 并解压，遇到 br 等无法解码的编码抛 `UnsupportedContentEncoding`；传入 `url_validator` 后每次 HTTP 重定向都会先用新 URL 调用它，抛异常即中断重定向；
+- `fetch_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> Any`：接口型源专用 JSON 请求；`method` 决定请求方法（默认 GET），`payload` 非空时带 JSON body 并加 `Content-Type: application/json;charset=UTF-8`（两者独立，`method="GET"` 配 `payload` 会发出带 body 的 GET），复用 `fetch_html` 的 UA、总时限、解压体积上限与 `NEWS_INSECURE_SSL` 降级，响应编码与 `fetch_html` 共用 `_decode_bytes`；响应不是合法 JSON 时抛 `ValueError`；
+- `_api_settings(source: dict) -> dict[str, Any] | None`：把 `source["api"]` 归一成带默认值的配置，返回的 dict 带 `_API_NORMALIZED_FLAG`（幂等，`load_config` 与 `collect_list_entries_detailed` 各调一次不会重复告警）；`collect_list_entries_detailed` 检测到接口型源时直接返回 `_collect_api_entries(...)` 的结果（结构与 HTML 分页一致：`items`/`pages`/`page_urls`/`stop_reason`），不要用 `source.get("api")` 判断是否接口型；
 - `normalize_images(images, base_url) -> list[str]`：把 `//cdn/x.jpg` 等相对图片地址补全为绝对 URL，去重去空，并只保留 `http/https`（过滤 `data:`/`javascript:`/`ftp:`）；`/v1` 读取侧同样调用，历史行也会被归一化；
 - `normalize_images_for_update(images, base_url) -> list[str] | None`：同上，但空结果返回 `None`，供写入侧按"本次未提供"保留旧图，避免把抽取失败误判为明确无图；
 - `MAX_DECODED_BYTES = 32 * 1024 * 1024`：解压后响应体上限，超限抛 `UnsupportedContentEncoding`，用于抵御压缩炸弹；

@@ -944,6 +944,159 @@ def _coerce_bool(value: object, *, default: bool) -> tuple[bool, bool]:
     return default, False
 
 
+_API_METHODS = ("GET", "POST")
+# 归一化结果的内部标记：让 _api_settings 可以幂等调用（load_config 与
+# collect 各一次），不重复打告警、不重复解析。
+_API_NORMALIZED_FLAG = "_normalized"
+
+
+def _dig(data: Any, path: str) -> Any:
+    """按点号路径取嵌套字段；任一层缺失返回 None。
+
+    接口型源的 items_path/total_path/字段映射都用同一套点号路径，
+    数字段可以下钻到数组元素（如 data.list.0.name）。
+    """
+    if not path:
+        return data
+    current = data
+    for part in path.split("."):
+        if isinstance(current, dict):
+            current = current.get(part)
+        elif isinstance(current, list) and part.isdigit():
+            index = int(part)
+            current = current[index] if 0 <= index < len(current) else None
+        else:
+            return None
+        if current is None:
+            return None
+    return current
+
+
+def _api_settings(source: dict) -> dict[str, Any] | None:
+    """归一化「接口型源」配置，返回 None 表示该站点不是接口型。
+
+    接口型源用于页面本身是 SPA、DOM 里拿不到可抓详情链接的站点：列表条目
+    与正文都来自同一个后端 JSON 接口。这里只做配置归一与校验（在
+    load_config 里执行一次，直接构造 source 的调用方也能靠同一函数兜底），
+    实际请求在 _collect_api_entries 里完成。
+    """
+    raw = source.get("api")
+    if raw is None:
+        return None
+    if isinstance(raw, dict) and raw.get(_API_NORMALIZED_FLAG):
+        # 已经归一过（load_config 走一次，collect 里再兜底一次），
+        # 直接复用，避免重复告警与重复解析。
+        return raw
+    name = source.get("name")
+    if not isinstance(raw, dict):
+        LOG.error("站点 %r 的 api 不是对象，已按空配置处理", name)
+        raw = {}
+    method = str(raw.get("method") or "POST").strip().upper()
+    if method not in _API_METHODS:
+        LOG.warning(
+            "站点 %r 的 api.method=%r 不支持（可选 GET/POST），回退为 POST",
+            name,
+            raw.get("method"),
+        )
+        method = "POST"
+    payload_raw = raw.get("payload")
+    if payload_raw is None:
+        payload: dict[str, Any] = {}
+    elif isinstance(payload_raw, dict):
+        payload = dict(payload_raw)
+    else:
+        LOG.warning("站点 %r 的 api.payload 不是对象，已忽略", name)
+        payload = {}
+    headers_raw = raw.get("headers")
+    headers: dict[str, str] = {}
+    if isinstance(headers_raw, dict):
+        headers = {str(key): str(value) for key, value in headers_raw.items()}
+    elif headers_raw is not None:
+        LOG.warning("站点 %r 的 api.headers 不是对象，已忽略", name)
+    items_path = str(raw.get("items_path") or "").strip()
+    if not items_path:
+        LOG.error(
+            "站点 %r 的 api.items_path 为空：无法定位条目数组，该站点不会有数据",
+            name,
+        )
+    api_url = str(raw.get("url") or "").strip()
+    base_url = str(raw.get("base_url") or "").strip()
+    if not base_url:
+        # 接口返回的链接常是 "/p/1.html" 这类相对路径，没有列表页可锚定。
+        # 默认取接口自身的 scheme://host[:port]/ 作基准；与接口不同域时
+        # 由显式 base_url 覆盖。
+        base_url = _origin_prefix(api_url)
+    return {
+        _API_NORMALIZED_FLAG: True,
+        "url": api_url,
+        "base_url": base_url,
+        "method": method,
+        "payload": payload,
+        "headers": headers,
+        "items_path": items_path,
+        "total_path": str(raw.get("total_path") or "").strip(),
+        "page_param": str(raw.get("page_param") or "pageNum").strip(),
+        "page_size_param": str(raw.get("page_size_param") or "pageSize").strip(),
+        "page_size": _config_int(raw, "page_size", 20, 1, 500, prefix="api"),
+        "start_page": _config_int(raw, "start_page", 1, 1, 10000, prefix="api"),
+        "max_pages": _config_int(raw, "max_pages", 20, 1, 500, prefix="api"),
+        "url_field": str(raw.get("url_field") or "originalURL").strip(),
+        "url_template": str(raw.get("url_template") or "").strip(),
+        "id_field": str(raw.get("id_field") or "id").strip(),
+        "title_field": str(raw.get("title_field") or "name").strip(),
+        "date_field": str(raw.get("date_field") or "publishTime").strip(),
+        "date_format": str(raw.get("date_format") or "").strip() or None,
+        "content_field": str(raw.get("content_field") or "content").strip(),
+        "author_field": str(raw.get("author_field") or "").strip(),
+        "content_is_html": _config_bool(
+            raw, "content_is_html", True, prefix="api"
+        ),
+        "stop_when_older_than_cutoff": _config_bool(
+            raw, "stop_when_older_than_cutoff", True, prefix="api"
+        ),
+        "stop_after_known_pages": _config_int(
+            raw, "stop_after_known_pages", 0, 0, 100, prefix="api"
+        ),
+    }
+
+
+def _html_to_text(html: str) -> tuple[str, list[str]]:
+    """把接口返回的 HTML 正文转成（保留段落换行的文本, 图片地址列表）。
+
+    与 GNE 的输出口径保持一致：换行保留在返回值里，调用方再决定
+    content 是否压成单行、raw_content 是否保留换行。
+    """
+    if not html.strip():
+        return "", []
+    try:
+        doc = lxml.html.fromstring(html)
+    except (etree.ParserError, ValueError) as exc:
+        LOG.warning("接口正文不是合法 HTML，按纯文本处理：%s", exc)
+        return clean_text(html), []
+    images = [str(src).strip() for src in doc.xpath("//img/@src") if str(src).strip()]
+    # 脚本/样式/模板内容不是正文：text_content() 会把它们当纯文本带出来，
+    # 而 GNE 路径有噪声剔除，接口路径必须自己删，否则正文里会混进
+    # "var a=1;console.log(...)" 与 CSS 规则。
+    for node in doc.xpath("//script|//style|//noscript|//template"):
+        node.drop_tree()
+    # <br> 与块级元素尾部补换行，避免相邻段落被粘成一句话。
+    for node in doc.xpath("//br"):
+        node.tail = "\n" + (node.tail or "")
+    # 表格单元格也按块处理：项目申报的「申请材料」表按单元格罗列，
+    # 不加分隔会粘成 "材料A材料B"；用换行而不是制表符，因为下面的
+    # 空白压缩会把连续空格/制表符归一成一个空格。
+    for node in doc.xpath(
+        "//p|//div|//li|//tr|//td|//th|//h1|//h2|//h3|//h4|//h5|//h6"
+    ):
+        node.tail = "\n" + (node.tail or "")
+    raw = doc.text_content()
+    raw = raw.replace("\u00a0", " ").replace("\r\n", "\n").replace("\r", "\n")
+    raw = re.sub(r"[ \t]+", " ", raw)
+    raw = re.sub(r" *\n *", "\n", raw)
+    raw = re.sub(r"\n{3,}", "\n\n", raw)
+    return raw.strip(), images
+
+
 def load_config(path: str) -> dict:
     """读取 JSON 配置并补齐默认值，同时校验各站点的字段 XPath。"""
     if not Path(path).exists():
@@ -1032,6 +1185,43 @@ def load_config(path: str) -> dict:
                 "站点 %r 是项目申报模式但未配置 deadline_xpath，deadline 将为空",
                 source.get("name"),
             )
+        # 接口型源：列表条目与正文都来自后端 JSON 接口（页面是 SPA，
+        # DOM 里没有可抓的详情链接）。归一结果写回 source["api"]，
+        # 采集与入库两条路径都只认这份归一后的结构。
+        api_settings = _api_settings(source)
+        if api_settings is not None:
+            source["api"] = api_settings
+            if not api_settings["items_path"]:
+                LOG.warning(
+                    "站点 %r 是接口型源但 items_path 为空，抓取不会得到条目",
+                    source.get("name"),
+                )
+            if not api_settings["url_field"] and not api_settings["url_template"]:
+                LOG.warning(
+                    "站点 %r 是接口型源但既没有 url_field 也没有 url_template，"
+                    "条目将没有可用链接（下游按 id 识别会失败）",
+                    source.get("name"),
+                )
+            if source.get("list_url") or source.get("list_urls"):
+                LOG.debug(
+                    "站点 %r 是接口型源，list_url/list_urls 不参与采集",
+                    source.get("name"),
+                )
+            if not source.get("api", {}).get("url"):
+                LOG.error(
+                    "站点 %r 是接口型源但没有 api.url，该站点不会有数据",
+                    source.get("name"),
+                )
+            if listing_type == "project_application":
+                # 这个组合没有实现：process_entry 会先分派到
+                # _process_project_entry，那条路径不读 entry 里的接口正文，
+                # 也没有 deadline 字段映射，结果是正文被丢弃、截止时间为空，
+                # 而项目行还会退化成按 0 字正文记 ok 并被后续运行跳过。
+                LOG.warning(
+                    "站点 %r 同时配置了 api 与 listing_type=project_application："
+                    "接口正文与截止时间都不会被采用，请改成新闻模式或去掉 api",
+                    source.get("name"),
+                )
         source.setdefault("date_skew_days", data["date_skew_days"])
         try:
             raw_skew = source["date_skew_days"]
@@ -1245,21 +1435,56 @@ def _url_origin(value: str) -> tuple[str, str, int] | None:
     return scheme, host, port
 
 
+def _origin_prefix(value: str) -> str:
+    """返回 URL 的 "scheme://host[:port]/"，用于补全接口返回的相对链接。"""
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return ""
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").strip("[]")
+    if scheme not in ("http", "https") or not host:
+        return ""
+    try:
+        port = parts.port
+    except ValueError:
+        return ""
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None and port != (443 if scheme == "https" else 80):
+        netloc = f"{netloc}:{port}"
+    return f"{scheme}://{netloc}/"
+
+
 _TRUSTED_ENDPOINT_RETRY_SECONDS = 60.0
 
 
 def _pagination_url_validator(source: dict) -> Callable[[str], None]:
-    """Build an SSRF guard for a site's list pages and browser subrequests.
-
-    配置里的 list_url/list_urls 是唯一可信目标，且必须 scheme + host + port
-    完全一致才允许内网地址。其他目标必须是公网地址，并且只允许 http 80 /
-    https 443。这样攻击者即使改下一页链接，也不能借爬虫访问配置主机的其他
-    端口；同端口无法按路径区分，配置主机本身视为可信。连接层解析出的可信
-    主机 IP 只在与该主机的配置端口组合时放行，不构成独立的 URL 白名单。
-    """
+    """Build an SSRF guard for a site's list pages and browser subrequests."""
     configured: list[Any] = list(source.get("list_urls") or [])
     if source.get("list_url"):
         configured.append(source["list_url"])
+    return _trusted_url_validator(configured)
+
+
+def _api_url_validator(settings: dict[str, Any]) -> Callable[[str], None]:
+    """接口型源的重定向目标校验，以配置的 api.url 为可信锚点。
+
+    接口型源没有 list_url，不能复用 _pagination_url_validator；但 api.url
+    同样是配置里写死的可信目标，用它承接受同一套策略：只有该 origin 允许
+    内网地址，其余目标必须是公网 http 80 / https 443。
+    """
+    return _trusted_url_validator([str(settings.get("url") or "")])
+
+
+def _trusted_url_validator(configured: list[Any]) -> Callable[[str], None]:
+    """Build an SSRF guard anchored on the given configured URLs.
+
+    配置里的 URL 是唯一可信目标，且必须 scheme + host + port 完全一致才允许
+    内网地址。其他目标必须是公网地址，并且只允许 http 80 / https 443。这样
+    攻击者即使改下一页链接（或让接口 302 到内网），也不能借爬虫访问未配置
+    主机的端口；同端口无法按路径区分，配置主机本身视为可信。连接层解析出
+    的可信主机 IP 只在与该主机的配置端口组合时放行，不构成独立的 URL 白名单。
+    """
     trusted_origins: set[tuple[str, str, int]] = set()
     trusted_ports: dict[str, set[int]] = {}
     for raw in configured:
@@ -1353,21 +1578,29 @@ def _pagination_url_validator(source: dict) -> Callable[[str], None]:
     return _validator
 
 
-def _pagination_int(
-    raw: dict[str, Any], name: str, default: int, minimum: int, maximum: int
+def _config_int(
+    raw: dict[str, Any],
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+    *,
+    prefix: str,
 ) -> int:
+    """读一个整数配置项，越界或类型不对时告警并回退默认值。"""
     value = raw.get(name, default)
     if isinstance(value, bool):
-        LOG.warning("pagination.%s 不能是布尔值，回退为 %d", name, default)
+        LOG.warning("%s.%s 不能是布尔值，回退为 %d", prefix, name, default)
         return default
     try:
         parsed = int(value)
     except (TypeError, ValueError):
-        LOG.warning("pagination.%s 不是整数（%r），回退为 %d", name, value, default)
+        LOG.warning("%s.%s 不是整数（%r），回退为 %d", prefix, name, value, default)
         return default
     if parsed < minimum or parsed > maximum:
         LOG.warning(
-            "pagination.%s 超出范围 %d..%d（%r），回退为 %d",
+            "%s.%s 超出范围 %d..%d（%r），回退为 %d",
+            prefix,
             name,
             minimum,
             maximum,
@@ -1378,7 +1611,10 @@ def _pagination_int(
     return parsed
 
 
-def _pagination_bool(raw: dict[str, Any], name: str, default: bool) -> bool:
+def _config_bool(
+    raw: dict[str, Any], name: str, default: bool, *, prefix: str
+) -> bool:
+    """读一个布尔配置项，JSON 里的 "false"/0 字符串不能被 bool() 误判。"""
     value = raw.get(name, default)
     if isinstance(value, bool):
         return value
@@ -1388,8 +1624,20 @@ def _pagination_bool(raw: dict[str, Any], name: str, default: bool) -> bool:
             return True
         if normalized in {"0", "false", "no", "off"}:
             return False
-    LOG.warning("pagination.%s 不是布尔值（%r），回退为 %s", name, value, default)
+    LOG.warning("%s.%s 不是布尔值（%r），回退为 %s", prefix, name, value, default)
     return default
+
+
+def _pagination_int(
+    raw: dict[str, Any], name: str, default: int, minimum: int, maximum: int
+) -> int:
+    return _config_int(
+        raw, name, default, minimum, maximum, prefix="pagination"
+    )
+
+
+def _pagination_bool(raw: dict[str, Any], name: str, default: bool) -> bool:
+    return _config_bool(raw, name, default, prefix="pagination")
 
 
 def _pagination_settings(source: dict) -> dict[str, Any]:
@@ -1610,6 +1858,252 @@ def _find_next_page_url(html: str, page_url: str, source: dict, settings: dict[s
     return ""
 
 
+def _api_page_url(settings: dict[str, Any], page: int) -> str:
+    """接口地址：支持 url 里的 {page} 占位符，其余翻页参数走 payload。"""
+    url = settings["url"]
+    if "{page}" in url:
+        return url.replace("{page}", str(page))
+    return url
+
+
+def _api_request_payload(settings: dict[str, Any], page: int) -> dict[str, Any]:
+    """把页码/页大小合并进 payload，覆盖配置里写死的同名键。"""
+    payload = dict(settings["payload"])
+    if settings["page_param"]:
+        payload[settings["page_param"]] = page
+    if settings["page_size_param"]:
+        payload[settings["page_size_param"]] = settings["page_size"]
+    return payload
+
+
+def _api_item_to_entry(
+    item: Any, settings: dict[str, Any], source: dict, tz_name: str
+) -> dict | None:
+    """把接口里的一条记录转成与 parse_list_items 同构的条目。
+
+    正文在采集阶段就带进 entry（content/raw_content/images），
+    process_entry 见到 entry 自带正文时跳过详情抓取直接入库。
+    """
+    if not isinstance(item, dict):
+        return None
+    title = clean_title(_dig(item, settings["title_field"]))
+    raw_url = str(_dig(item, settings["url_field"]) or "").strip()
+    if not raw_url and settings["url_template"]:
+        item_id = str(_dig(item, settings["id_field"]) or "").strip()
+        # id 为空时 url_template 会退化成 "https://host/detail/" 这种非空串，
+        # 绕过下面的空链接检查，导致整页条目共用一个 URL、去重后只剩第一条。
+        if not item_id and "{id}" in settings["url_template"]:
+            LOG.warning(
+                "站点 %r 的接口条目缺少 id 字段 %r，无法套用 url_template，已跳过：%r",
+                source.get("name"),
+                settings["id_field"],
+                title,
+            )
+            return None
+        raw_url = settings["url_template"].replace("{id}", item_id)
+    if not title and not raw_url:
+        return None
+    if not raw_url:
+        LOG.warning(
+            "站点 %r 的接口条目缺少链接字段 %r，已跳过：%r",
+            source.get("name"),
+            settings["url_field"],
+            title,
+        )
+        return None
+    # 接口常返回 "/p/1.html" 这类相对路径：HTML 路径在 parse_list_items 里
+    # 由 urljoin(base_url, href) 补全，接口路径没有列表页可锚定，改用接口
+    # 自身（或显式 base_url）作基准，否则详情抓取与入库 URL 都是不可访问
+    # 的相对串。
+    # 接口数据里的畸形链接（如 "https://[broken/p"）会让 urlsplit 抛
+    # ValueError：一条坏链接不该中断整次采集——之前页累积的 all_items 会跟着
+    # 一起丢掉，所以按条目跳过并告警。
+    try:
+        url = raw_url if urlsplit(raw_url).scheme else urljoin(
+            settings["base_url"], raw_url
+        )
+    except ValueError:
+        LOG.warning(
+            "站点 %r 的接口条目链接无法解析，已跳过：%r（%r）",
+            source.get("name"),
+            title,
+            raw_url,
+        )
+        return None
+    date_text = clean_text(_dig(item, settings["date_field"]))
+    parsed = parse_datetime(date_text, settings["date_format"], tz_name)
+    if parsed is None:
+        # 接口只给时间、不给日期时（如 "12:00:00"）没有可用发布日期，
+        # 交给 process_entry 按 unknown_date 处理，不在这里猜。
+        parsed = parse_datetime(url, None, tz_name) if not date_text else None
+    entry: dict[str, Any] = {
+        "title": title,
+        "url": url,
+        "date_text": date_text,
+        "parsed": parsed,
+        "deadline_text": "",
+        "deadline": None,
+        "project_status": "",
+        "api_id": str(_dig(item, settings["id_field"]) or ""),
+    }
+    raw_body = _dig(item, settings["content_field"])
+    if raw_body:
+        text, images = (
+            _html_to_text(str(raw_body))
+            if settings["content_is_html"]
+            else (str(raw_body), [])
+        )
+        if text:
+            entry["content"] = clean_text(text)
+            entry["raw_content"] = text
+            entry["images"] = images
+    if settings["author_field"]:
+        entry["author"] = clean_text(_dig(item, settings["author_field"]))
+    return entry
+
+
+def _collect_api_entries(
+    source: dict,
+    settings: dict[str, Any],
+    *,
+    cutoff: dt.datetime | None = None,
+    known_urls: set[str] | None = None,
+) -> dict[str, Any]:
+    """按接口翻页采集条目，返回与 collect_list_entries_detailed 同构的结果。
+
+    翻页终止条件与 HTML 分页保持一致：达到 max_pages、本页没有新条目、
+    整页日期都早于 cutoff（stop_when_older_than_cutoff）、或连续若干页
+    全是已入库链接（stop_after_known_pages）。
+    """
+    from url_extract import fetch_json
+
+    api_validator = _api_url_validator(settings)
+    tz_name = source.get("timezone") or "Asia/Shanghai"
+    is_project = source.get("listing_type") == "project_application"
+    delay = float(source.get("delay", 0) or 0)
+    page_urls: list[str] = []
+    all_items: list[dict] = []
+    seen_urls: set[str] = set()
+    pages = 0
+    known_streak = 0
+    stop_reason = "done"
+    total: int | None = None
+
+    for offset in range(settings["max_pages"]):
+        # 等待放在每轮开头（首轮不睡）：放在末尾的话，因 max_pages 自然
+        # 走完时最后一页抓完还会白等一次 delay。
+        if offset and delay > 0:
+            time.sleep(delay)
+        page = settings["start_page"] + offset
+        page_url = _api_page_url(settings, page)
+        payload = (
+            _api_request_payload(settings, page)
+            if settings["method"] == "POST"
+            else None
+        )
+        try:
+            data = fetch_json(
+                page_url,
+                method=settings["method"],
+                payload=payload,
+                headers=settings["headers"],
+                # 接口型源没有 list_url 可锚定分页白名单，改以配置的 api.url
+                # 为可信目标：重定向到未配置主机一律按公网策略校验，避免
+                # 可信接口被篡改后把爬虫导向内网。
+                url_validator=api_validator,
+            )
+        except Exception as exc:
+            LOG.warning("接口翻页失败（第 %d 页）：%s", page, exc)
+            stop_reason = "fetch_failed"
+            break
+        raw_items = _dig(data, settings["items_path"])
+        if not isinstance(raw_items, list):
+            LOG.warning(
+                "接口返回里 items_path=%r 不是数组，停止翻页",
+                settings["items_path"],
+            )
+            stop_reason = "empty"
+            break
+        if total is None and settings["total_path"]:
+            raw_total = _dig(data, settings["total_path"])
+            try:
+                total = int(raw_total)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                total = None
+        pages += 1
+        page_urls.append(page_url)
+        if not raw_items:
+            stop_reason = "empty"
+            break
+        # page_items 保留本页全部有效条目（含与前面页重复的），早停判断要用
+        # 它的完整视图；fresh_items 才是跨页去重后真正新增的条目。
+        # 只拿去重结果判早停会漏抓：例如第 2 页是「重复的 A + 已入库的 B」，
+        # 去重后只剩 B，stop_after_known_pages=1 会误判整页已入库而停止，
+        # 后面的页再也走不到；整页日期都早于窗口的判断同样会被去重削弱。
+        page_items: list[dict] = []
+        fresh_items: list[dict] = []
+        for item in raw_items:
+            entry = _api_item_to_entry(item, settings, source, tz_name)
+            if entry is None:
+                continue
+            page_items.append(entry)
+            if entry["url"] in seen_urls:
+                continue
+            seen_urls.add(entry["url"])
+            fresh_items.append(entry)
+        if not page_items or not fresh_items:
+            stop_reason = "empty"
+            break
+        all_items.extend(fresh_items)
+
+        parsed_dates = [item["parsed"] for item in page_items if item.get("parsed")]
+        # 与 HTML 分页同一口径：项目申报页的日期是公告发布日期，整页都在
+        # 窗口之前不代表后面没有仍在受理的项目，禁止据此早停。
+        if (
+            not is_project
+            and cutoff is not None
+            and settings["stop_when_older_than_cutoff"]
+            and len(parsed_dates) == len(page_items)
+            and max(parsed_dates) < cutoff
+        ):
+            stop_reason = "cutoff"
+            break
+
+        if known_urls is not None and settings["stop_after_known_pages"] > 0:
+            page_known = all(item["url"] in known_urls for item in page_items)
+            known_streak = known_streak + 1 if page_known else 0
+            if known_streak >= settings["stop_after_known_pages"]:
+                stop_reason = "known_pages"
+                break
+
+        if total is not None and page * settings["page_size"] >= total:
+            stop_reason = "done"
+            break
+        if len(raw_items) < settings["page_size"]:
+            # 不足一页即最后一页，省掉一次必然为空的请求。
+            stop_reason = "done"
+            break
+    else:
+        # for 正常走完（没被任何 break 打断）说明是 max_pages 把抓取截断的：
+        # 否则 stop_reason 会停在初值 "done"，运维会误以为数据已经取全。
+        stop_reason = "max_pages"
+
+    LOG.info(
+        "[%s] 接口采集 %d 页（停止原因：%s），解析 %d 条%s",
+        source.get("name"),
+        pages,
+        stop_reason,
+        len(all_items),
+        f"，接口报告总数 {total}" if total is not None else "",
+    )
+    return {
+        "items": all_items,
+        "pages": pages,
+        "page_urls": page_urls,
+        "stop_reason": stop_reason,
+    }
+
+
 def collect_list_entries_detailed(
     source: dict,
     *,
@@ -1623,7 +2117,15 @@ def collect_list_entries_detailed(
     - template: 抓 list_url 后按 url_template 生成后续页；
     - next: 按 next_url_xpath 或“下一页”链接跟随；
     - auto: 有 url_template 时按模板，否则按下一页链接。
+
+    接口型源（source["api"] 已由 load_config 归一）完全不走 HTML 分页，
+    条目与正文都来自后端 JSON 接口。
     """
+    api_settings = _api_settings(source)
+    if api_settings is not None:
+        return _collect_api_entries(
+            source, api_settings, cutoff=cutoff, known_urls=known_urls
+        )
     settings = _pagination_settings(source)
     fixed_urls = [str(url) for url in (source.get("list_urls") or [source["list_url"]])]
     fixed_mode = settings["mode"] == "none" or bool(source.get("list_urls"))
@@ -2448,43 +2950,62 @@ def process_entry(
         )
         return "old"
 
-    # 详情页请求同样遵守站点 delay，否则单站点内会连续无间隔请求，
-    # 实测 3 篇文章之间的间隔只有 0.13s（配置 0.5s 未生效）。
-    if delay > 0:
-        time.sleep(delay)
-    fetched = fetch_article_html(url)
-    if not fetched:
-        save_article(
-            conn,
-            source_name,
-            url,
-            list_title=entry.get("title", ""),
-            list_publish_time=list_publish_text,
-            status="error",
-            error="抓取 HTML 失败（直接抓取和浏览器回退均失败）",
-        )
-        return "error"
-    html, already_rendered = fetched
+    # 直接构造 entry 的调用方可能只填 content（没有换行版），两者都认。
+    inline_body = str(entry.get("raw_content") or entry.get("content") or "").strip()
+    result: dict[str, Any] | None
+    if inline_body:
+        # 接口型源的正文随条目一起返回：不再请求详情页，也不跑 GNE
+        # （详情页往往就是同一个 SPA，抓下来同样没有正文）。
+        result = {
+            "content": inline_body,
+            "publish_time": "",
+            "publish_time_source": "",
+            # 标题来自接口字段而不是 GNE/XPath：单独标记，便于下游区分
+            # 「详情页抽取的标题」与「接口列表给的标题」。
+            "title_source": "api_field",
+            "author": entry.get("author", ""),
+            "images": list(entry.get("images") or []),
+        }
+        if entry.get("title"):
+            result["title"] = entry["title"]
+    else:
+        # 详情页请求同样遵守站点 delay，否则单站点内会连续无间隔请求，
+        # 实测 3 篇文章之间的间隔只有 0.13s（配置 0.5s 未生效）。
+        if delay > 0:
+            time.sleep(delay)
+        fetched = fetch_article_html(url)
+        if not fetched:
+            save_article(
+                conn,
+                source_name,
+                url,
+                list_title=entry.get("title", ""),
+                list_publish_time=list_publish_text,
+                status="error",
+                error="抓取 HTML 失败（直接抓取和浏览器回退均失败）",
+            )
+            return "error"
+        html, already_rendered = fetched
 
-    result = extract_article(
-        html,
-        url,
-        already_rendered=already_rendered,
-        title_xpath=source.get("article_title_xpath") or "",
-        publish_time_xpath=source.get("article_publish_time_xpath") or "",
-        body_xpath=source.get("article_body_xpath") or "",
-    )
-    if result is None:
-        save_article(
-            conn,
-            source_name,
+        result = extract_article(
+            html,
             url,
-            list_title=entry.get("title", ""),
-            list_publish_time=list_publish_text,
-            status="no_content",
-            error="无法提取正文",
+            already_rendered=already_rendered,
+            title_xpath=source.get("article_title_xpath") or "",
+            publish_time_xpath=source.get("article_publish_time_xpath") or "",
+            body_xpath=source.get("article_body_xpath") or "",
         )
-        return "no_content"
+        if result is None:
+            save_article(
+                conn,
+                source_name,
+                url,
+                list_title=entry.get("title", ""),
+                list_publish_time=list_publish_text,
+                status="no_content",
+                error="无法提取正文",
+            )
+            return "no_content"
 
     # GNE 的 content 本身保留段落换行，clean_text 会把它们压成空格。
     # content 继续存归一化文本（搜索/摘要/既有下游语义不变），
@@ -2505,7 +3026,7 @@ def process_entry(
     raw_publish_source = str(result.get("publish_time_source") or "")
     publish_source = publish_source_for(raw_publish_source)
     title_source = str(result.get("title_source") or "gne_default")
-    if title_source not in ("article_title_xpath", "gne_default"):
+    if title_source not in ("article_title_xpath", "api_field", "gne_default"):
         title_source = "gne_default"
     # 无年份的“09月30日 09:30”先按列表日期补年份，再比较偏差：
     # 否则 parse_datetime 用当前年生成 2026-09-30，与 2025-09-30 的列表
@@ -2641,7 +3162,13 @@ def run_source(
         conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
         known_urls: set[str] | None = None
         pagination = _pagination_settings(source)
-        if not force and pagination["mode"] != "none" and not source.get("list_urls"):
+        api_settings = source.get("api")
+        wants_known_urls = (
+            api_settings.get("stop_after_known_pages", 0) > 0
+            if isinstance(api_settings, dict)
+            else pagination["mode"] != "none" and not source.get("list_urls")
+        )
+        if not force and wants_known_urls:
             known_urls = {
                 str(row[0])
                 for row in conn.execute(
