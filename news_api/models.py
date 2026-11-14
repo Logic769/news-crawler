@@ -97,6 +97,8 @@ class ArticleOut(BaseModel):
     content: str | None = None
     # 保留段落换行的原始正文：只在详情返回，列表接口（include_content=false）为 null。
     raw_content: str | None = None
+    # 清洗后的正文 HTML（白名单标签/属性）：只在详情返回，前端据此渲染富文本。
+    body_html: str | None = None
     content_length: int = 0
     images: list[str] = Field(default_factory=list)
     status: str

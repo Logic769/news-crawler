@@ -53,7 +53,7 @@ DEFAULT_DB_FILE = "news.db"
 # 锁等待时长与 sqlite3.connect(timeout=...) 保持一致，避免 PRAGMA 把
 # 30s 的连接超时悄悄压成 5s（并发写时更早报 database is locked）。
 DB_BUSY_TIMEOUT_MS = 30000
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS articles (
@@ -83,6 +83,8 @@ CREATE TABLE IF NOT EXISTS articles (
     content      TEXT,
     content_length INTEGER,
     raw_content  TEXT,
+    -- 清洗后的正文 HTML（白名单标签/属性），供前端富文本渲染；历史行补列后为 NULL。
+    body_html    TEXT,
     images       TEXT,
     status       TEXT NOT NULL,
     error        TEXT,
@@ -726,6 +728,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             "article_id",
             "timezone",
             "raw_content",
+            "body_html",
             "content_length",
             "publish_time_utc",
             "publish_time_source",
@@ -761,6 +764,9 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     for column in ("deadline", "deadline_raw", "project_status"):
         if column not in columns:
             conn.execute(f"ALTER TABLE articles ADD COLUMN {column} TEXT")
+    # v9：正文 HTML 富文本。只补列，历史行不回填（原文已不可得）。
+    if "body_html" not in columns:
+        conn.execute("ALTER TABLE articles ADD COLUMN body_html TEXT")
 
     # 分批回填，避免大库一次性 fetchall 占满内存；仍在同一事务内，保证
     # article_id 全部回填后才会置位 user_version。用 rowid 键集分页而不是
@@ -2317,6 +2323,7 @@ def save_article(
     author: str = "",
     content: str = "",
     raw_content: str = "",
+    body_html: str = "",
     images: list[str] | None = None,
     status: str,
     error: str = "",
@@ -2347,9 +2354,9 @@ def save_article(
             publish_time_utc, publish_time_source, publish_time_raw,
             list_publish_time, title_source, deadline, deadline_raw,
             project_status, timezone, author, content,
-            content_length, raw_content, images, status, error,
+            content_length, raw_content, body_html, images, status, error,
             first_seen_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source, url) DO UPDATE SET
             article_id = excluded.article_id,
             list_title = COALESCE(NULLIF(excluded.list_title, ''), articles.list_title),
@@ -2389,6 +2396,7 @@ def save_article(
             content_length = CASE WHEN excluded.content <> ''
                 THEN length(excluded.content) ELSE articles.content_length END,
             raw_content = COALESCE(NULLIF(excluded.raw_content, ''), articles.raw_content),
+            body_html = COALESCE(NULLIF(excluded.body_html, ''), articles.body_html),
             images = CASE WHEN excluded.images IS NULL
                 THEN articles.images ELSE excluded.images END,
             status = excluded.status,
@@ -2415,6 +2423,7 @@ def save_article(
             content,
             len(content),
             raw_content,
+            body_html,
             images_json,
             status,
             error,
@@ -2901,6 +2910,7 @@ def _process_project_entry(
         "ok",
         content=clean_text(raw_content),
         raw_content=raw_content,
+        body_html=str(result.get("body_html") or ""),
         images=normalize_images_for_update(result.get("images"), url),
     )
 
@@ -3109,6 +3119,7 @@ def process_entry(
             title_source=title_source,
             content=clean_text(raw_content),
             raw_content=raw_content,
+            body_html=str(result.get("body_html") or ""),
             images=normalize_images_for_update(result.get("images"), url),
             status="unknown_date",
             error="无法解析发布日期",
@@ -3130,6 +3141,7 @@ def process_entry(
         author=clean_text(result.get("author")),
         content=clean_text(raw_content),
         raw_content=raw_content,
+        body_html=str(result.get("body_html") or ""),
         images=normalize_images_for_update(result.get("images"), url),
         status="ok",
     )

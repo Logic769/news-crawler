@@ -162,6 +162,9 @@ def row_to_article(
         "raw_content": (row["raw_content"] or "")
         if include_content and "raw_content" in keys
         else None,
+        "body_html": (row["body_html"] or "")
+        if include_content and "body_html" in keys
+        else None,
         "content_length": content_length,
         # 历史行可能存着 //cdn/x.jpg 这类协议相对地址（v1.1.1 之前写入的），
         # 读取时按文章 URL 归一化，保证 /v1 对外始终是可直接使用的绝对地址。
@@ -316,7 +319,7 @@ def get_article(
             "SELECT article_id, source, url, list_title, title, publish_time, "
             "timezone, publish_time_source, publish_time_raw, list_publish_time, "
             "title_source, deadline, deadline_raw, project_status, "
-            "author, content, content_length, raw_content, images, "
+            "author, content, content_length, raw_content, body_html, images, "
             "status, error, first_seen_at, updated_at "
             "FROM articles WHERE article_id = ?",
             (article_id,),
