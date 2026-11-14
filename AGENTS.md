@@ -76,7 +76,8 @@ news-crawler/
 ├── backfill_body_html.py           # 回填历史行的 body_html（v9 新增，只写清洗后的正文 HTML）
 ├── html_sanitize.py                # 正文 HTML 白名单清洗（脚本/事件属性/可执行 URL 过滤）
 ├── api.py                          # FastAPI 入口（uvicorn api:app）
-├── news_api/                       # API 应用：设置、模型、查询、作业队列
+├── news_api/                       # API 应用：设置、模型、查询、作业队列、站点配置存储
+│   └── config_store.py             # sources.local.json 的受控读写（写前备份、保留未知键、过滤敏感头）
 ├── api_smoke.py                    # API 冒烟测试（本地 HTTP + 临时数据库）
 ├── verify_live_news.py             # 实时新闻抓取验证（默认抽取 10 静态 / 10 JS / 10 视频）
 ├── live_news_pool.json             # 实时验证页面池（100 静态 / 50 JS / 50 视频）
@@ -219,12 +220,13 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | GET | `/v1/articles` | 分页查询文章，默认 `status=ok` 且不含正文 |
 | GET | `/v1/articles/{article_id}` | 文章详情，始终含正文 |
 | GET | `/v1/sources` | 来源统计 |
+| GET/POST/PUT/DELETE | `/v1/admin/sites` | 站点配置 CRUD：写前备份到 `NEWS_BACKUP_DIR`；接口型源只能改分类/地区/时区/渲染/启停等非接口字段 |
 | GET | `/v1/stats` | 全局统计 |
 | POST | `/v1/jobs` | 提交 `crawl` 或 `extract` 异步作业，返回 202 |
 | GET | `/v1/jobs`、`/v1/jobs/{id}` | 作业列表与状态 |
 | GET | `/v1/health` | 健康检查（无需鉴权） |
 
-列表参数：`status`、`source`、`published_from`、`published_to`、`deadline_from`、`deadline_to`、`q`、`page`、`page_size`、`order`（`published_desc`/`published_asc`/`updated_desc`/`deadline_desc`/`deadline_asc`）、`include_content`（为 `true` 时列表返回 `content`；`raw_content` 无论何时都只在详情返回）。项目申报行 `publish_time` 为空，使用 `published_from`/`published_to` 会被排除，应按 `deadline` 过滤（`deadline` 为站点墙钟，`deadline_*` 带时区偏移时只取墙钟部分、不做换算；`deadline_*` 与 `published_*` 同时传会 AND 成空集）。文章列表与作业列表返回 `{"data": [...], "meta": {...}}`；文章详情、统计、健康检查返回对应对象；`/v1/sources` 返回 `{"data": [...]}`。
+列表参数：`status`、`source`、`published_from`、`published_to`、`deadline_from`、`deadline_to`、`q`、`page`、`page_size`、`order`（`published_desc`/`published_asc`/`updated_desc`/`deadline_desc`/`deadline_asc`）、`include_content`（为 `true` 时列表返回 `content`；`raw_content` 无论何时都只在详情返回）。项目申报行 `publish_time` 为空，使用 `published_from`/`published_to` 会被排除，应按 `deadline` 过滤（`deadline` 为站点墙钟，`deadline_*` 带时区偏移时只取墙钟部分、不做换算；`deadline_*` 与 `published_*` 同时传会 AND 成空集）。文章列表与作业列表返回 `{"data": [...], "meta": {...}}`；文章详情、统计、健康检查返回对应对象；`/v1/sources` 返回 `{"data": [...]}`。`/v1/admin/sites` 写入前会把原 `sources.local.json` 备份到 `NEWS_BACKUP_DIR`（compose 默认 `/app/backups`），并保留未识别的扩展键；接口型源的 `api`、`pagination` 等字段不在管理接口可改范围内。
 
 设置 `NEWS_API_KEY` 后，除 `/v1/health` 与文档外都需 `X-API-Key` 或 `Authorization: Bearer <key>`。作业状态为 `queued`/`running`/`succeeded`/`failed`，单进程执行，避免 SQLite 并发写冲突。排队 + 运行中的作业上限为 `NEWS_MAX_PENDING_JOBS`（默认 50），超出返回 `429`；相同类型与参数的未完成作业复用同一 ID。`extract` 默认拒绝回环、内网与保留地址（`NEWS_ALLOW_PRIVATE_URLS=1` 可放开）；`fetch_html` 通过自定义 `HTTPRedirectHandler` 对每个重定向目标复用同一校验，默认还以 `allow_browser=False` 禁用浏览器回退（`NEWS_EXTRACT_ALLOW_BROWSER=1` 可放开），避免页面 JS 绕过地址限制。上述限制仍不能替代 API Key。已完成作业保留 30 天后自动清理。未设置 `NEWS_API_KEY` 时默认开放（仅提示 warning）；设置 `NEWS_REQUIRE_AUTH=1` 后行为是"未配置 key 则业务请求一律 401，已配置 key 时按 key 校验"（401 带 `WWW-Authenticate`，`/v1/health`、`/docs`、openapi 与根路径始终开放）。错误响应统一为 `{"error": {"code", "status": <HTTP 码>, "message", "details"?}}`，参数校验错误为 422 且带 `details`。`docker compose` 通过白名单透传 API 变量，需在 `.env` 或 shell 中设置后生效。
 
@@ -259,6 +261,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `name` | 是 | 站点唯一标识，同时作为数据库 `source` 字段 |
+| `enabled` | 否 | 默认 `true`；`load_config` 会过滤 `enabled=false` 的源，便于临时停用 |
 | `list_url` | 二选一 | 列表页地址 |
 | `list_urls` | 二选一 | 多个固定列表页地址（旧版分页方式；单 `list_url` 站点优先用 `pagination`） |
 | `item_xpath` | 是 | 每条新闻节点的 XPath |
@@ -542,7 +545,7 @@ docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content
 
 ### 回填 body_html（历史行）
 
-v9 之前入库的文章没有 `body_html`（详情页渲染用的清洗后正文 HTML）。`backfill_body_html.py` 只重抓这些行、只写 `body_html`，不改变 `content`/`raw_content`/`status`/`updated_at`；失败行原样保留，可重复运行。清洗规则见 `html_sanitize.py`：白名单标签/属性，去掉脚本、事件属性与可执行 URL。抽取器修复后重刷已有行用 `--overwrite`（默认只补空行）。
+v9 之前入库的文章没有 `body_html`（详情页渲染用的清洗后正文 HTML）。`backfill_body_html.py` 只重抓这些行、只写 `body_html`，不改变 `content`/`raw_content`/`status`/`updated_at`；失败行原样保留，可重复运行。清洗规则见 `html_sanitize.py`：白名单标签/属性，去掉脚本、事件属性与可执行 URL。抽取器修复后重刷已有行用 `--overwrite`（默认只补空行）；接口型源拿不到原始 HTML 时用 `--from-raw` 从 `raw_content` 派生安全 HTML。
 
 ```bash
 # 先看候选数

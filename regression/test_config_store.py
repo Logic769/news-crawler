@@ -40,6 +40,23 @@ class ConfigStoreTest(unittest.TestCase):
         self.env.stop()
         self.temp.cleanup()
 
+    def test_load_config_skips_disabled_sources(self) -> None:
+        """管理台停用后，抓取器加载配置时不能再把该站点带进队列。"""
+        import news_crawler
+
+        data = json.loads(json.dumps(BASE))
+        data["sources"][0]["enabled"] = False
+        data["sources"].append(
+            {
+                "name": "active",
+                "list_url": "https://example.com/active",
+                "item_xpath": "//li",
+            }
+        )
+        self.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        config = news_crawler.load_config(str(self.path))
+        self.assertEqual([site["name"] for site in config["sources"]], ["active"])
+
     def test_public_view_never_leaks_api_headers(self) -> None:
         sites = config_store.list_sites(self.path)
         self.assertEqual(len(sites), 1)

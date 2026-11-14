@@ -193,6 +193,7 @@ curl http://localhost:8000/v1/health
 | `NEWS_MAX_PENDING_JOBS` | `50` | 排队 + 运行中的作业上限，超出返回 `429`；相同类型与参数的未完成作业会复用 |
 | `NEWS_REQUIRE_AUTH` | 空（关闭） | 设为 `1` 时要求必须配置 `NEWS_API_KEY`，否则业务接口一律返回 `401` |
 | `NEWS_INSECURE_SSL` | 空（关闭） | 设为 `1`/`true`/`yes`/`on` 时，证书校验失败会打印 WARNING 并降级为不校验重试；默认直接抛错，避免中间人攻击 |
+| `NEWS_BACKUP_DIR` | `/app/backups`（compose） | 站点配置写入前的 JSON 备份目录；每次 `/v1/admin/sites` 变更都会在此保留一份 `sources_local_<时间戳>.json` |
 
 > 安全提示：未设置 `NEWS_API_KEY` 时接口完全开放。compose 默认只监听 `127.0.0.1`；如需局域网访问，请同时设置强随机 `NEWS_API_KEY` 再改 `NEWS_API_BIND=0.0.0.0`。`extract` 默认拒绝回环、内网与保留地址，并在每次 HTTP 重定向时重新校验目标；默认还禁用浏览器回退，避免通过页面 JS 绕过地址限制。确需抓取内网新闻时设置 `NEWS_ALLOW_PRIVATE_URLS=1`；确需浏览器渲染时再加 `NEWS_EXTRACT_ALLOW_BROWSER=1`。
 >
@@ -216,6 +217,7 @@ curl -H "X-API-Key: change-me" http://localhost:8000/v1/articles
 | GET | `/v1/articles` | 分页查询文章列表 |
 | GET | `/v1/articles/{id}` | 文章详情（始终包含正文） |
 | GET | `/v1/sources` | 按站点聚合的统计 |
+| GET/POST/PUT/DELETE | `/v1/admin/sites` | 管理站点配置：列表、新增、按 `name` 更新、删除；写入前自动备份到 `NEWS_BACKUP_DIR`。接口型源（`api` 配置）只能在原配置上修改分类/地区/时区/渲染/启停等非接口字段，抓取地址与 XPath 由接口配置维护 |
 | GET | `/v1/stats` | 全库统计 |
 | POST | `/v1/jobs` | 创建异步任务（`crawl` 或 `extract`） |
 | GET | `/v1/jobs` | 任务列表 |
@@ -268,7 +270,7 @@ curl "http://localhost:8000/v1/articles?status=all&page_size=50"
 | `timezone` | 该文章写入时使用的站点时区（落库保存，站点配置变化不影响历史数据；`unknown_date` 等没有发布时间的结果不会写入该列，API extract 路径同样如此） |
 | `content` / `content_length` | 正文与字数（已归一化为单行；列表默认不返回，详情始终返回） |
 | `raw_content` | GNE 原始正文，保留段落换行；只在 `GET /v1/articles/{id}` 详情返回，列表（含 `include_content=true`）为 `null`；v4 之前入库的历史行为空，需 `--force` 重抓，或用 `backfill_raw_content.py` 回填（先 `--dry-run` 看候选数，再 `--limit 50` 小批试跑；容器内必须显式传 `--db /app/data/news.db`，命令见 AGENTS.md §8） |
-| `body_html` | 清洗后的正文 HTML（v9 新增，供下游详情页渲染）：白名单标签/属性，去掉脚本、事件属性与可执行 URL；与 `raw_content` 一样只在详情接口返回，列表默认不返回；历史行可用 `backfill_body_html.py` 回填（只写 `body_html`，不改 `content`/`raw_content`/`status`/`updated_at`，可重复运行；修复抽取器后重刷已有行用 `--overwrite`） |
+| `body_html` | 清洗后的正文 HTML（v9 新增，供下游详情页渲染）：白名单标签/属性，去掉脚本、事件属性与可执行 URL；与 `raw_content` 一样只在详情接口返回，列表默认不返回；历史行可用 `backfill_body_html.py` 回填（只写 `body_html`，不改 `content`/`raw_content`/`status`/`updated_at`，可重复运行；修复抽取器后重刷已有行用 `--overwrite`；接口型源拿不到原始 HTML 时用 `--from-raw` 从 `raw_content` 派生安全 HTML） |
 | `images` | 图片 URL 数组 |
 | `status` / `error` | 抓取状态与错误信息 |
 
@@ -391,6 +393,7 @@ cp sources.json sources.local.json
 | 字段 | 是否必填 | 说明 |
 | --- | --- | --- |
 | `name` | 必填 | 站点唯一标识，例如 `ncu_news` |
+| `enabled` | 可选 | 默认 `true`；设为 `false` 时 `load_config` 会在抓取前过滤掉该源，便于临时停用而不删配置 |
 | `list_url` | 二选一 | 新闻列表页地址 |
 | `list_urls` | 二选一 | 多个固定列表页地址组成的数组（旧版分页方式；单 `list_url` 站点请优先用 `pagination`） |
 | `item_xpath` | 必填 | 定位每条新闻节点的 XPath |
