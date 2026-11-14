@@ -14,6 +14,7 @@ GNE 的 body_html 是原文正文容器的序列化结果，含站点自带的 c
 
 from __future__ import annotations
 
+import html as html_lib
 import re
 from urllib.parse import urljoin, urlsplit
 
@@ -134,7 +135,10 @@ def sanitize_body_html(raw_html: str | None, base_url: str = "") -> str:
 
     parts: list[str] = []
     if container.text and container.text.strip():
-        parts.append(container.text)
+        # container.text 是「未被解析成子元素的纯文本」。它可能来自原文实体编码
+        # （例如码示例里的 &lt;script&gt;），必须转义后再拼回 HTML，否则这里会成为
+        # 绕过 _clean_element 的唯一注入口。
+        parts.append(html_lib.escape(container.text, quote=False))
     for child in container:
         parts.append(etree.tostring(child, encoding="unicode", method="html"))
     cleaned = "".join(parts).strip()

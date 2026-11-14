@@ -73,6 +73,7 @@ news-crawler/
 ├── smoke_test.py                   # 部署后的离线冒烟测试
 ├── smoke_fixture.py                # 冒烟测试共用的内置新闻页（镜像内没有 tests/ 时的回退样本）
 ├── backfill_raw_content.py         # 回填历史行的 raw_content（重抓 URL，只写换行正文，不动 content）
+├── backfill_body_html.py           # 回填历史行的 body_html（v9 新增，只写清洗后的正文 HTML）
 ├── api.py                          # FastAPI 入口（uvicorn api:app）
 ├── news_api/                       # API 应用：设置、模型、查询、作业队列
 ├── api_smoke.py                    # API 冒烟测试（本地 HTTP + 临时数据库）
@@ -416,6 +417,7 @@ CREATE TABLE IF NOT EXISTS articles (
     content       TEXT,            -- 正文纯文本（clean_text 归一化，段落换行被压成空格）
     content_length INTEGER,        -- 正文长度缓存；列表接口避免读整段正文 blob
     raw_content   TEXT,            -- GNE 原始正文，保留段落换行；仅展示/导出用
+    body_html     TEXT,            -- v9 新增：清洗后的正文 HTML（白名单标签/属性），供下游详情页渲染
     images        TEXT,            -- JSON 数组字符串；NULL 表示本次未提供（保留旧值），[] 表示明确无图（清空）
     status        TEXT NOT NULL,   -- ok/old/no_content/unknown_date/error
     error         TEXT,
@@ -439,7 +441,7 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 
 索引：`source`、`status`、`publish_time`、`article_id`（唯一），以及五条查询性能覆盖索引：`(status, publish_time DESC, source, url)`、`(status, updated_at DESC, source, url)` 供列表分页、`(source, publish_time DESC, updated_at DESC, timezone, status)` 供 `/v1/sources` 聚合、`publish_time_utc` 供真实时刻过滤、`deadline` 供项目申报截止时间过滤/排序；`crawl_jobs` 的 `status`、`created_at`、`(type, payload, status)` 去重索引。
 
-旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 8`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、`timezone`、v4 的 `raw_content`（只补列，原文已不可得，历史行不回填）、v5 的 `content_length`（补列后按 `length(content)` 回填 NULL 行）、v6 的 `publish_time_utc`（补列后按每行 `timezone` 换算 UTC 回填，供混时区按真实时刻过滤）、v7 的 `publish_time_source`/`publish_time_raw`/`list_publish_time`/`title_source`（只补列，历史行为 NULL）与 v8 的 `deadline`/`deadline_raw`/`project_status`（只补列，新闻站点为 NULL），按 rowid 键集分页（每批 2000 行）回填 `article_id`，不边读游标边 UPDATE 同表；再补建唯一索引、去重索引与五条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这些，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外）。迁移早退条件校验十二列齐全且 `required_indexes`（五条性能索引 + `idx_articles_article_id` + `idx_crawl_jobs_dedupe`）齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
+旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 9`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、`timezone`、v4 的 `raw_content`（只补列，原文已不可得，历史行不回填）、v5 的 `content_length`（补列后按 `length(content)` 回填 NULL 行）、v6 的 `publish_time_utc`（补列后按每行 `timezone` 换算 UTC 回填，供混时区按真实时刻过滤）、v7 的 `publish_time_source`/`publish_time_raw`/`list_publish_time`/`title_source`（只补列，历史行为 NULL）、v8 的 `deadline`/`deadline_raw`/`project_status`（只补列，新闻站点为 NULL）与 v9 的 `body_html`（只补列，历史行用 `backfill_body_html.py` 回填），按 rowid 键集分页（每批 2000 行）回填 `article_id`，不边读游标边 UPDATE 同表；再补建唯一索引、去重索引与五条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这些，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外）。迁移早退条件校验十二列齐全且 `required_indexes`（五条性能索引 + `idx_articles_article_id` + `idx_crawl_jobs_dedupe`）齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
 
 ### 7.2 status 语义
 
@@ -536,6 +538,17 @@ docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content
 - `--config` 指定站点配置路径（默认 `sources.json`，存在 `sources.local.json` 时由 `resolve_config_path` 优先取它）。回填会按站点名读取 `article_body_xpath` 并透传给 GNE，否则正文容器被页面长文本块带偏的站点会把诱饵写进 `raw_content`，与同一行的 `content` 不一致；`--dry-run` 不读配置；一个都没读到时打印提示（常见于未挂载 `sources.local.json`、只读到镜像内空模板）。
 
 脚本的 `--db` 默认值取自 `news_crawler.DEFAULT_DB_FILE`（相对路径 `news.db`），容器内必须显式传 `/app/data/news.db`，否则会指向 `/app/news.db`。
+
+### 回填 body_html（历史行）
+
+v9 之前入库的文章没有 `body_html`（详情页渲染用的清洗后正文 HTML）。`backfill_body_html.py` 只重抓这些行、只写 `body_html`，不改变 `content`/`raw_content`/`status`/`updated_at`；失败行原样保留，可重复运行。清洗规则见 `html_sanitize.py`：白名单标签/属性，去掉脚本、事件属性与可执行 URL。
+
+```bash
+# 先看候选数
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_body_html.py --db /app/data/news.db --dry-run
+# 小批回填
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_body_html.py --db /app/data/news.db --limit 50
+```
 
 ### 启动 HTTP API
 

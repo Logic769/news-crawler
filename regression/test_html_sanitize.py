@@ -47,6 +47,16 @@ class SanitizeBodyHtmlTest(unittest.TestCase):
         cleaned = sanitize_body_html("<center><font color=red>保留文字</font></center>")
         self.assertEqual(cleaned, "保留文字")
 
+    def test_container_text_entities_are_escaped(self) -> None:
+        # 首个子节点被删掉后，容器的纯文本会直接拼回输出；实体编码的脚本
+        # 不能在这里变回可执行标签（GNE 正常输出顶层是元素，但这是防御边界）。
+        cleaned = sanitize_body_html(
+            "&lt;script&gt;alert(1)&lt;/script&gt;<p>正文</p>"
+        )
+        self.assertNotIn("<script", cleaned)
+        self.assertIn("&lt;script&gt;", cleaned)
+        self.assertIn("<p>正文</p>", cleaned)
+
     def test_comments_are_removed(self) -> None:
         cleaned = sanitize_body_html("<p>正文</p><!--[if IE]><script>x</script><![endif]-->")
         self.assertEqual(cleaned, "<p>正文</p>")
