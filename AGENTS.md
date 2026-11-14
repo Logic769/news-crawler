@@ -74,6 +74,7 @@ news-crawler/
 ├── smoke_fixture.py                # 冒烟测试共用的内置新闻页（镜像内没有 tests/ 时的回退样本）
 ├── backfill_raw_content.py         # 回填历史行的 raw_content（重抓 URL，只写换行正文，不动 content）
 ├── backfill_body_html.py           # 回填历史行的 body_html（v9 新增，只写清洗后的正文 HTML）
+├── html_sanitize.py                # 正文 HTML 白名单清洗（脚本/事件属性/可执行 URL 过滤）
 ├── api.py                          # FastAPI 入口（uvicorn api:app）
 ├── news_api/                       # API 应用：设置、模型、查询、作业队列
 ├── api_smoke.py                    # API 冒烟测试（本地 HTTP + 临时数据库）
@@ -541,13 +542,15 @@ docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content
 
 ### 回填 body_html（历史行）
 
-v9 之前入库的文章没有 `body_html`（详情页渲染用的清洗后正文 HTML）。`backfill_body_html.py` 只重抓这些行、只写 `body_html`，不改变 `content`/`raw_content`/`status`/`updated_at`；失败行原样保留，可重复运行。清洗规则见 `html_sanitize.py`：白名单标签/属性，去掉脚本、事件属性与可执行 URL。
+v9 之前入库的文章没有 `body_html`（详情页渲染用的清洗后正文 HTML）。`backfill_body_html.py` 只重抓这些行、只写 `body_html`，不改变 `content`/`raw_content`/`status`/`updated_at`；失败行原样保留，可重复运行。清洗规则见 `html_sanitize.py`：白名单标签/属性，去掉脚本、事件属性与可执行 URL。抽取器修复后重刷已有行用 `--overwrite`（默认只补空行）。
 
 ```bash
 # 先看候选数
 docker compose run --rm --entrypoint python crawler -X utf8 backfill_body_html.py --db /app/data/news.db --dry-run
 # 小批回填
 docker compose run --rm --entrypoint python crawler -X utf8 backfill_body_html.py --db /app/data/news.db --limit 50
+# 修复抽取器后重刷已有行（默认只补空行）
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_body_html.py --db /app/data/news.db --overwrite
 ```
 
 ### 启动 HTTP API
@@ -599,7 +602,7 @@ curl http://localhost:8000/v1/health
 - `smoke_test.py`：部署自检，验证导入、日期解析、GNE 抽取、SQLite 初始化、视频页判定、图片地址补全、浏览器回退状态码白名单、性能索引是否建齐、`raw_content` 落库与「本次未传不覆盖」、`old` 在窗口放宽后是否重抓；样本缺失时回退到 `smoke_fixture.py` 的内置新闻页（与 `api_smoke.py` 共用）；
 - `api_smoke.py`：启动临时 uvicorn + 临时 SQLite，验证鉴权、查询、详情（含 `raw_content` 换行）、统计、异步作业全链路，以及入库图片必须为绝对 URL；
 - `verify_live_news.py` + `live_news_pool.json`：从 100 静态 / 50 JS 渲染 / 50 视频的页面池中随机抽取（默认 10/10/10）访问公开新闻站点，验证三条抽取路径；视频池要求覆盖 ≥10 个来源站点；
-- `regression/`：62 篇样本的离线抽取基线（含 `meta_keys`/`meta_sha1`/`is_video`），外加列表页解析、视频页判定与回填脚本三组独立用例；
+- `regression/`：62 篇样本的离线抽取基线（含 `meta_keys`/`meta_sha1`/`is_video`），外加列表页解析、视频页判定、正文 HTML 清洗/回填等独立用例；
 
 ### 实时新闻池维护
 
@@ -633,6 +636,9 @@ curl http://localhost:8000/v1/health
 | `regression/test_list_page.py` | 7 个用例：列表页解析的条目定位、feature 缺失、少于 4 条时不回退、`count()`/`number()`/`boolean()` 等标量 XPath 在 `xpath_text`/`xpath_href` 中返回空而不崩溃 |
 | `regression/test_video_detection.py` | 7 个用例：路径规则、`og:type`、JSON-LD `VideoObject`、文章内嵌视频不误判 |
 | `regression/test_backfill.py` | 15 个用例：候选 skip/limit（含真实 SQLite）、LIMIT 下推与游标提前停止、游标异常关闭、失败清单列清洗、BOM 跳过清单、`--skip-file` 条目在下次失败清单中保留、`--failed-list` 指向数据库/目录/硬链接/符号链接/未创建的 WAL·SHM 侧车路径时抓取前返回 2、正常清单文件不误杀 |
+| `regression/test_backfill_body_html.py` | 7 个用例：只选空 body_html 与可回填状态、source/limit、`--overwrite` 覆盖已有 HTML、写入不改 content/raw_content、默认守卫保留已有 HTML、空 HTML 记失败 |
+| `regression/test_body_html.py` | 1 个用例：GNE `with_body_html=True` 保留正文里的实体文本，不把 `&lt;div&gt;`/`&lt;script&gt;`/`&lt;b` 还原成真标签 |
+| `regression/test_html_sanitize.py` | 8 个用例：白名单结构、脚本/样式子树、事件属性与内联样式、可执行 URL、相对链接补全、裸文本转义、空值 |
 | `regression/test_time_extractor.py` | 34 个用例：标签日期优先于正文、XPath 元素/字符串/多值、多日期按文本位置取最早、无效 ISO 候选跳过、脚本与页脚排除、兄弟/嵌套行内节点拼接、块级边界、表格单元格（`td`/`th`）标签日期与不跨 `<tr>`、停止词、dateUpdate 兜底、拆分年份重建 |
 | `regression/test_parse_datetime.py` | 16 个用例：中文/数字/相对日期、ISO 偏移、未来日期与年份调整、reference_year 指定年份、无年份日期按基准年补齐、跨年无年份日期取最近合法年份、闰日落非闰年返回 None |
 | `regression/test_publish_source.py` | 9 个用例：GNE 内部来源映射到落库值、视频页 meta 来源标记、`clean_title()` 清掉标题里的字面量 HTML 标签（`<br>`/`<BR/>`/`<b>`/`<p>`）且不误伤 `a < b > c` 这类普通文本、带长 `style` 属性的标签整段删除不留半截开标签、纯文本标题原样保留、单字母标签只在成对/带属性/自闭合/孤立结束这几种无歧义写法下清除（`A <B> C` 保留）、`parse_list_items` 清洗属性标题、`process_entry` 清洗详情标题 |

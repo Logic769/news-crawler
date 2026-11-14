@@ -3,6 +3,7 @@
 前端详情页用 v-html 渲染 body_html；v9 之前入库的历史行没有该字段，
 只能回到原页面重新抽取。脚本只写 body_html，不动 content / raw_content /
 status / updated_at，失败行原样保留，可重复运行（已回填的行不再是候选）。
+修复抽取器后可用 --overwrite 重刷已有 body_html。
 
 宿主机：
     python -X utf8 backfill_body_html.py --db data/news.db --dry-run
@@ -31,6 +32,7 @@ _UPDATE_SQL = (
     "UPDATE articles SET body_html = ? "
     "WHERE source = ? AND url = ? AND (body_html IS NULL OR body_html = '')"
 )
+_OVERWRITE_SQL = "UPDATE articles SET body_html = ? WHERE source = ? AND url = ?"
 
 
 def find_candidates(
@@ -38,13 +40,16 @@ def find_candidates(
     source: str,
     limit: int,
     skip: set[tuple[str, str]] | None = None,
+    *,
+    overwrite: bool = False,
 ) -> list[tuple[str, str]]:
     placeholders = ", ".join("?" * len(BACKFILL_STATUSES))
     sql = (
         "SELECT source, url FROM articles "
-        "WHERE (body_html IS NULL OR body_html = '') "
-        f"AND status IN ({placeholders})"
+        f"WHERE status IN ({placeholders})"
     )
+    if not overwrite:
+        sql += " AND (body_html IS NULL OR body_html = '')"
     params: list[object] = list(BACKFILL_STATUSES)
     if source:
         sql += " AND source = ?"
@@ -79,6 +84,7 @@ def backfill(
     allow_browser: bool,
     dry_run: bool,
     source_xpaths: dict[str, str] | None = None,
+    overwrite: bool = False,
 ) -> tuple[int, int, int, int]:
     """逐条重抓并写回 body_html。
 
@@ -112,7 +118,8 @@ def backfill(
                 print(f"  [失败] {source} {url}：抽取结果没有正文 HTML")
                 continue
             try:
-                cursor = conn.execute(_UPDATE_SQL, (body_html, source, url))
+                sql = _OVERWRITE_SQL if overwrite else _UPDATE_SQL
+                cursor = conn.execute(sql, (body_html, source, url))
                 conn.commit()
             except sqlite3.Error as exc:
                 try:
@@ -143,6 +150,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--delay", type=float, default=0.3, help="两次请求之间的等待秒数，默认 0.3")
     parser.add_argument("--allow-browser", action="store_true", help="直接抓取失败时允许回退本机 Chrome")
     parser.add_argument("--dry-run", action="store_true", help="只统计候选数量，不抓取")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="覆盖已有 body_html（修复抽取器后重刷历史行时使用）",
+    )
     return parser
 
 
@@ -157,8 +169,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     conn = init_db(str(db_path))
     try:
-        candidates = find_candidates(conn, args.source, args.limit)
-        print(f"候选 {len(candidates)} 条（status in {'/'.join(BACKFILL_STATUSES)} 且 body_html 为空）")
+        candidates = find_candidates(conn, args.source, args.limit, overwrite=args.overwrite)
+        scope = "全部" if args.overwrite else "body_html 为空"
+        print(f"候选 {len(candidates)} 条（status in {'/'.join(BACKFILL_STATUSES)} 且 {scope}）")
         source_xpaths = {} if args.dry_run else load_source_xpaths(args.config)
         updated, failed, skipped, write_failed = backfill(
             conn,
@@ -167,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_browser=args.allow_browser,
             dry_run=args.dry_run,
             source_xpaths=source_xpaths,
+            overwrite=args.overwrite,
         )
     finally:
         conn.close()

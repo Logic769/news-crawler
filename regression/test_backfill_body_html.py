@@ -43,6 +43,14 @@ class FindCandidatesTest(unittest.TestCase):
         self.assertEqual(len(bf.find_candidates(conn, "a", 2)), 2)
         self.assertEqual(bf.find_candidates(conn, "b", 0), [("b", "https://e.com/b")])
 
+    def test_overwrite_includes_existing_html(self) -> None:
+        conn = _conn()
+        conn.execute(
+            "INSERT INTO articles (source, url, body_html, status) "
+            "VALUES ('site', 'https://e.com/a', '<p>旧</p>', 'ok')"
+        )
+        self.assertEqual(bf.find_candidates(conn, "", 0, overwrite=True), [("site", "https://e.com/a")])
+
 
 class BackfillTest(unittest.TestCase):
     def test_writes_html_without_touching_existing_content(self) -> None:
@@ -87,6 +95,27 @@ class BackfillTest(unittest.TestCase):
                 conn, [("site", "https://e.com/a")], delay=0, allow_browser=False, dry_run=False
             )
         self.assertEqual((updated, failed, skipped), (0, 1, 0))
+
+    def test_overwrite_replaces_existing_html(self) -> None:
+        conn = _conn()
+        conn.execute(
+            "INSERT INTO articles (source, url, body_html, status) "
+            "VALUES ('site', 'https://e.com/a', '<p>旧</p>', 'ok')"
+        )
+        with mock.patch.object(bf, "extract_article", return_value={"body_html": "<p>新</p>"}):
+            updated, failed, skipped, _ = bf.backfill(
+                conn,
+                [("site", "https://e.com/a")],
+                delay=0,
+                allow_browser=False,
+                dry_run=False,
+                overwrite=True,
+            )
+        self.assertEqual((updated, failed, skipped), (1, 0, 0))
+        self.assertEqual(
+            conn.execute("SELECT body_html FROM articles WHERE url='https://e.com/a'").fetchone()[0],
+            "<p>新</p>",
+        )
 
 
 if __name__ == "__main__":

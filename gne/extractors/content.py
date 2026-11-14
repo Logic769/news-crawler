@@ -6,7 +6,6 @@ import json
 import logging
 import math
 import re
-from html import unescape
 from typing import Any
 
 from lxml.html import HtmlElement, etree
@@ -180,8 +179,10 @@ class ContentExtractor:
                 node_info["is_visiable"] = node.attrib.get("is_visiable", True)
                 node_info["coordinate"] = node.attrib.get("coordinate", "")
             if include_body_html:
-                node_info["body_html"] = unescape(
-                    etree.tostring(node, encoding="utf-8").decode()
+                # 不能用 html.unescape 解码序列化结果：正文里本来就有的
+                # “&lt;div&gt;”文本会被还原成真标签，既破坏文本也绕过清洗边界。
+                node_info["body_html"] = etree.tostring(
+                    node, encoding="unicode", method="html"
                 ).replace(BR_SENTINEL, "\n")
             self.node_info[hash(node)] = node_info
 
