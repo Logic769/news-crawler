@@ -161,6 +161,76 @@ class JobListResponse(BaseModel):
     meta: PageMeta
 
 
+class SiteConfigOut(BaseModel):
+    """Admin-facing view of one crawler source; never includes api headers."""
+
+    name: str
+    list_url: str = ""
+    category: str = ""
+    region: str = ""
+    timezone: str = ""
+    render: bool = False
+    enabled: bool = True
+    item_xpath: str = ""
+    title_xpath: str = ""
+    url_xpath: str = ""
+    date_xpath: str = ""
+    has_api: bool = False
+
+
+class SiteConfigListResponse(BaseModel):
+    data: list[SiteConfigOut]
+
+
+class SiteConfigCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=100)
+    list_url: str = Field(min_length=1, max_length=2048)
+    category: str = Field(default="", max_length=50)
+    region: str = Field(default="", max_length=100)
+    timezone: str = Field(default="Asia/Shanghai", max_length=100)
+    render: bool = False
+    enabled: bool = True
+    item_xpath: str = Field(default="//li", max_length=1000)
+    title_xpath: str = Field(default=".//a", max_length=1000)
+    url_xpath: str = Field(default=".//a/@href", max_length=1000)
+    date_xpath: str = Field(default="", max_length=1000)
+
+    @field_validator("list_url")
+    @classmethod
+    def _validate_list_url(cls, value: str) -> str:
+        value = value.strip()
+        if not re.match(r"^https?://", value, re.IGNORECASE):
+            raise ValueError("list_url 必须是 http:// 或 https:// 开头")
+        return value
+
+
+class SiteConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    list_url: str | None = Field(default=None, max_length=2048)
+    category: str | None = Field(default=None, max_length=50)
+    region: str | None = Field(default=None, max_length=100)
+    timezone: str | None = Field(default=None, max_length=100)
+    render: bool | None = None
+    enabled: bool | None = None
+    item_xpath: str | None = Field(default=None, max_length=1000)
+    title_xpath: str | None = Field(default=None, max_length=1000)
+    url_xpath: str | None = Field(default=None, max_length=1000)
+    date_xpath: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("list_url")
+    @classmethod
+    def _validate_list_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not re.match(r"^https?://", value, re.IGNORECASE):
+            raise ValueError("list_url 必须是 http:// 或 https:// 开头")
+        return value
+
+
 class HealthOut(BaseModel):
     status: str
     api_version: str

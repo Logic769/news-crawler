@@ -16,6 +16,8 @@ status / updated_at，失败行原样保留，可重复运行（已回填的行�
 from __future__ import annotations
 
 import argparse
+import html as html_lib
+import re
 import sqlite3
 import sys
 import time
@@ -23,6 +25,7 @@ from pathlib import Path
 
 from backfill_raw_content import load_source_xpaths
 from gne import GeneralNewsExtractor
+from html_sanitize import sanitize_body_html
 from news_crawler import DEFAULT_DB_FILE, DEFAULT_SOURCES_FILE, init_db
 from url_extract import close_thread_browser, extract_article
 
@@ -33,6 +36,82 @@ _UPDATE_SQL = (
     "WHERE source = ? AND url = ? AND (body_html IS NULL OR body_html = '')"
 )
 _OVERWRITE_SQL = "UPDATE articles SET body_html = ? WHERE source = ? AND url = ?"
+
+
+_HTML_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
+
+
+def html_from_raw(text: str) -> str:
+    """把库内原文转成安全 HTML。
+
+    API 源的 content_is_html 可能是 HTML 片段，走与抓取链路相同的白名单清洗；
+    普通纯文本按空行拆段并转义，绝不把原文里的尖括号当标签执行。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    if _HTML_TAG_RE.search(raw):
+        return sanitize_body_html(raw)
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", raw) if part.strip()]
+    if not paragraphs:
+        return ""
+    return "".join(
+        f"<p>{html_lib.escape(part, quote=False).replace(chr(10), '<br>')}</p>"
+        for part in paragraphs
+    )
+
+
+def find_raw_candidates(
+    conn: sqlite3.Connection,
+    source: str,
+    limit: int,
+    *,
+    overwrite: bool = False,
+) -> list[tuple[str, str, str]]:
+    """找出可直接从库内 raw_content/content 派生 body_html 的行（不联网）。"""
+    sql = (
+        "SELECT source, url, COALESCE(NULLIF(raw_content,''), content) AS raw "
+        "FROM articles WHERE status IN ('ok','unknown_date') "
+        "AND COALESCE(NULLIF(raw_content,''), content) IS NOT NULL"
+    )
+    if not overwrite:
+        sql += " AND (body_html IS NULL OR body_html = '')"
+    params: list[object] = []
+    if source:
+        sql += " AND source = ?"
+        params.append(source)
+    sql += " ORDER BY source, url"
+    if limit > 0:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return [
+        (str(row[0]), str(row[1]), str(row[2]))
+        for row in conn.execute(sql, params).fetchall()
+        if str(row[2] or "").strip()
+    ]
+
+
+def backfill_from_raw(
+    conn: sqlite3.Connection,
+    candidates: list[tuple[str, str, str]],
+    *,
+    overwrite: bool = False,
+) -> tuple[int, int]:
+    """只用库内原文回填 body_html，返回 (更新数, 跳过数)。"""
+    updated = skipped = 0
+    for source, url, raw in candidates:
+        body_html = html_from_raw(raw)
+        if not body_html:
+            skipped += 1
+            continue
+        sql = _OVERWRITE_SQL if overwrite else _UPDATE_SQL
+        cursor = conn.execute(sql, (body_html, source, url))
+        conn.commit()
+        if cursor.rowcount:
+            updated += 1
+        else:
+            skipped += 1
+    return updated, skipped
 
 
 def find_candidates(
@@ -155,6 +234,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="覆盖已有 body_html（修复抽取器后重刷历史行时使用）",
     )
+    parser.add_argument(
+        "--from-raw",
+        action="store_true",
+        help="不联网，直接从库内 raw_content/content 派生安全 HTML（适合接口源历史行）",
+    )
     return parser
 
 
@@ -169,6 +253,22 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     conn = init_db(str(db_path))
     try:
+        if args.from_raw:
+            candidates = find_raw_candidates(
+                conn, args.source, args.limit, overwrite=args.overwrite
+            )
+            scope = "全部" if args.overwrite else "body_html 为空"
+            print(
+                f"候选 {len(candidates)} 条（status in {'/'.join(BACKFILL_STATUSES)} 且 {scope}，库内原文）"
+            )
+            if args.dry_run:
+                print("dry-run：未写入任何正文 HTML。")
+                return 0
+            updated, skipped = backfill_from_raw(
+                conn, candidates, overwrite=args.overwrite
+            )
+            print(f"完成：回填 {updated} 条，跳过 {skipped} 条。")
+            return 0
         candidates = find_candidates(conn, args.source, args.limit, overwrite=args.overwrite)
         scope = "全部" if args.overwrite else "body_html 为空"
         print(f"候选 {len(candidates)} 条（status in {'/'.join(BACKFILL_STATUSES)} 且 {scope}）")

@@ -51,9 +51,13 @@ services:
       NEWS_MAX_PENDING_JOBS: ${NEWS_MAX_PENDING_JOBS:-50}
       NEWS_REQUIRE_AUTH: ${NEWS_REQUIRE_AUTH:-}
       NEWS_INSECURE_SSL: ${NEWS_INSECURE_SSL:-}
+      NEWS_BACKUP_DIR: /app/backups
     volumes:
-      - ./sources.local.json:/app/sources.local.json:ro
+      # API 需要写站点配置：管理台通过 /v1/admin/sites 维护 sources.local.json。
+      # crawler 服务仍是只读挂载，抓取过程不会改配置。
+      - ./sources.local.json:/app/sources.local.json
       - ./data:/app/data
+      - ./backups:/app/backups
     command: ["api"]
     ports:
       # 默认只绑定宿主机回环地址，避免未设置 NEWS_API_KEY 时暴露到局域网

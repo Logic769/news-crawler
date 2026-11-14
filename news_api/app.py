@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import news_crawler
-from news_api import __version__
+from news_api import __version__, config_store
 from news_api.db import (
     count_articles,
     get_article,
@@ -38,6 +38,10 @@ from news_api.models import (
     JobCreateResponse,
     JobListResponse,
     JobOut,
+    SiteConfigCreate,
+    SiteConfigListResponse,
+    SiteConfigOut,
+    SiteConfigUpdate,
     SourceListResponse,
     StatsOut,
 )
@@ -361,6 +365,61 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             request.app.state.settings.db_path,
             default_tz=request.app.state.settings.timezone,
         )
+
+    # ---- 站点配置管理：管理台通过 news-insight 代理调用，最终落盘到 crawler 的
+    # sources.local.json。响应有意不返回 api.headers，避免把接口源密钥带到浏览器。
+    @app.get(
+        "/v1/admin/sites", response_model=SiteConfigListResponse, dependencies=auth
+    )
+    def admin_list_sites(request: Request) -> dict[str, Any]:
+        try:
+            sites = config_store.list_sites(request.app.state.settings.config_path)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail=f"读取站点配置失败: {exc}") from exc
+        return {"data": sites}
+
+    @app.post(
+        "/v1/admin/sites", response_model=SiteConfigOut, status_code=201, dependencies=auth
+    )
+    def admin_create_site(payload: SiteConfigCreate, request: Request) -> dict[str, Any]:
+        try:
+            return config_store.create_site(
+                request.app.state.settings.config_path,
+                payload.model_dump(),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"写入站点配置失败: {exc}") from exc
+
+    @app.put(
+        "/v1/admin/sites/{name}", response_model=SiteConfigOut, dependencies=auth
+    )
+    def admin_update_site(
+        name: str, payload: SiteConfigUpdate, request: Request
+    ) -> dict[str, Any]:
+        values = payload.model_dump(exclude_none=True)
+        try:
+            updated = config_store.update_site(
+                request.app.state.settings.config_path, name, values
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"写入站点配置失败: {exc}") from exc
+        if updated is None:
+            raise HTTPException(status_code=404, detail="站点不存在")
+        return updated
+
+    @app.delete("/v1/admin/sites/{name}", dependencies=auth)
+    def admin_delete_site(name: str, request: Request) -> dict[str, Any]:
+        try:
+            removed = config_store.delete_site(request.app.state.settings.config_path, name)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail=f"写入站点配置失败: {exc}") from exc
+        if not removed:
+            raise HTTPException(status_code=404, detail="站点不存在")
+        return {"data": {"name": name, "deleted": True}}
 
     @app.post(
         "/v1/jobs",

@@ -35,6 +35,7 @@ from lxml import etree
 
 from gne import GeneralNewsExtractor
 from gne.netguard import UnsafeUrlError, ensure_url_allowed
+from html_sanitize import sanitize_body_html
 from url_extract import (
     BROWSER_FALLBACK_HTTP_CODES,
     MIN_CONTENT_LENGTH,
@@ -1125,8 +1126,14 @@ def load_config(path: str) -> dict:
     data["timezone"] = resolve_timezone_name(data.get("timezone"), "Asia/Shanghai")
     data.setdefault("delay", 0.3)
     data.setdefault("date_skew_days", 7)
+    active_sources = []
     for source in data.get("sources") or []:
         if not isinstance(source, dict):
+            continue
+        # 管理台的「启用/停用」写在源配置的 enabled 字段上；抓取器在这里统一
+        # 过滤，避免管理台停用后 CLI 仍然继续跑该站点。缺省（老配置）视为启用。
+        if source.get("enabled") is False:
+            LOG.info("站点 %r 已在管理台停用，跳过", source.get("name"))
             continue
         # 站点时区在加载期定死：空串/非法值回退顶层 timezone（默认
         # Asia/Shanghai）。否则 get_timezone('') 会按运行环境本地时区解析列表
@@ -1241,6 +1248,8 @@ def load_config(path: str) -> dict:
                 source.get("date_skew_days"),
             )
             source["date_skew_days"] = 7
+        active_sources.append(source)
+    data["sources"] = active_sources
     return data
 
 
@@ -1963,6 +1972,11 @@ def _api_item_to_entry(
             entry["content"] = clean_text(text)
             entry["raw_content"] = text
             entry["images"] = images
+            if settings["content_is_html"]:
+                # 接口源没有详情页可回抓，正文 HTML 必须在这里就从接口原文
+                # 清洗出来；否则这条链路永远无法给前端提供富文本（此前 40 条
+                # shpolicy_ssme 正是因此只有纯文本）。
+                entry["body_html"] = sanitize_body_html(str(raw_body), url)
     if settings["author_field"]:
         entry["author"] = clean_text(_dig(item, settings["author_field"]))
     return entry

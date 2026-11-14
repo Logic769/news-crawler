@@ -118,5 +118,34 @@ class BackfillTest(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
+class FromRawTest(unittest.TestCase):
+    def test_html_from_raw_escapes_plain_text(self) -> None:
+        html = bf.html_from_raw("第一段\n\n2 < 3 & 4")
+        self.assertEqual(html, "<p>第一段</p><p>2 &lt; 3 &amp; 4</p>")
+
+    def test_html_from_raw_sanitizes_markup_in_text(self) -> None:
+        html = bf.html_from_raw("<p>正文</p><script>alert(1)</script>")
+        self.assertEqual(html, "<p>正文</p>")
+
+    def test_backfill_from_raw_fills_missing_rows(self) -> None:
+        conn = _conn()
+        conn.executemany(
+            "INSERT INTO articles (source, url, raw_content, body_html, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                ("api", "https://e.com/a", "第一段\n\n第二段", None, "ok"),
+                ("api", "https://e.com/b", "已有原文", "<p>保留</p>", "ok"),
+            ],
+        )
+        candidates = bf.find_raw_candidates(conn, "api", 0)
+        self.assertEqual(len(candidates), 1)
+        updated, skipped = bf.backfill_from_raw(conn, candidates)
+        self.assertEqual((updated, skipped), (1, 0))
+        self.assertEqual(
+            conn.execute("SELECT body_html FROM articles WHERE url='https://e.com/a'").fetchone()[0],
+            "<p>第一段</p><p>第二段</p>",
+        )
+        self.assertEqual(
+            conn.execute("SELECT body_html FROM articles WHERE url='https://e.com/b'").fetchone()[0],
+            "<p>保留</p>",
+        )
