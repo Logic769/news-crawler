@@ -120,6 +120,23 @@ class ArticleListResponse(BaseModel):
     meta: PageMeta
 
 
+class ArchiveOut(BaseModel):
+    id: int
+    article_id: str
+    source: str
+    url: str
+    kind: str
+    size_bytes: int
+    content_type: str
+    created_at: str
+    download_url: str
+
+
+class ArchiveListResponse(BaseModel):
+    data: list[ArchiveOut]
+    meta: dict[str, Any]
+
+
 class SourceOut(BaseModel):
     source: str
     total: int

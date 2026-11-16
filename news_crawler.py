@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 import lxml.html
 from lxml import etree
 
+import article_archive
 from gne import GeneralNewsExtractor
 from gne.netguard import UnsafeUrlError, ensure_url_allowed
 from html_sanitize import sanitize_body_html
@@ -54,7 +55,7 @@ DEFAULT_DB_FILE = "news.db"
 # 锁等待时长与 sqlite3.connect(timeout=...) 保持一致，避免 PRAGMA 把
 # 30s 的连接超时悄悄压成 5s（并发写时更早报 database is locked）。
 DB_BUSY_TIMEOUT_MS = 30000
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS articles (
@@ -122,7 +123,7 @@ CREATE INDEX IF NOT EXISTS idx_crawl_jobs_created_at
     ON crawl_jobs(created_at);
 CREATE INDEX IF NOT EXISTS idx_crawl_jobs_dedupe
     ON crawl_jobs(type, payload, status);
-"""
+""" + article_archive.SCHEMA_SQL
 
 
 # 查询性能覆盖索引。放在迁移事务内执行，新建库（user_version=0）同样会走到，
@@ -2341,6 +2342,9 @@ def save_article(
     images: list[str] | None = None,
     status: str,
     error: str = "",
+    archive_payload: str | bytes | None = None,
+    archive_kind: str = "",
+    archive_content_type: str = "text/html; charset=utf-8",
 ) -> str:
     """Insert or update one article with partial-update semantics.
 
@@ -2446,6 +2450,21 @@ def save_article(
         ),
     )
     conn.commit()
+    # 原文归档是旁路能力：写盘/索引失败只记日志，不能把已成功入库的文章
+    # 改写成抓取失败。相同内容按 sha256 去重，重复抓取不会重复占盘。
+    if archive_payload is not None and archive_kind:
+        try:
+            article_archive.archive_article(
+                conn,
+                article_id=article_id,
+                source=source,
+                url=url,
+                payload=archive_payload,
+                kind=archive_kind,
+                content_type=archive_content_type,
+            )
+        except Exception:
+            LOG.exception("归档原文失败（不影响文章入库）: %s", url)
     return article_id
 
 
@@ -2838,6 +2857,8 @@ def _process_project_entry(
         ):
             return "skip"
 
+    archived_html = ""
+
     def _save(status: str, **kwargs: Any) -> str:
         # 项目申报的列表标题就是公告标题；详情页常是登录墙，GNE 抽到的
         # <title> 往往是站点名，因此统一以列表标题作为展示标题。
@@ -2849,6 +2870,11 @@ def _process_project_entry(
         kwargs.setdefault("publish_time_source", "list" if publish_text else "")
         kwargs.setdefault("publish_time_raw", publish_raw)
         kwargs.setdefault("list_publish_time", publish_text)
+        # 只要本次确实抓到了页面就归档：no_content（抽不出正文）恰恰是最需要
+        # 回看原始页面的场景。old 在抓取前就返回，此时 archived_html 仍为空。
+        if archived_html:
+            kwargs.setdefault("archive_payload", archived_html)
+            kwargs.setdefault("archive_kind", article_archive.KIND_RAW_HTML)
         save_article(
             conn,
             source_name,
@@ -2899,6 +2925,8 @@ def _process_project_entry(
         return _save("ok")
 
     html, already_rendered = fetched
+    # 拿到页面就先记下来：后面两条 no_content 分支同样需要归档这份 HTML。
+    archived_html = html
     result = extract_article(
         html,
         url,
@@ -2976,10 +3004,17 @@ def process_entry(
 
     # 直接构造 entry 的调用方可能只填 content（没有换行版），两者都认。
     inline_body = str(entry.get("raw_content") or entry.get("content") or "").strip()
+    archive_payload: str | bytes | None = None
+    archive_kind = ""
+    archive_content_type = "text/html; charset=utf-8"
     result: dict[str, Any] | None
     if inline_body:
         # 接口型源的正文随条目一起返回：不再请求详情页，也不跑 GNE
         # （详情页往往就是同一个 SPA，抓下来同样没有正文）。
+        # 接口型源没有独立详情页，归档接口返回的原始条目 JSON。
+        archive_payload = json.dumps(entry, ensure_ascii=False, sort_keys=True, default=str)
+        archive_kind = article_archive.KIND_API_RESPONSE
+        archive_content_type = "application/json; charset=utf-8"
         result = {
             "content": inline_body,
             "publish_time": "",
@@ -3010,6 +3045,8 @@ def process_entry(
             )
             return "error"
         html, already_rendered = fetched
+        archive_payload = html
+        archive_kind = article_archive.KIND_RAW_HTML
 
         result = extract_article(
             html,
@@ -3028,6 +3065,9 @@ def process_entry(
                 list_publish_time=list_publish_text,
                 status="no_content",
                 error="无法提取正文",
+                archive_payload=archive_payload,
+                archive_kind=archive_kind,
+                archive_content_type=archive_content_type,
             )
             return "no_content"
 
@@ -3117,6 +3157,9 @@ def process_entry(
             timezone=tz_name,
             author=clean_text(result.get("author")),
             status="old",
+            archive_payload=archive_payload,
+            archive_kind=archive_kind,
+            archive_content_type=archive_content_type,
         )
         return "old"
 
@@ -3137,6 +3180,9 @@ def process_entry(
             images=normalize_images_for_update(result.get("images"), url),
             status="unknown_date",
             error="无法解析发布日期",
+            archive_payload=archive_payload,
+            archive_kind=archive_kind,
+            archive_content_type=archive_content_type,
         )
         return "unknown_date"
 
@@ -3158,6 +3204,9 @@ def process_entry(
         body_html=str(result.get("body_html") or ""),
         images=normalize_images_for_update(result.get("images"), url),
         status="ok",
+        archive_payload=archive_payload,
+        archive_kind=archive_kind,
+        archive_content_type=archive_content_type,
     )
     return "ok"
 
@@ -3340,6 +3389,12 @@ def cmd_run(args: argparse.Namespace) -> None:
             print(f"[{name}] " + ", ".join(f"{k}={v}" for k, v in counts.items()))
 
     print("\n汇总：" + ", ".join(f"{k}={v}" for k, v in sorted(total.items())))
+    try:
+        pruned = article_archive.prune_expired_archives(db_path)
+        if pruned["moved"] or pruned["failed"] or pruned["missing"]:
+            print(f"归档保留期清理：{pruned}")
+    except Exception:
+        LOG.exception("归档保留期清理失败（不影响本轮抓取结果）")
     print("最新结果可查询 SQLite：")
     print(
         "SELECT source, title, publish_time, url FROM articles "
