@@ -54,7 +54,7 @@ jobs:
           fi
           # 固定版本：规则集较宽（见 pyproject 的 [tool.ruff]），上游新版本增删规则
           # 会让无关 PR 突然变红。升级时同步改这里，并本地跑一遍 ruff/mypy。
-          pip install "ruff==0.17.3"
+          pip install "ruff==0.17.5"
           if [ "${{ matrix.python-version }}" = "3.12" ]; then
             pip install "mypy==2.4.1"
           fi

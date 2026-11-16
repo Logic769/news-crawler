@@ -48,7 +48,7 @@ build-backend = "hatchling.build"
 dev = [
     # 与 CI（.github/workflows/deploy-test.yml）保持一致，避免本地与 CI 结论不同。
     "mypy==2.4.1",
-    "ruff==0.17.3",
+    "ruff==0.17.5",
 ]
 
 [tool.ruff]
