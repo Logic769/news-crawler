@@ -42,11 +42,15 @@
       "enabled": false
     },
     {
-      "description": "Python 3.15 is not ready for this repo: lxml 6.0.2 publishes no cp315 wheel and python:3.15-slim lacks the libxml2/libxslt development packages, so the Docker build fails (see closed PR #26). Keep the python package below 3.15 until lxml and the base image support it; this covers the Dockerfile base image and the CI python-version.",
+      "description": "Python 3.15 is not ready for this repo: lxml 6.0.2 publishes no cp315 wheel and python:3.15-slim lacks the libxml2/libxslt development packages, so the Docker build fails (see closed PR #26). Disable major/minor python bumps so the runtime stays on the 3.12 line; patch-level 3.12.x updates and pin digests still flow. Re-enable once lxml and the base image support 3.15.",
       "matchPackageNames": [
         "python"
       ],
-      "allowedVersions": "<3.15"
+      "matchUpdateTypes": [
+        "major",
+        "minor"
+      ],
+      "enabled": false
     }
   ]
 }
