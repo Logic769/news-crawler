@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import logging
 import secrets
 import threading
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -15,11 +17,12 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+import article_archive
 import news_crawler
-from news_api import __version__
+from news_api import __version__, config_store
 from news_api.db import (
     count_articles,
     get_article,
@@ -31,6 +34,7 @@ from news_api.db import (
 )
 from news_api.jobs import JobManager, JobQueueFull
 from news_api.models import (
+    ArchiveListResponse,
     ArticleListResponse,
     ArticleOut,
     HealthOut,
@@ -38,6 +42,10 @@ from news_api.models import (
     JobCreateResponse,
     JobListResponse,
     JobOut,
+    SiteConfigCreate,
+    SiteConfigListResponse,
+    SiteConfigOut,
+    SiteConfigUpdate,
     SourceListResponse,
     StatsOut,
 )
@@ -94,6 +102,29 @@ def require_api_key(request: Request) -> None:
             detail="缺少或无效的 API Key",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+def _attachment_disposition(filename: str) -> str:
+    """构造 attachment 头，兼容非 ASCII 文件名。
+
+    HTTP 头只能承载 latin-1：`filename="..."` 里出现中文/全角字符会让 Starlette
+    在响应编码阶段抛 UnicodeEncodeError（表现为 500）。这里给两份名字：
+    `filename` 放纯 ASCII 兜底（非 ASCII 与引号替换成下划线），
+    `filename*` 按 RFC 5987 放 UTF-8 百分号编码的原始名字，现代浏览器优先用后者。
+    """
+    fallback = "".join(
+        ch if 32 <= ord(ch) < 127 and ch not in '"\\' else "_" for ch in filename
+    )
+    # 全被替换成下划线时兜底名不唯一（「公告abc」和「通知abc」都成了 __abc...），
+    # 同一浏览器下载多个归档会互相覆盖/重名。用原始名的短哈希做区分，保证
+    # 不同 filename 得到不同 fallback。只有真的含非 ASCII 时才加，避免把
+    # 正常文件名也改得面目全非。
+    if fallback != filename:
+        digest = hashlib.sha256(filename.encode("utf-8")).hexdigest()[:8]
+        stem, dot, suffix = fallback.rpartition(".")
+        fallback = f"{stem or fallback}-{digest}{dot}{suffix}" if dot else f"{fallback}-{digest}"
+    quoted = urllib.parse.quote(filename, safe="")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quoted}"
 
 
 def _timezones(request: Request) -> tuple[dict[str, str], str]:
@@ -344,6 +375,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="文章不存在")
         return article
 
+    @app.get(
+        "/v1/articles/{article_id}/archives",
+        response_model=ArchiveListResponse,
+        dependencies=auth,
+    )
+    def article_archives(article_id: str, request: Request) -> dict[str, Any]:
+        """列出某篇文章的原文快照（最新在前），供追溯与核对。"""
+        items = article_archive.list_archives(
+            request.app.state.settings.db_path, article_id
+        )
+        for item in items:
+            item["download_url"] = f"/v1/archives/{item['id']}"
+        return {"data": items, "meta": {"total": len(items)}}
+
+    @app.get("/v1/archives/{archive_id}", dependencies=auth)
+    def download_archive(archive_id: int, request: Request) -> Response:
+        """下载解压后的原文快照；文件名带上文章与归档类型便于人工核对。"""
+        try:
+            item, data = article_archive.get_archive(
+                request.app.state.settings.db_path, archive_id
+            )
+        except article_archive.ArticleArchiveError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        suffix = {
+            "raw_html": ".html",
+            "body_html": ".html",
+            "api_response": ".json",
+        }.get(str(item.get("kind")), ".txt")
+        filename = f"{item['article_id']}_{item['kind']}{suffix}"
+        return Response(
+            content=data,
+            media_type=str(item.get("content_type") or "application/octet-stream"),
+            headers={
+                # HTTP header 只能是 latin-1，article_id 若含非 ASCII 字符，
+                # 直接拼进 filename="" 会让 Starlette 在编码阶段抛错变成 500。
+                # 按 RFC 5987 同时给 ASCII 兜底名和 UTF-8 的 filename*。
+                "Content-Disposition": _attachment_disposition(filename),
+                "X-Archive-SHA256": str(item.get("sha256") or ""),
+            },
+        )
+
     @app.get("/v1/sources", response_model=SourceListResponse, dependencies=auth)
     def sources(request: Request) -> dict[str, Any]:
         timezones, default_tz = _timezones(request)
@@ -361,6 +433,61 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             request.app.state.settings.db_path,
             default_tz=request.app.state.settings.timezone,
         )
+
+    # ---- 站点配置管理：管理台通过 news-insight 代理调用，最终落盘到 crawler 的
+    # sources.local.json。响应有意不返回 api.headers，避免把接口源密钥带到浏览器。
+    @app.get(
+        "/v1/admin/sites", response_model=SiteConfigListResponse, dependencies=auth
+    )
+    def admin_list_sites(request: Request) -> dict[str, Any]:
+        try:
+            sites = config_store.list_sites(request.app.state.settings.config_path)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail=f"读取站点配置失败: {exc}") from exc
+        return {"data": sites}
+
+    @app.post(
+        "/v1/admin/sites", response_model=SiteConfigOut, status_code=201, dependencies=auth
+    )
+    def admin_create_site(payload: SiteConfigCreate, request: Request) -> dict[str, Any]:
+        try:
+            return config_store.create_site(
+                request.app.state.settings.config_path,
+                payload.model_dump(),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"写入站点配置失败: {exc}") from exc
+
+    @app.put(
+        "/v1/admin/sites/{name}", response_model=SiteConfigOut, dependencies=auth
+    )
+    def admin_update_site(
+        name: str, payload: SiteConfigUpdate, request: Request
+    ) -> dict[str, Any]:
+        values = payload.model_dump(exclude_none=True)
+        try:
+            updated = config_store.update_site(
+                request.app.state.settings.config_path, name, values
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"写入站点配置失败: {exc}") from exc
+        if updated is None:
+            raise HTTPException(status_code=404, detail="站点不存在")
+        return updated
+
+    @app.delete("/v1/admin/sites/{name}", dependencies=auth)
+    def admin_delete_site(name: str, request: Request) -> dict[str, Any]:
+        try:
+            removed = config_store.delete_site(request.app.state.settings.config_path, name)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail=f"写入站点配置失败: {exc}") from exc
+        if not removed:
+            raise HTTPException(status_code=404, detail="站点不存在")
+        return {"data": {"name": name, "deleted": True}}
 
     @app.post(
         "/v1/jobs",

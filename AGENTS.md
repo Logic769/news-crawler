@@ -73,8 +73,13 @@ news-crawler/
 ├── smoke_test.py                   # 部署后的离线冒烟测试
 ├── smoke_fixture.py                # 冒烟测试共用的内置新闻页（镜像内没有 tests/ 时的回退样本）
 ├── backfill_raw_content.py         # 回填历史行的 raw_content（重抓 URL，只写换行正文，不动 content）
+├── backfill_body_html.py           # 回填历史行的 body_html（v9 新增，只写清洗后的正文 HTML）
+├── article_archive.py              # 公告原文归档（v10）：gzip 快照 + .meta.json sidecar + 索引表，过期移入 archive_trash
+├── backfill_archives.py            # 回填历史文章的原文快照（默认用库内 body_html/raw_content，--fetch-html 才重抓）
+├── html_sanitize.py                # 正文 HTML 白名单清洗（脚本/事件属性/可执行 URL 过滤）
 ├── api.py                          # FastAPI 入口（uvicorn api:app）
-├── news_api/                       # API 应用：设置、模型、查询、作业队列
+├── news_api/                       # API 应用：设置、模型、查询、作业队列、站点配置存储
+│   └── config_store.py             # sources.local.json 的受控读写（写前备份、保留未知键、过滤敏感头）
 ├── api_smoke.py                    # API 冒烟测试（本地 HTTP + 临时数据库）
 ├── verify_live_news.py             # 实时新闻抓取验证（默认抽取 10 静态 / 10 JS / 10 视频）
 ├── live_news_pool.json             # 实时验证页面池（100 静态 / 50 JS / 50 视频）
@@ -216,13 +221,16 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | --- | --- | --- |
 | GET | `/v1/articles` | 分页查询文章，默认 `status=ok` 且不含正文 |
 | GET | `/v1/articles/{article_id}` | 文章详情，始终含正文 |
+| GET | `/v1/articles/{article_id}/archives` | 该文章的原文快照列表（kind/size_bytes/content_type/created_at/download_url） |
+| GET | `/v1/archives/{archive_id}` | 下载原始快照文件（gzip 解压后返回，带 `X-Archive-SHA256` 与 RFC 5987 的 `Content-Disposition`） |
 | GET | `/v1/sources` | 来源统计 |
+| GET/POST/PUT/DELETE | `/v1/admin/sites` | 站点配置 CRUD：写前备份到 `NEWS_BACKUP_DIR`；接口型源只能改分类/地区/时区/渲染/启停等非接口字段 |
 | GET | `/v1/stats` | 全局统计 |
 | POST | `/v1/jobs` | 提交 `crawl` 或 `extract` 异步作业，返回 202 |
 | GET | `/v1/jobs`、`/v1/jobs/{id}` | 作业列表与状态 |
 | GET | `/v1/health` | 健康检查（无需鉴权） |
 
-列表参数：`status`、`source`、`published_from`、`published_to`、`deadline_from`、`deadline_to`、`q`、`page`、`page_size`、`order`（`published_desc`/`published_asc`/`updated_desc`/`deadline_desc`/`deadline_asc`）、`include_content`（为 `true` 时列表返回 `content`；`raw_content` 无论何时都只在详情返回）。项目申报行 `publish_time` 为空，使用 `published_from`/`published_to` 会被排除，应按 `deadline` 过滤（`deadline` 为站点墙钟，`deadline_*` 带时区偏移时只取墙钟部分、不做换算；`deadline_*` 与 `published_*` 同时传会 AND 成空集）。文章列表与作业列表返回 `{"data": [...], "meta": {...}}`；文章详情、统计、健康检查返回对应对象；`/v1/sources` 返回 `{"data": [...]}`。
+列表参数：`status`、`source`、`published_from`、`published_to`、`deadline_from`、`deadline_to`、`q`、`page`、`page_size`、`order`（`published_desc`/`published_asc`/`updated_desc`/`deadline_desc`/`deadline_asc`）、`include_content`（为 `true` 时列表返回 `content`；`raw_content` 无论何时都只在详情返回）。项目申报行 `publish_time` 为空，使用 `published_from`/`published_to` 会被排除，应按 `deadline` 过滤（`deadline` 为站点墙钟，`deadline_*` 带时区偏移时只取墙钟部分、不做换算；`deadline_*` 与 `published_*` 同时传会 AND 成空集）。文章列表与作业列表返回 `{"data": [...], "meta": {...}}`；文章详情、统计、健康检查返回对应对象；`/v1/sources` 返回 `{"data": [...]}`。`/v1/admin/sites` 写入前会把原 `sources.local.json` 备份到 `NEWS_BACKUP_DIR`（compose 默认 `/app/backups`），并保留未识别的扩展键；接口型源的 `api`、`pagination` 等字段不在管理接口可改范围内。
 
 设置 `NEWS_API_KEY` 后，除 `/v1/health` 与文档外都需 `X-API-Key` 或 `Authorization: Bearer <key>`。作业状态为 `queued`/`running`/`succeeded`/`failed`，单进程执行，避免 SQLite 并发写冲突。排队 + 运行中的作业上限为 `NEWS_MAX_PENDING_JOBS`（默认 50），超出返回 `429`；相同类型与参数的未完成作业复用同一 ID。`extract` 默认拒绝回环、内网与保留地址（`NEWS_ALLOW_PRIVATE_URLS=1` 可放开）；`fetch_html` 通过自定义 `HTTPRedirectHandler` 对每个重定向目标复用同一校验，默认还以 `allow_browser=False` 禁用浏览器回退（`NEWS_EXTRACT_ALLOW_BROWSER=1` 可放开），避免页面 JS 绕过地址限制。上述限制仍不能替代 API Key。已完成作业保留 30 天后自动清理。未设置 `NEWS_API_KEY` 时默认开放（仅提示 warning）；设置 `NEWS_REQUIRE_AUTH=1` 后行为是"未配置 key 则业务请求一律 401，已配置 key 时按 key 校验"（401 带 `WWW-Authenticate`，`/v1/health`、`/docs`、openapi 与根路径始终开放）。错误响应统一为 `{"error": {"code", "status": <HTTP 码>, "message", "details"?}}`，参数校验错误为 422 且带 `details`。`docker compose` 通过白名单透传 API 变量，需在 `.env` 或 shell 中设置后生效。
 
@@ -257,6 +265,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `name` | 是 | 站点唯一标识，同时作为数据库 `source` 字段 |
+| `enabled` | 否 | 默认 `true`；`load_config` 会过滤 `enabled=false` 的源，便于临时停用 |
 | `list_url` | 二选一 | 列表页地址 |
 | `list_urls` | 二选一 | 多个固定列表页地址（旧版分页方式；单 `list_url` 站点优先用 `pagination`） |
 | `item_xpath` | 是 | 每条新闻节点的 XPath |
@@ -416,12 +425,26 @@ CREATE TABLE IF NOT EXISTS articles (
     content       TEXT,            -- 正文纯文本（clean_text 归一化，段落换行被压成空格）
     content_length INTEGER,        -- 正文长度缓存；列表接口避免读整段正文 blob
     raw_content   TEXT,            -- GNE 原始正文，保留段落换行；仅展示/导出用
+    body_html     TEXT,            -- v9 新增：清洗后的正文 HTML（白名单标签/属性），供下游详情页渲染
     images        TEXT,            -- JSON 数组字符串；NULL 表示本次未提供（保留旧值），[] 表示明确无图（清空）
     status        TEXT NOT NULL,   -- ok/old/no_content/unknown_date/error
     error         TEXT,
     first_seen_at TEXT,
     updated_at    TEXT,
     PRIMARY KEY (source, url)
+);
+
+CREATE TABLE IF NOT EXISTS article_archives (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    article_id   TEXT NOT NULL,    -- 关联 articles.article_id（不建外键，避免与抓取并发写冲突）
+    source       TEXT NOT NULL,
+    url          TEXT NOT NULL,
+    kind         TEXT NOT NULL,    -- raw_html / api_response / body_html
+    path         TEXT NOT NULL UNIQUE,  -- 相对库目录的快照路径 archive/xx/<article_id>/<时间>_<kind>.gz
+    sha256       TEXT NOT NULL,    -- 解压后明文的 sha256，用于同内容去重
+    size_bytes   INTEGER NOT NULL,
+    content_type TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS crawl_jobs (
@@ -439,7 +462,7 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 
 索引：`source`、`status`、`publish_time`、`article_id`（唯一），以及五条查询性能覆盖索引：`(status, publish_time DESC, source, url)`、`(status, updated_at DESC, source, url)` 供列表分页、`(source, publish_time DESC, updated_at DESC, timezone, status)` 供 `/v1/sources` 聚合、`publish_time_utc` 供真实时刻过滤、`deadline` 供项目申报截止时间过滤/排序；`crawl_jobs` 的 `status`、`created_at`、`(type, payload, status)` 去重索引。
 
-旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 8`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、`timezone`、v4 的 `raw_content`（只补列，原文已不可得，历史行不回填）、v5 的 `content_length`（补列后按 `length(content)` 回填 NULL 行）、v6 的 `publish_time_utc`（补列后按每行 `timezone` 换算 UTC 回填，供混时区按真实时刻过滤）、v7 的 `publish_time_source`/`publish_time_raw`/`list_publish_time`/`title_source`（只补列，历史行为 NULL）与 v8 的 `deadline`/`deadline_raw`/`project_status`（只补列，新闻站点为 NULL），按 rowid 键集分页（每批 2000 行）回填 `article_id`，不边读游标边 UPDATE 同表；再补建唯一索引、去重索引与五条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这些，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外）。迁移早退条件校验十二列齐全且 `required_indexes`（五条性能索引 + `idx_articles_article_id` + `idx_crawl_jobs_dedupe`）齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
+旧库升级由 `init_db()` 按 `PRAGMA user_version` 一次性迁移（当前 `SCHEMA_VERSION = 10`，在 `BEGIN IMMEDIATE` 事务内）：`ALTER TABLE` 补 `article_id`、`timezone`、v4 的 `raw_content`（只补列，原文已不可得，历史行不回填）、v5 的 `content_length`（补列后按 `length(content)` 回填 NULL 行）、v6 的 `publish_time_utc`（补列后按每行 `timezone` 换算 UTC 回填，供混时区按真实时刻过滤）、v7 的 `publish_time_source`/`publish_time_raw`/`list_publish_time`/`title_source`（只补列，历史行为 NULL）、v8 的 `deadline`/`deadline_raw`/`project_status`（只补列，新闻站点为 NULL）、v9 的 `body_html`（只补列，历史行用 `backfill_body_html.py` 回填）与 v10 的 `article_archives` 归档索引表（随 `SCHEMA_SQL` 建表，老库启动时同样 `CREATE TABLE IF NOT EXISTS`，历史文章的原文快照用 `backfill_archives.py` 补），按 rowid 键集分页（每批 2000 行）回填 `article_id`，不边读游标边 UPDATE 同表；再补建唯一索引、去重索引与五条性能覆盖索引（`CREATE INDEX IF NOT EXISTS`，写在 `_PERFORMANCE_INDEX_SQL` 并由迁移事务执行，老库升级与新建库结果一致；`SCHEMA_SQL` 里不放这些，因为 `executescript` 会隐式提交，DDL 会落到 `BEGIN IMMEDIATE` 之外）。迁移早退条件校验十三列齐全且 `required_indexes`（五条性能索引 + `idx_articles_article_id` + `idx_crawl_jobs_dedupe`）齐全，完成后置 `user_version`，后续启动直接跳过。首次切换到 `journal_mode=WAL` 前先读当前模式，已是 WAL 则跳过，并对并发首启做短重试（该 PRAGMA 不受 `busy_timeout` 保护）。`crawl_jobs` 中已完成的作业由 `JobManager.start()` 清理 30 天前的记录。
 
 ### 7.2 status 语义
 
@@ -465,6 +488,7 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 - `old` 分支的 `publish_time_source` 取决于判定时机：列表阶段就确认超出窗口时记 `list`；详情抓取后才发现超出窗口时保留详情来源（`xpath`/`labeled_text`/`meta`/`text`）。`publish_time_raw` 与当前 `publish_time` 同步：回退到列表日期时清空，不再保留旧详情原文；`unknown_date` 本次没有可信发布时间，新插入行会保留本次抽取文本便于排查，已有行则保留旧值与旧时间配对；新行的 `publish_time_source` 为空字符串，已有行保留旧来源，避免旧时间挂新来源；
 - 项目申报行（`listing_type=project_application`）的 `title`/`list_title` 都写列表标题（经 `clean_title()` 清掉属性值里的字面量 HTML 标记：`br`/`p`/`div`/`span`/`strong`/`em`/`sub`/`sup` 带不带属性都删；单字母 `b`/`i`/`u`/`a` 只删成对写法与带属性/自闭合/孤立结束标签，孤立的 `<b>` 按普通文本保留以免误伤 `A <B> C`；其余标签原样保留）、`title_source=list_title`；`deadline` 列存截止时间，与发布时间完全解耦：列表页自身的发布日期在配置了 `date_xpath` 时照常写 `publish_time`/`publish_time_utc`/`list_publish_time`（`publish_time_source=list`），未配置时 `publish_time` 为空，两种情况都不会拿截止时间顶替。`publish_time` 为空的项目行按 `published_desc` 排序会排在末尾、且会被 `published_from`/`published_to` 排除；查询项目公告请用 `order=deadline_desc|deadline_asc` 与 `deadline_from`/`deadline_to`。`content_required=false` 时详情抓不到正文也记 `ok`，不会反复重试；同一 URL 从新闻模式切到项目模式时，未配 `date_xpath` 的站点清空 `publish_time*`、配了 `date_xpath` 的站点改写成列表日期并把 `publish_time_source` 归一为 `list`（本次解析失败沿用旧值、来源保持原值并记 WARNING），`content`/`raw_content`/`author`/`images` 保留（可能残留旧新闻正文，检索侧请以 `title_source=list_title` 或站点配置识别项目行，不要只按 `deadline`；`deadline_from`/`deadline_to` 只对有可解析截止时间的项目行生效）；反向切换（项目→新闻）会保留旧 `deadline`/`deadline_raw`/`project_status`，这类新闻行仍可能命中截止时间过滤，查询侧请按站点/字段区分行类型；
 - `article_id` 由 `sha256(source + \x1f + url)` 派生，不随数据库重建变化，可安全作为下游引用；
+- 原文归档（v10）是旁路能力：`save_article()` 在 `conn.commit()` 之后才调 `article_archive.archive_article()`，归档异常只记 `LOG.exception`，不会把已入库的文章改写成抓取失败；快照写成 gzip 文件（`{库目录}/archive/{article_id前两位}/{article_id}/{时间}_{kind}.gz`）加同目录 `.meta.json` sidecar，`article_archives` 表只存索引。同一 `(article_id, kind)` 按解压后明文的 sha256 去重，重复抓取不重复占盘；kind 取 `raw_html`（详情页原始 HTML）、`api_response`（接口型源条目 JSON）或 `body_html`（历史行回填的清洗正文）。保留期 365 天（`article_archive.DEFAULT_RETENTION_DAYS`），过期快照由 `prune_expired_archives()` 移到 `archive_trash/{日期}/` 而不是硬删除；`cmd_run` 每轮末尾顺手清理一次，清理失败同样不影响抓取结果。**prune 只扫 `article_archives` 里有索引的行，看不见没有索引的孤儿文件**，需要「索引与文件同一事务原子」时应当先提交再归档，别指望 prune 兜底；
 - SQLite 启用 WAL 与 `busy_timeout=30000`（`DB_BUSY_TIMEOUT_MS`，与连接 timeout 一致，不用 5s 覆盖 30s 连接超时），API 作业默认单 worker 写入；只读查询使用 `file:...?mode=ro` URI（路径会转义），WAL 库仍要求目录可写（需要 -shm/-wal）。
 
 ---
@@ -537,6 +561,32 @@ docker compose run --rm --entrypoint python crawler -X utf8 backfill_raw_content
 
 脚本的 `--db` 默认值取自 `news_crawler.DEFAULT_DB_FILE`（相对路径 `news.db`），容器内必须显式传 `/app/data/news.db`，否则会指向 `/app/news.db`。
 
+### 回填 body_html（历史行）
+
+v9 之前入库的文章没有 `body_html`（详情页渲染用的清洗后正文 HTML）。`backfill_body_html.py` 只重抓这些行、只写 `body_html`，不改变 `content`/`raw_content`/`status`/`updated_at`；失败行原样保留，可重复运行。清洗规则见 `html_sanitize.py`：白名单标签/属性，去掉脚本、事件属性与可执行 URL。抽取器修复后重刷已有行用 `--overwrite`（默认只补空行）；接口型源拿不到原始 HTML 时用 `--from-raw` 从 `raw_content` 派生安全 HTML。
+
+```bash
+# 先看候选数
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_body_html.py --db /app/data/news.db --dry-run
+# 小批回填
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_body_html.py --db /app/data/news.db --limit 50
+# 修复抽取器后重刷已有行（默认只补空行）
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_body_html.py --db /app/data/news.db --overwrite
+```
+
+### 回填公告原文归档（历史行）
+
+v10 之前入库的文章没有原文快照。`backfill_archives.py` 默认**不联网**：先用库内 `body_html`（缺失时退回 `raw_content`）生成 `kind=body_html` 的正文快照，保证"原文可追溯"先有最小闭环；只有显式加 `--fetch-html` 才逐条重抓原始页面，写 `kind=raw_html`（受 `--delay` 限速，默认 0.5s）。只写 `article_archives` 与 `archive/` 下文件，不改 `articles` 任何列；已存在同类型快照的行直接跳过，可重复运行。
+
+```bash
+# 先看候选数（不写盘）
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_archives.py --db /app/data/news.db --dry-run
+# 用库内正文补正文快照
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_archives.py --db /app/data/news.db --limit 500
+# 需要真正原始 HTML 时才重抓
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_archives.py --db /app/data/news.db --fetch-html --limit 20
+```
+
 ### 启动 HTTP API
 
 ```bash
@@ -586,7 +636,7 @@ curl http://localhost:8000/v1/health
 - `smoke_test.py`：部署自检，验证导入、日期解析、GNE 抽取、SQLite 初始化、视频页判定、图片地址补全、浏览器回退状态码白名单、性能索引是否建齐、`raw_content` 落库与「本次未传不覆盖」、`old` 在窗口放宽后是否重抓；样本缺失时回退到 `smoke_fixture.py` 的内置新闻页（与 `api_smoke.py` 共用）；
 - `api_smoke.py`：启动临时 uvicorn + 临时 SQLite，验证鉴权、查询、详情（含 `raw_content` 换行）、统计、异步作业全链路，以及入库图片必须为绝对 URL；
 - `verify_live_news.py` + `live_news_pool.json`：从 100 静态 / 50 JS 渲染 / 50 视频的页面池中随机抽取（默认 10/10/10）访问公开新闻站点，验证三条抽取路径；视频池要求覆盖 ≥10 个来源站点；
-- `regression/`：62 篇样本的离线抽取基线（含 `meta_keys`/`meta_sha1`/`is_video`），外加列表页解析、视频页判定与回填脚本三组独立用例；
+- `regression/`：62 篇样本的离线抽取基线（含 `meta_keys`/`meta_sha1`/`is_video`），外加列表页解析、视频页判定、正文 HTML 清洗/回填等独立用例；
 
 ### 实时新闻池维护
 
@@ -620,6 +670,10 @@ curl http://localhost:8000/v1/health
 | `regression/test_list_page.py` | 7 个用例：列表页解析的条目定位、feature 缺失、少于 4 条时不回退、`count()`/`number()`/`boolean()` 等标量 XPath 在 `xpath_text`/`xpath_href` 中返回空而不崩溃 |
 | `regression/test_video_detection.py` | 7 个用例：路径规则、`og:type`、JSON-LD `VideoObject`、文章内嵌视频不误判 |
 | `regression/test_backfill.py` | 15 个用例：候选 skip/limit（含真实 SQLite）、LIMIT 下推与游标提前停止、游标异常关闭、失败清单列清洗、BOM 跳过清单、`--skip-file` 条目在下次失败清单中保留、`--failed-list` 指向数据库/目录/硬链接/符号链接/未创建的 WAL·SHM 侧车路径时抓取前返回 2、正常清单文件不误杀 |
+| `regression/test_backfill_body_html.py` | 7 个用例：只选空 body_html 与可回填状态、source/limit、`--overwrite` 覆盖已有 HTML、写入不改 content/raw_content、默认守卫保留已有 HTML、空 HTML 记失败 |
+| `regression/test_body_html.py` | 1 个用例：GNE `with_body_html=True` 保留正文里的实体文本，不把 `&lt;div&gt;`/`&lt;script&gt;`/`&lt;b` 还原成真标签 |
+| `regression/test_html_sanitize.py` | 8 个用例：白名单结构、脚本/样式子树、事件属性与内联样式、可执行 URL、相对链接补全、裸文本转义、空值 |
+| `regression/test_article_archive.py` | 17 个用例：gzip 快照与索引写入、同内容去重、不同内容/不同 kind 各留一条、解压读取、过期快照移入 trash、索引缺失时保留快照、索引 commit 失败回滚后不留孤儿 .gz、prune 删索引失败时把文件搬回原位、`article_id` 路径穿越（`../escape`/`a/b`/空串/NUL/超长）被拒、`Content-Disposition` 对非 ASCII 文件名 latin-1 安全且 `filename*` 可解码、同名 fallback 不重复、zlib 损坏与权限错误区分、sidecar 写失败不留半截、init_db 建表 |
 | `regression/test_time_extractor.py` | 34 个用例：标签日期优先于正文、XPath 元素/字符串/多值、多日期按文本位置取最早、无效 ISO 候选跳过、脚本与页脚排除、兄弟/嵌套行内节点拼接、块级边界、表格单元格（`td`/`th`）标签日期与不跨 `<tr>`、停止词、dateUpdate 兜底、拆分年份重建 |
 | `regression/test_parse_datetime.py` | 16 个用例：中文/数字/相对日期、ISO 偏移、未来日期与年份调整、reference_year 指定年份、无年份日期按基准年补齐、跨年无年份日期取最近合法年份、闰日落非闰年返回 None |
 | `regression/test_publish_source.py` | 9 个用例：GNE 内部来源映射到落库值、视频页 meta 来源标记、`clean_title()` 清掉标题里的字面量 HTML 标签（`<br>`/`<BR/>`/`<b>`/`<p>`）且不误伤 `a < b > c` 这类普通文本、带长 `style` 属性的标签整段删除不留半截开标签、纯文本标题原样保留、单字母标签只在成对/带属性/自闭合/孤立结束这几种无歧义写法下清除（`A <B> C` 保留）、`parse_list_items` 清洗属性标题、`process_entry` 清洗详情标题 |
@@ -640,7 +694,7 @@ curl http://localhost:8000/v1/health
 ### 提交前必须执行
 
 ```bash
-docker compose run --rm --entrypoint python crawler -m compileall -q news_crawler.py url_extract.py smoke_fixture.py backfill_raw_content.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api gne regression
+docker compose run --rm --entrypoint python crawler -m compileall -q news_crawler.py url_extract.py smoke_fixture.py backfill_raw_content.py backfill_body_html.py backfill_archives.py article_archive.py html_sanitize.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api gne regression
 docker compose run --rm crawler smoke
 docker compose run --rm --entrypoint python crawler -X utf8 api_smoke.py
 ```
@@ -761,6 +815,10 @@ docker compose run --rm crawler test --config sources.local.json --limit 2
 - `GeneralNewsExtractor.extract(html, **kwargs) -> dict`：正文抽取入口；实例无跨调用可变状态，可跨线程复用（每次 extract 内部新建 ContentExtractor）；
 - `create_app(settings=None) -> FastAPI`：API 应用工厂，测试可注入独立设置；
 - `article_id_for(source, url) -> str`：稳定文章 ID，改动会破坏下游引用；
+- `article_archive.archive_article(conn, *, article_id, source, url, payload, kind, content_type="text/html; charset=utf-8", db_path: str | Path | None = None) -> dict | None`：写一份 gzip 快照 + `.meta.json` 并登记索引；`payload` 为 `str`（按 UTF-8）或 `bytes`；同 `(article_id, kind)` 同 sha256 直接复用旧记录；`article_id` 只允许 `[A-Za-z0-9_-]{1,128}`，否则抛 `ArticleArchiveError`；
+- `article_archive.list_archives(db_path, article_id) -> list[dict]` / `get_archive(db_path, archive_id) -> tuple[dict, bytes]`：列表与读取（读取返回解压后的明文与索引行），索引缺失抛 `ArticleArchiveError`；
+- `article_archive.prune_expired_archives(db_path, *, retention_days=365) -> dict`：把过期快照移入 `archive_trash/{日期}/`，返回 `{scanned, moved, missing, failed}`；只处理有索引的行；
+- `article_archive.SCHEMA_SQL`：`article_archives` 建表语句，已拼进 `news_crawler.SCHEMA_SQL`，`init_db()` 新建库与老库升级都会执行；
 - `POST /v1/jobs` 的 `crawl`/`extract` schema 属于对外契约，新增字段必须保持向后兼容；
 - 数据库字段与 status 语义保持向后兼容，新增字段需要迁移策略。
 

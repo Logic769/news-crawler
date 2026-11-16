@@ -36,6 +36,8 @@
 | `docker-deploy.sh` / `docker-deploy.bat` | Docker 一键部署脚本（Linux·macOS / Windows） |
 | `smoke_test.py` | 部署后的离线自检脚本 |
 | `verify_live_news.py` | 实时新闻抓取验证（默认抽取 10 静态 / 10 JS 渲染 / 10 视频） |
+| `article_archive.py` | 公告原文归档：抓取时保留原始快照，索引存库、正文存 gzip 文件 |
+| `backfill_archives.py` | 给历史文章补原文快照（默认用库内正文，`--fetch-html` 才重抓） |
 | `live_news_pool.json` | 实时验证页面池（100 静态 / 50 JS 渲染 / 50 视频） |
 | `AGENTS.md` | 多 Agent 协作与开发说明（架构、规范、发布流程） |
 | `gne/` | 新闻抽取核心库（重构版，按字段拆分于 `gne/extractors/`） |
@@ -193,6 +195,7 @@ curl http://localhost:8000/v1/health
 | `NEWS_MAX_PENDING_JOBS` | `50` | 排队 + 运行中的作业上限，超出返回 `429`；相同类型与参数的未完成作业会复用 |
 | `NEWS_REQUIRE_AUTH` | 空（关闭） | 设为 `1` 时要求必须配置 `NEWS_API_KEY`，否则业务接口一律返回 `401` |
 | `NEWS_INSECURE_SSL` | 空（关闭） | 设为 `1`/`true`/`yes`/`on` 时，证书校验失败会打印 WARNING 并降级为不校验重试；默认直接抛错，避免中间人攻击 |
+| `NEWS_BACKUP_DIR` | `/app/backups`（compose） | 站点配置写入前的 JSON 备份目录；每次 `/v1/admin/sites` 变更都会在此保留一份 `sources_local_<时间戳>.json` |
 
 > 安全提示：未设置 `NEWS_API_KEY` 时接口完全开放。compose 默认只监听 `127.0.0.1`；如需局域网访问，请同时设置强随机 `NEWS_API_KEY` 再改 `NEWS_API_BIND=0.0.0.0`。`extract` 默认拒绝回环、内网与保留地址，并在每次 HTTP 重定向时重新校验目标；默认还禁用浏览器回退，避免通过页面 JS 绕过地址限制。确需抓取内网新闻时设置 `NEWS_ALLOW_PRIVATE_URLS=1`；确需浏览器渲染时再加 `NEWS_EXTRACT_ALLOW_BROWSER=1`。
 >
@@ -215,7 +218,10 @@ curl -H "X-API-Key: change-me" http://localhost:8000/v1/articles
 | GET | `/v1/health` | 健康检查，不需要 API Key |
 | GET | `/v1/articles` | 分页查询文章列表 |
 | GET | `/v1/articles/{id}` | 文章详情（始终包含正文） |
+| GET | `/v1/articles/{id}/archives` | 该文章的原文快照列表（`raw_html` 原始页面 / `api_response` 接口响应 / `body_html` 清洗正文） |
+| GET | `/v1/archives/{archive_id}` | 下载某份原文快照（直接返回解压后的内容，带 `X-Archive-SHA256`） |
 | GET | `/v1/sources` | 按站点聚合的统计 |
+| GET/POST/PUT/DELETE | `/v1/admin/sites` | 管理站点配置：列表、新增、按 `name` 更新、删除；写入前自动备份到 `NEWS_BACKUP_DIR`。接口型源（`api` 配置）只能在原配置上修改分类/地区/时区/渲染/启停等非接口字段，抓取地址与 XPath 由接口配置维护 |
 | GET | `/v1/stats` | 全库统计 |
 | POST | `/v1/jobs` | 创建异步任务（`crawl` 或 `extract`） |
 | GET | `/v1/jobs` | 任务列表 |
@@ -268,6 +274,7 @@ curl "http://localhost:8000/v1/articles?status=all&page_size=50"
 | `timezone` | 该文章写入时使用的站点时区（落库保存，站点配置变化不影响历史数据；`unknown_date` 等没有发布时间的结果不会写入该列，API extract 路径同样如此） |
 | `content` / `content_length` | 正文与字数（已归一化为单行；列表默认不返回，详情始终返回） |
 | `raw_content` | GNE 原始正文，保留段落换行；只在 `GET /v1/articles/{id}` 详情返回，列表（含 `include_content=true`）为 `null`；v4 之前入库的历史行为空，需 `--force` 重抓，或用 `backfill_raw_content.py` 回填（先 `--dry-run` 看候选数，再 `--limit 50` 小批试跑；容器内必须显式传 `--db /app/data/news.db`，命令见 AGENTS.md §8） |
+| `body_html` | 清洗后的正文 HTML（v9 新增，供下游详情页渲染）：白名单标签/属性，去掉脚本、事件属性与可执行 URL；与 `raw_content` 一样只在详情接口返回，列表默认不返回；历史行可用 `backfill_body_html.py` 回填（只写 `body_html`，不改 `content`/`raw_content`/`status`/`updated_at`，可重复运行；修复抽取器后重刷已有行用 `--overwrite`；接口型源拿不到原始 HTML 时用 `--from-raw` 从 `raw_content` 派生安全 HTML） |
 | `images` | 图片 URL 数组 |
 | `status` / `error` | 抓取状态与错误信息 |
 
@@ -390,6 +397,7 @@ cp sources.json sources.local.json
 | 字段 | 是否必填 | 说明 |
 | --- | --- | --- |
 | `name` | 必填 | 站点唯一标识，例如 `ncu_news` |
+| `enabled` | 可选 | 默认 `true`；设为 `false` 时 `load_config` 会在抓取前过滤掉该源，便于临时停用而不删配置 |
 | `list_url` | 二选一 | 新闻列表页地址 |
 | `list_urls` | 二选一 | 多个固定列表页地址组成的数组（旧版分页方式；单 `list_url` 站点请优先用 `pagination`） |
 | `item_xpath` | 必填 | 定位每条新闻节点的 XPath |
@@ -600,6 +608,27 @@ ORDER BY publish_time DESC;
 ```
 
 也可以用图形工具 [DB Browser for SQLite](https://sqlitebrowser.org/) 打开 `data/news.db`。
+
+### 原文归档
+
+每篇文章抓到页面时会存一份快照，用于事后核对站点是否改版、公告是否被撤下。覆盖 `ok`、`unknown_date` 以及项目申报的 `no_content` 分支（正文抽不出来但页面确实抓到了）；项目申报的 `old` 在截止时间早于窗口时抓取前就返回，不抓页面也不归档。
+
+- **存哪里**：索引在库里（`article_archives` 表），内容写成 gzip 文件放在库文件同级的 `data/archive/<article_id 前两位>/<article_id>/<时间>_<kind>.gz`，旁边附一份 `.meta.json` 便于脱离数据库核对来源；
+- **kind 有三种**：`raw_html`（详情页原始 HTML）、`api_response`（接口型源返回的条目 JSON）、`body_html`（历史行回填的清洗正文）；
+- **不会重复占盘**：同一条文章的同一种内容按 sha256 去重，反复重抓只留一份；
+- **保留一年**：过期快照由每轮抓取末尾的清理搬进 `data/archive_trash/<日期>/`，不硬删除；
+- **归档失败不影响抓取**：写盘或写索引出错只记日志，已入库的文章照常可用。
+
+历史文章（本功能上线前入库的）可以用 `backfill_archives.py` 补快照，默认只拿库内已有正文生成，不联网：
+
+```bash
+# 先看候选数
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_archives.py --db /app/data/news.db --dry-run
+# 小批补快照（默认用库内 body_html / raw_content，不联网）
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_archives.py --db /app/data/news.db --limit 500
+# 需要真正的原始页面时才重抓（受 --delay 限速）
+docker compose run --rm --entrypoint python crawler -X utf8 backfill_archives.py --db /app/data/news.db --fetch-html --limit 20
+```
 
 ### 数据状态说明
 

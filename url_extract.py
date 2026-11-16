@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from gne import GeneralNewsExtractor, NoContentException
+from html_sanitize import sanitize_body_html
 
 HEADERS = {
     "User-Agent": (
@@ -1067,6 +1068,7 @@ def extract_from_html(
             title_xpath=title_xpath,
             publish_time_xpath=publish_time_xpath,
             body_xpath=body_xpath,
+            with_body_html=True,
         )
     except NoContentException:
         result = None
@@ -1099,6 +1101,7 @@ def extract_from_html(
                     title_xpath=title_xpath,
                     publish_time_xpath=publish_time_xpath,
                     body_xpath=body_xpath,
+                    with_body_html=True,
                 )
             except NoContentException:
                 result = None
@@ -1113,6 +1116,9 @@ def extract_from_html(
     # 抽取出的图片可能是 //cdn.example.com/x.jpg 这类协议相对地址，
     # 按文章 URL 补全，避免下游拿到无法直接使用的地址。
     result["images"] = normalize_images(result.get("images"), url)
+    # 正文 HTML 来自第三方页面，入库前统一清洗：只保留排版标签与安全属性，
+    # 前端才能安全地 v-html 渲染（图片/表格/代码块等富文本形态）。
+    result["body_html"] = sanitize_body_html(result.get("body_html"), url)
     return result
 
 

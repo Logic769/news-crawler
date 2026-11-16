@@ -329,6 +329,7 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             author=news_crawler.clean_text(result.get("author")),
             content=news_crawler.clean_text(raw_content),
             raw_content=raw_content,
+            body_html=str(result.get("body_html") or ""),
             images=normalize_images_for_update(result.get("images"), url),
             status=status,
             error=error,
