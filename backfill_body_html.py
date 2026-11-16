@@ -254,18 +254,18 @@ def main(argv: list[str] | None = None) -> int:
     conn = init_db(str(db_path))
     try:
         if args.from_raw:
-            candidates = find_raw_candidates(
+            raw_candidates = find_raw_candidates(
                 conn, args.source, args.limit, overwrite=args.overwrite
             )
             scope = "全部" if args.overwrite else "body_html 为空"
             print(
-                f"候选 {len(candidates)} 条（status in {'/'.join(BACKFILL_STATUSES)} 且 {scope}，库内原文）"
+                f"候选 {len(raw_candidates)} 条（status in {'/'.join(BACKFILL_STATUSES)} 且 {scope}，库内原文）"
             )
             if args.dry_run:
                 print("dry-run：未写入任何正文 HTML。")
                 return 0
             updated, skipped = backfill_from_raw(
-                conn, candidates, overwrite=args.overwrite
+                conn, raw_candidates, overwrite=args.overwrite
             )
             print(f"完成：回填 {updated} 条，跳过 {skipped} 条。")
             return 0

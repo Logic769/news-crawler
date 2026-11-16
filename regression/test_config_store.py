@@ -85,6 +85,7 @@ class ConfigStoreTest(unittest.TestCase):
 
         updated = config_store.update_site(self.path, "new-site", {"enabled": True})
         self.assertIsNotNone(updated)
+        assert updated is not None
         self.assertTrue(updated["enabled"])
         self.assertEqual(updated["title_xpath"], ".//h2")
 
@@ -102,6 +103,7 @@ class ConfigStoreTest(unittest.TestCase):
         ):
             updated = config_store.update_site(self.path, "existing", {"enabled": False})
         self.assertIsNotNone(updated)
+        assert updated is not None
         self.assertFalse(updated["enabled"])
         self.assertFalse((self.root / "sources.local.json.tmp").exists())
         data = json.loads(self.path.read_text(encoding="utf-8"))
