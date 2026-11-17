@@ -15,7 +15,7 @@ import os
 import signal
 import subprocess
 import sys
-import time
+import threading
 import urllib.request
 from pathlib import Path
 from typing import IO
@@ -84,13 +84,15 @@ def trigger_analysis(url: str, api_key: str, limit: int = 1000, timeout: int = 1
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["X-API-Key"] = api_key
-    request = urllib.request.Request(
-        url.rstrip("/") + "/v1/jobs",
-        data=payload,
-        headers=headers,
-        method="POST",
-    )
     try:
+        # URL 构造也会校验 scheme；非法 INSIGHT_URL 必须只记分析失败，
+        # 不能让它冒泡到 run_forever 终止整个调度进程。
+        request = urllib.request.Request(
+            url.rstrip("/") + "/v1/jobs",
+            data=payload,
+            headers=headers,
+            method="POST",
+        )
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read(500).decode("utf-8", "replace")
         LOG.info("已触发 insight 分析作业: HTTP %s %s", response.status, body)
@@ -156,14 +158,37 @@ class FileLock:
             self._file = None
 
 
-def execute_once(args: argparse.Namespace) -> int:
+def _wait_for_crawl(proc: subprocess.Popen, stop: threading.Event | None) -> int:
+    """等待抓取子进程结束；收到停止信号时先终止子进程并回收。"""
+    while True:
+        try:
+            return proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            if stop is None or not stop.is_set():
+                continue
+            LOG.info("收到停止信号，终止抓取子进程")
+            proc.terminate()
+            try:
+                return proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                LOG.warning("抓取子进程 10 秒内未退出，强制终止")
+                proc.kill()
+                return proc.wait()
+
+
+def execute_once(
+    args: argparse.Namespace, stop: threading.Event | None = None
+) -> int:
     lock = FileLock(Path(args.lock_file))
     if not lock.acquire():
         LOG.warning("已有采集任务在运行，跳过本轮")
         return 1
     try:
+        if stop is not None and stop.is_set():
+            return 1
         LOG.info("开始抓取: %s", " ".join(crawl_command(args)))
-        code = subprocess.run(crawl_command(args), check=False).returncode
+        proc = subprocess.Popen(crawl_command(args))
+        code = _wait_for_crawl(proc, stop)
         LOG.info("抓取结束，exit code=%s", code)
         if code == 0:
             trigger_analysis(args.insight_url, args.insight_api_key, args.analyze_limit)
@@ -172,30 +197,34 @@ def execute_once(args: argparse.Namespace) -> int:
         lock.release()
 
 
-def run_forever(args: argparse.Namespace) -> int:
-    times = parse_times(args.times)
-    timezone = ZoneInfo(args.timezone)
-    stop = False
-
+def _install_stop_handlers(stop: threading.Event) -> None:
     def _stop(_signum, _frame) -> None:
-        nonlocal stop
-        stop = True
+        stop.set()
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
+
+
+def run_forever(args: argparse.Namespace) -> int:
+    times = parse_times(args.times)
+    timezone = ZoneInfo(args.timezone)
+    stop = threading.Event()
+    _install_stop_handlers(stop)
     LOG.info("定时采集启动: times=%s timezone=%s", args.times, args.timezone)
-    while not stop:
+    while not stop.is_set():
         now = dt.datetime.now(timezone)
         at = next_run_at(now, times)
         LOG.info("下一次采集: %s", at.isoformat())
-        while not stop:
+        while not stop.is_set():
             remaining = (at - dt.datetime.now(timezone)).total_seconds()
             if remaining <= 0:
                 break
-            time.sleep(min(remaining, 60))
-        if stop:
+            # Event.wait 可被信号处理器立即唤醒，避免 SIGTERM 后还要睡满 60 秒。
+            if stop.wait(timeout=min(remaining, 60)):
+                break
+        if stop.is_set():
             break
-        execute_once(args)
+        execute_once(args, stop)
     LOG.info("定时采集已停止")
     return 0
 
@@ -224,7 +253,10 @@ def main() -> int:
     args = build_parser().parse_args()
     parse_times(args.times)  # 启动即校验，配置错误直接退出
     if args.once:
-        return execute_once(args)
+        # --once 也要响应 SIGTERM：docker compose run 被中断时不能留下孤儿抓取进程。
+        stop = threading.Event()
+        _install_stop_handlers(stop)
+        return execute_once(args, stop)
     return run_forever(args)
 
 

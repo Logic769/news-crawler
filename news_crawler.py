@@ -3262,11 +3262,17 @@ def run_source(
             len(entries),
         )
         if not entries:
-            counts["list_empty"] = 1
-            if collected["stop_reason"] == "cutoff":
-                LOG.info("[%s] 抓取窗口内没有新条目。", source_name)
+            # fetch_failed 是列表页请求失败，不是「没有新文章」；如果把它记成
+            # list_empty，整轮会误判成功并提交一次无意义的分析作业。
+            if collected["stop_reason"] == "fetch_failed":
+                counts["error"] += 1
+                LOG.error("[%s] 列表页抓取失败，本轮视为站点失败。", source_name)
             else:
-                LOG.warning("[%s] 列表页没有解析到任何条目。", source_name)
+                counts["list_empty"] = 1
+                if collected["stop_reason"] == "cutoff":
+                    LOG.info("[%s] 抓取窗口内没有新条目。", source_name)
+                else:
+                    LOG.warning("[%s] 列表页没有解析到任何条目。", source_name)
         else:
             now = dt.datetime.now(
                 get_timezone(source.get("timezone") or "Asia/Shanghai")
@@ -3333,7 +3339,19 @@ def cmd_init(args: argparse.Namespace) -> None:
     print(f"数据库已初始化：{args.db}")
 
 
-def cmd_run(args: argparse.Namespace) -> None:
+def run_exit_code(total: dict[str, int]) -> int:
+    """只在「没有任何有效产出且存在处理失败」时返回非零，供调度器判断是否触发分析。
+
+    单个站点全部失败、或所有站点都没有产出且至少一个站点报错时，整轮视为失败；
+    没有新文章（list_empty）不算失败，正常返回 0。no_content/unknown_date 也是
+    处理失败状态，不能因为「有记录」就当成有效产出。
+    """
+    effective = sum(total.get(key, 0) for key in ("ok", "old", "skip"))
+    failed = sum(total.get(key, 0) for key in ("error", "no_content", "unknown_date"))
+    return 1 if effective == 0 and failed > 0 else 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
     config_path = resolve_config_path(args.config)
     config = load_config(config_path)
     sources = config["sources"]
@@ -3342,7 +3360,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             f"{config_path} 里还没有配置任何站点。"
             "请参考 README 中的配置说明添加站点。"
         )
-        return
+        return 0
 
     db_path = args.db
     conn = init_db(db_path)
@@ -3381,8 +3399,10 @@ def cmd_run(args: argparse.Namespace) -> None:
             try:
                 name, counts = future.result()
             except Exception as exc:
-                # 单个站点任务抛出未捕获异常时隔离，不影响其余站点继续汇总。
+                # 单个站点任务抛出未捕获异常时隔离，不影响其余站点继续汇总；
+                # 但必须计入 error，否则全部站点都在线程边界失败时会被误判成功。
                 LOG.exception("站点任务异常：%s", exc)
+                total["error"] = total.get("error", 0) + 1
                 continue
             for key, value in counts.items():
                 total[key] = total.get(key, 0) + value
@@ -3400,6 +3420,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         "SELECT source, title, publish_time, url FROM articles "
         "WHERE status='ok' ORDER BY publish_time DESC;"
     )
+    return run_exit_code(total)
 
 
 def cmd_test(args: argparse.Namespace) -> None:
@@ -3486,7 +3507,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.func(args)
+    result = args.func(args)
+    # cmd_run 用退出码告诉调度器这一轮是否全部失败；其余命令返回 None。
+    raise SystemExit(result or 0)
 
 
 if __name__ == "__main__":

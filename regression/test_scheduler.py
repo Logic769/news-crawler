@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -107,6 +109,13 @@ class FileLockTests(unittest.TestCase):
             second.release()
 
 
+class TriggerAnalysisTests(unittest.TestCase):
+    def test_invalid_url_only_logs_and_returns_false(self) -> None:
+        with mock.patch.object(scheduler.urllib.request, "urlopen") as urlopen:
+            self.assertFalse(scheduler.trigger_analysis("insight", ""))
+            urlopen.assert_not_called()
+
+
 class ExecuteOnceTests(unittest.TestCase):
     def test_skips_when_lock_is_held(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -114,31 +123,68 @@ class ExecuteOnceTests(unittest.TestCase):
             holder = scheduler.FileLock(Path(args.lock_file))
             self.assertTrue(holder.acquire())
             try:
-                with mock.patch.object(scheduler.subprocess, "run") as run:
+                with mock.patch.object(scheduler.subprocess, "Popen") as popen:
                     self.assertEqual(scheduler.execute_once(args), 1)
-                    run.assert_not_called()
+                    popen.assert_not_called()
             finally:
                 holder.release()
 
     def test_success_triggers_analysis(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             args = _args(lock_file=str(Path(temp_dir) / "crawl.lock"), insight_url="http://insight:8020")
-            with mock.patch.object(scheduler.subprocess, "run") as run, mock.patch.object(
+            with mock.patch.object(scheduler.subprocess, "Popen") as popen, mock.patch.object(
                 scheduler, "trigger_analysis"
             ) as trigger:
-                run.return_value = mock.Mock(returncode=0)
+                popen.return_value.wait.return_value = 0
                 self.assertEqual(scheduler.execute_once(args), 0)
                 trigger.assert_called_once_with("http://insight:8020", "", 1000)
 
     def test_failure_does_not_trigger_analysis(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             args = _args(lock_file=str(Path(temp_dir) / "crawl.lock"), insight_url="http://insight:8020")
-            with mock.patch.object(scheduler.subprocess, "run") as run, mock.patch.object(
+            with mock.patch.object(scheduler.subprocess, "Popen") as popen, mock.patch.object(
                 scheduler, "trigger_analysis"
             ) as trigger:
-                run.return_value = mock.Mock(returncode=1)
+                popen.return_value.wait.return_value = 1
                 self.assertEqual(scheduler.execute_once(args), 1)
                 trigger.assert_not_called()
+
+    def test_stop_signal_terminates_running_child(self) -> None:
+        stop = threading.Event()
+        stop.set()
+        process = mock.Mock()
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired("news_crawler.py", 1),
+            143,
+        ]
+        self.assertEqual(scheduler._wait_for_crawl(process, stop), 143)
+        process.terminate.assert_called_once()
+
+    def test_stop_signal_kills_child_after_terminate_timeout(self) -> None:
+        stop = threading.Event()
+        stop.set()
+        process = mock.Mock()
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired("news_crawler.py", 1),
+            subprocess.TimeoutExpired("news_crawler.py", 10),
+            9,
+        ]
+        self.assertEqual(scheduler._wait_for_crawl(process, stop), 9)
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+
+
+class ExecuteOnceStopWiringTests(unittest.TestCase):
+    def test_execute_once_passes_stop_event_to_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = _args(lock_file=str(Path(temp_dir) / "crawl.lock"))
+            stop = threading.Event()
+            with mock.patch.object(scheduler.subprocess, "Popen") as popen, mock.patch.object(
+                scheduler, "_wait_for_crawl", return_value=0
+            ) as wait:
+                self.assertEqual(scheduler.execute_once(args, stop), 0)
+                popen.assert_called_once()
+                self.assertIs(wait.call_args.args[1], stop)
 
 
 if __name__ == "__main__":

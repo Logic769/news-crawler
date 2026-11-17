@@ -178,7 +178,7 @@ docker compose run --rm scheduler scheduler --once  # 立即执行一次，便�
 | `INSIGHT_API_KEY` | 空 | 调用 insight `/v1/jobs` 时携带的 `X-API-Key` |
 | `ANALYZE_LIMIT` | `1000` | 单次分析作业上限 |
 
-调度器使用 `data/.crawl.lock` 文件锁防止上一轮未结束时重复启动；抓取失败只记日志，下一轮照常执行。若只想手动抓取，保持 `scheduler` 服务不启动即可。
+调度器使用 `data/.crawl.lock` 文件锁防止上一轮未结束时重复启动；单轮抓取失败只记日志，下一轮照常执行。整轮只产生错误、没有任何有效产出时 `news_crawler.py run` 返回非零退出码，调度器不会提交分析作业。若只想手动抓取，保持 `scheduler` 服务不启动即可。
 
 ---
 
