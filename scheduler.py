@@ -18,6 +18,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from typing import IO
 from zoneinfo import ZoneInfo
 
 LOG = logging.getLogger("scheduler")
@@ -104,7 +105,7 @@ class FileLock:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._file = None
+        self._file: IO[bytes] | None = None
 
     def acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -119,7 +120,7 @@ class FileLock:
             if os.name == "nt":
                 import msvcrt
 
-                msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
             else:
                 import fcntl
 
@@ -145,7 +146,7 @@ class FileLock:
                 import msvcrt
 
                 self._file.seek(0)
-                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
             else:
                 import fcntl
 
