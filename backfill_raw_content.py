@@ -132,6 +132,29 @@ def write_failed_list(path: Path, failures: list[Failure]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def load_source_body_modes(config_path: str) -> dict[str, str]:
+    """读取站点配置里的 article_body_mode，返回 {站点名: 模式}。
+
+    回填和主抓取共用 extract_article；只传 body_xpath 而不传 body_mode 时，
+    article_body_mode=container 的站点会退回 GNE 密度算法，回填出的正文与
+    现抓结果不一致。配置缺失或损坏时返回空字典，按默认 GNE 处理。
+    """
+    path = resolve_config_path(config_path)
+    try:
+        config = load_config(path)
+    except (OSError, ValueError):
+        return {}
+    result: dict[str, str] = {}
+    for item in config.get("sources") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        mode = str(item.get("article_body_mode") or "").strip().lower()
+        if name and mode:
+            result[name] = mode
+    return result
+
+
 def load_source_xpaths(config_path: str) -> dict[str, str]:
     """读取站点配置里的 article_body_xpath，返回 {站点名: body_xpath}。
 
@@ -165,6 +188,7 @@ def backfill(
     allow_browser: bool,
     dry_run: bool,
     source_xpaths: dict[str, str] | None = None,
+    source_body_modes: dict[str, str] | None = None,
 ) -> tuple[int, int, int, list[Failure], int]:
     """逐条重抓并写回 raw_content。
 
@@ -176,6 +200,7 @@ def backfill(
         return 0, 0, 0, [], 0
 
     source_xpaths = source_xpaths or {}
+    source_body_modes = source_body_modes or {}
     # 单线程串行复用同一实例是安全的（跨线程共享才会出 math domain error）。
     extractor = GeneralNewsExtractor()
     updated = 0
@@ -193,6 +218,7 @@ def backfill(
                     extractor,
                     allow_browser=allow_browser,
                     body_xpath=source_xpaths.get(source, ""),
+                    body_mode=source_body_modes.get(source, ""),
                 )
                 raw_content = str((result or {}).get("content") or "").strip()
             except Exception as exc:  # 单条失败不能中止整批
@@ -333,6 +359,7 @@ def main(argv: list[str] | None = None) -> int:
         if skip:
             print(f"已跳过清单中的 {len(skip)} 条")
         source_xpaths = {} if args.dry_run else load_source_xpaths(args.config)
+        source_body_modes = {} if args.dry_run else load_source_body_modes(args.config)
         if source_xpaths:
             names = "、".join(sorted(source_xpaths))
             print(f"已读取 {len(source_xpaths)} 个站点的 article_body_xpath：{names}")
@@ -350,6 +377,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_browser=args.allow_browser,
             dry_run=args.dry_run,
             source_xpaths=source_xpaths,
+            source_body_modes=source_body_modes,
         )
     finally:
         conn.close()

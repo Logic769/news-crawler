@@ -27,7 +27,7 @@ import urllib.error
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 import lxml.html
@@ -956,6 +956,7 @@ _API_METHODS = ("GET", "POST")
 # 归一化结果的内部标记：让 _api_settings 可以幂等调用（load_config 与
 # collect 各一次），不重复打告警、不重复解析。
 _API_NORMALIZED_FLAG = "_normalized"
+_DATASTORE_NORMALIZED_FLAG = "_normalized"
 
 
 def _dig(data: Any, path: str) -> Any:
@@ -978,6 +979,11 @@ def _dig(data: Any, path: str) -> Any:
         if current is None:
             return None
     return current
+
+
+def _api_string(value: Any) -> str:
+    """接口字段转展示/占位字符串：只把 None 视为缺失，0/False 原样保留。"""
+    return "" if value is None else str(value).strip()
 
 
 def _api_settings(source: dict) -> dict[str, Any] | None:
@@ -1022,9 +1028,11 @@ def _api_settings(source: dict) -> dict[str, Any] | None:
     elif headers_raw is not None:
         LOG.warning("站点 %r 的 api.headers 不是对象，已忽略", name)
     items_path = str(raw.get("items_path") or "").strip()
-    if not items_path:
+    html_path = str(raw.get("html_path") or "").strip()
+    root_array = _config_bool(raw, "root_array", False, prefix="api")
+    if not items_path and not html_path and not root_array:
         LOG.error(
-            "站点 %r 的 api.items_path 为空：无法定位条目数组，该站点不会有数据",
+            "站点 %r 的 api.items_path 为空且未配置 html_path/root_array：无法定位条目，该站点不会有数据",
             name,
         )
     api_url = str(raw.get("url") or "").strip()
@@ -1034,19 +1042,63 @@ def _api_settings(source: dict) -> dict[str, Any] | None:
         # 默认取接口自身的 scheme://host[:port]/ 作基准；与接口不同域时
         # 由显式 base_url 覆盖。
         base_url = _origin_prefix(api_url)
+    detail_payload_value = raw.get("detail_payload")
+    detail_url = str(raw.get("detail_url") or "").strip()
+    if html_path and detail_url:
+        # html_path 走 parse_list_items，条目只有 title/url/date，没有接口 id；
+        # 详情模板里的 {id} 无法展开，固定 URL 又会让所有条目抓同一页。
+        LOG.warning(
+            "站点 %r 同时配置 api.html_path 与 api.detail_url：HTML 片段条目没有 id，detail_url 无法逐条展开，已禁用",
+            name,
+        )
+        detail_url = ""
+    payload_format = str(raw.get("payload_format") or "json").strip().lower()
+    if payload_format not in {"json", "form"}:
+        LOG.warning(
+            "站点 %r 的 api.payload_format=%r 不支持（可选 json/form），回退为 json",
+            name,
+            raw.get("payload_format"),
+        )
+        payload_format = "json"
+    detail_method = str(raw.get("detail_method") or "POST").strip().upper()
+    if detail_method not in _API_METHODS:
+        LOG.warning(
+            "站点 %r 的 api.detail_method=%r 不支持（可选 GET/POST），回退为 POST",
+            name,
+            raw.get("detail_method"),
+        )
+        detail_method = "POST"
+    if detail_payload_value is not None and not isinstance(detail_payload_value, dict):
+        LOG.warning("站点 %r 的 api.detail_payload 不是对象，已忽略", name)
+        detail_payload = {}
+    else:
+        detail_payload = dict(detail_payload_value) if isinstance(detail_payload_value, dict) else {}
+    page_param_mode = str(raw.get("page_param_mode") or "page").strip().lower()
+    if page_param_mode not in {"page", "offset"}:
+        LOG.warning(
+            "站点 %r 的 api.page_param_mode=%r 不支持（可选 page/offset），回退为 page",
+            name,
+            raw.get("page_param_mode"),
+        )
+        page_param_mode = "page"
     return {
         _API_NORMALIZED_FLAG: True,
         "url": api_url,
         "base_url": base_url,
         "method": method,
         "payload": payload,
+        "payload_format": payload_format,
         "headers": headers,
         "items_path": items_path,
+        "html_path": html_path,
+        "root_array": root_array,
+        "item_path": str(raw.get("item_path") or "").strip(),
         "total_path": str(raw.get("total_path") or "").strip(),
         "page_param": str(raw.get("page_param") or "pageNum").strip(),
+        "page_param_mode": page_param_mode,
         "page_size_param": str(raw.get("page_size_param") or "pageSize").strip(),
         "page_size": _config_int(raw, "page_size", 20, 1, 500, prefix="api"),
-        "start_page": _config_int(raw, "start_page", 1, 1, 10000, prefix="api"),
+        "start_page": _config_int(raw, "start_page", 1, 0, 10000, prefix="api"),
         "max_pages": _config_int(raw, "max_pages", 20, 1, 500, prefix="api"),
         "url_field": str(raw.get("url_field") or "originalURL").strip(),
         "url_template": str(raw.get("url_template") or "").strip(),
@@ -1055,6 +1107,14 @@ def _api_settings(source: dict) -> dict[str, Any] | None:
         "date_field": str(raw.get("date_field") or "publishTime").strip(),
         "date_format": str(raw.get("date_format") or "").strip() or None,
         "content_field": str(raw.get("content_field") or "content").strip(),
+        "detail_url": detail_url,
+        "detail_method": detail_method,
+        "detail_payload": detail_payload,
+        "detail_content_field": str(raw.get("detail_content_field") or "content").strip(),
+        "detail_content_is_html": _config_bool(
+            raw, "detail_content_is_html", True, prefix="api"
+        ),
+        "legacy_ssl": _config_bool(raw, "legacy_ssl", False, prefix="api"),
         "author_field": str(raw.get("author_field") or "").strip(),
         "content_is_html": _config_bool(
             raw, "content_is_html", True, prefix="api"
@@ -1065,6 +1125,87 @@ def _api_settings(source: dict) -> dict[str, Any] | None:
         "stop_after_known_pages": _config_int(
             raw, "stop_after_known_pages", 0, 0, 100, prefix="api"
         ),
+    }
+
+
+
+def _datastore_settings(source: dict) -> dict[str, Any] | None:
+    """归一化“datastore 列表源”配置，返回 None 表示该站点不是这种源。
+
+    适用于大汉版通等 CMS：首页把列表条目以 CDATA 形式嵌在 script 里，
+    后续页必须 POST 到 dataproxy.jsp 才能拿到 XML。配置放在 source["datastore"]，
+    与 source["api"] 互斥；采集入口会自动分派。
+    """
+    raw = source.get("datastore")
+    if raw is None:
+        return None
+    if isinstance(raw, dict) and raw.get(_DATASTORE_NORMALIZED_FLAG):
+        return raw
+    name = source.get("name")
+    if not isinstance(raw, dict):
+        LOG.error("站点 %r 的 datastore 不是对象，已按空配置处理", name)
+        raw = {}
+    params_raw = raw.get("params")
+    if params_raw is None:
+        params: dict[str, str] = {}
+    elif isinstance(params_raw, dict):
+        params = {str(key): str(value) for key, value in params_raw.items()}
+    else:
+        LOG.warning("站点 %r 的 datastore.params 不是对象，已忽略", name)
+        params = {}
+    payload_raw = raw.get("payload")
+    if payload_raw is None:
+        payload: dict[str, str] = {}
+    elif isinstance(payload_raw, dict):
+        payload = {str(key): str(value) for key, value in payload_raw.items()}
+    else:
+        LOG.warning("站点 %r 的 datastore.payload 不是对象，已忽略", name)
+        payload = {}
+    headers_raw = raw.get("headers")
+    if headers_raw is None:
+        headers: dict[str, str] = {}
+    elif isinstance(headers_raw, dict):
+        headers = {str(key): str(value) for key, value in headers_raw.items()}
+    else:
+        LOG.warning("站点 %r 的 datastore.headers 不是对象，已忽略", name)
+        headers = {}
+    url = str(raw.get("url") or "").strip()
+    base_url = str(raw.get("base_url") or "").strip() or _origin_prefix(url)
+    method = str(raw.get("method") or "POST").strip().upper()
+    if method not in _API_METHODS:
+        LOG.warning(
+            "站点 %r 的 datastore.method=%r 不支持（可选 GET/POST），回退为 POST",
+            name,
+            raw.get("method"),
+        )
+        method = "POST"
+    return {
+        _DATASTORE_NORMALIZED_FLAG: True,
+        "url": url,
+        "base_url": base_url,
+        "method": method,
+        "params": params,
+        "payload": payload,
+        "headers": headers,
+        "page_size": _config_int(raw, "page_size", 25, 1, 500, prefix="datastore"),
+        "total": _config_int(raw, "total", 0, 0, 10**9, prefix="datastore"),
+        "max_pages": _config_int(raw, "max_pages", 0, 0, 500, prefix="datastore"),
+        "start_record_param": str(raw.get("start_record_param") or "startrecord").strip(),
+        "end_record_param": str(raw.get("end_record_param") or "endrecord").strip(),
+        "per_page_param": str(raw.get("per_page_param") or "perpage").strip(),
+        "record_regex": str(
+            raw.get("record_regex")
+            or r"<record>\s*<!\[CDATA\[(.*?)\]\]>\s*</record>"
+        ),
+        "total_regex": str(raw.get("total_regex") or r"<totalrecord>(\d+)</totalrecord>"),
+        "item_xpath": str(raw.get("item_xpath") or "//li").strip() or "//li",
+        "stop_when_older_than_cutoff": _config_bool(
+            raw, "stop_when_older_than_cutoff", True, prefix="datastore"
+        ),
+        "stop_after_known_pages": _config_int(
+            raw, "stop_after_known_pages", 0, 0, 100, prefix="datastore"
+        ),
+        "legacy_ssl": _config_bool(raw, "legacy_ssl", False, prefix="datastore"),
     }
 
 
@@ -1152,6 +1293,22 @@ def load_config(path: str) -> dict:
                 source[field_name] = _validate_xpath_field(
                     source.get("name"), source.get(field_name), field_name
                 )
+        body_mode = str(source.get("article_body_mode") or "").strip().lower()
+        if body_mode not in ("", "container"):
+            LOG.warning(
+                "站点 %r 的 article_body_mode %r 不受支持，按默认 GNE 密度算法处理",
+                source.get("name"),
+                source.get("article_body_mode"),
+            )
+            body_mode = ""
+        if body_mode == "container" and not source.get("article_body_xpath"):
+            LOG.warning(
+                "站点 %r 配置了 article_body_mode=container 但没有 article_body_xpath，"
+                "将退回默认 GNE 密度算法",
+                source.get("name"),
+            )
+            body_mode = ""
+        source["article_body_mode"] = body_mode
         # 项目申报特化：deadline_xpath / project_status_xpath 与标题时间 XPath
         # 走同一套校验（非法或标量表达式直接忽略，不中断整站抓取）。
         for field_name in ("deadline_xpath", "project_status_xpath"):
@@ -1205,12 +1362,20 @@ def load_config(path: str) -> dict:
         api_settings = _api_settings(source)
         if api_settings is not None:
             source["api"] = api_settings
-            if not api_settings["items_path"]:
+            if (
+                not api_settings["items_path"]
+                and not api_settings["html_path"]
+                and not api_settings["root_array"]
+            ):
                 LOG.warning(
-                    "站点 %r 是接口型源但 items_path 为空，抓取不会得到条目",
+                    "站点 %r 是接口型源但 items_path 为空且未配置 html_path/root_array，抓取不会得到条目",
                     source.get("name"),
                 )
-            if not api_settings["url_field"] and not api_settings["url_template"]:
+            if (
+                not api_settings["html_path"]
+                and not api_settings["url_field"]
+                and not api_settings["url_template"]
+            ):
                 LOG.warning(
                     "站点 %r 是接口型源但既没有 url_field 也没有 url_template，"
                     "条目将没有可用链接（下游按 id 识别会失败）",
@@ -1234,6 +1399,29 @@ def load_config(path: str) -> dict:
                 LOG.warning(
                     "站点 %r 同时配置了 api 与 listing_type=project_application："
                     "接口正文与截止时间都不会被采用，请改成新闻模式或去掉 api",
+                    source.get("name"),
+                )
+        datastore_settings = _datastore_settings(source)
+        if datastore_settings is not None:
+            source["datastore"] = datastore_settings
+            if source.get("api") is not None:
+                LOG.warning(
+                    "站点 %r 同时配置了 api 与 datastore：按 datastore 采集，api 配置被忽略",
+                    source.get("name"),
+                )
+            if not datastore_settings["url"]:
+                LOG.error(
+                    "站点 %r 是 datastore 源但没有 datastore.url，该站点不会有数据",
+                    source.get("name"),
+                )
+            if not source.get("list_url"):
+                LOG.warning(
+                    "站点 %r 是 datastore 源但没有 list_url，首页无法读取",
+                    source.get("name"),
+                )
+            if source.get("list_urls"):
+                LOG.warning(
+                    "站点 %r 是 datastore 源，list_urls 不参与采集",
                     source.get("name"),
                 )
         source.setdefault("date_skew_days", data["date_skew_days"])
@@ -1874,11 +2062,22 @@ def _find_next_page_url(html: str, page_url: str, source: dict, settings: dict[s
     return ""
 
 
+def _api_page_value(settings: dict[str, Any], page: int) -> int:
+    """把页码转成接口参数值。
+
+    默认 page 直接传页码；page_param_mode=offset 时传 page * page_size，
+    适配创客中国这类用 start_index 偏移量而不是页码的接口。
+    """
+    if settings.get("page_param_mode") == "offset":
+        return page * settings["page_size"]
+    return page
+
+
 def _api_page_url(settings: dict[str, Any], page: int) -> str:
     """接口地址：支持 url 里的 {page} 占位符，其余翻页参数走 payload。"""
     url = settings["url"]
     if "{page}" in url:
-        return url.replace("{page}", str(page))
+        return url.replace("{page}", str(_api_page_value(settings, page)))
     return url
 
 
@@ -1886,10 +2085,62 @@ def _api_request_payload(settings: dict[str, Any], page: int) -> dict[str, Any]:
     """把页码/页大小合并进 payload，覆盖配置里写死的同名键。"""
     payload = dict(settings["payload"])
     if settings["page_param"]:
-        payload[settings["page_param"]] = page
+        payload[settings["page_param"]] = _api_page_value(settings, page)
     if settings["page_size_param"]:
         payload[settings["page_size_param"]] = settings["page_size"]
     return payload
+
+
+def _api_fill_detail(
+    entry: dict[str, Any], item: Any, settings: dict[str, Any], url_validator: Any
+) -> None:
+    """列表接口不带正文时，按 detail_url 再取一次详情 JSON 填充正文。"""
+    if not settings["detail_url"] or entry.get("content"):
+        return
+    item_id = _api_string(_dig(item, settings["id_field"]))
+    if not item_id and "{id}" in settings["detail_url"]:
+        LOG.warning(
+            "站点接口条目缺少 id 字段 %r，无法请求详情，跳过正文：%r",
+            settings["id_field"],
+            entry.get("title"),
+        )
+        return
+    url = settings["detail_url"].replace("{id}", item_id)
+    from url_extract import fetch_json
+
+    payload = settings["detail_payload"] if settings["detail_method"] == "POST" else None
+    try:
+        detail = fetch_json(
+            url,
+            method=settings["detail_method"],
+            payload=payload,
+            headers=settings["headers"],
+            url_validator=url_validator,
+            legacy_renegotiation=settings["legacy_ssl"],
+            form_payload=settings["payload_format"] == "form",
+        )
+    except Exception as exc:  # noqa: BLE001 - 单篇详情失败不应丢整页列表
+        LOG.warning("接口详情获取失败，保留列表字段：%s（%s）", url, exc)
+        return
+    if isinstance(detail, list):
+        detail = detail[0] if detail else {}
+    if not isinstance(detail, dict):
+        return
+    raw_body = _dig(detail, settings["detail_content_field"])
+    if not raw_body:
+        return
+    text, images = (
+        _html_to_text(str(raw_body))
+        if settings["detail_content_is_html"]
+        else (str(raw_body), [])
+    )
+    if not text:
+        return
+    entry["content"] = clean_text(text)
+    entry["raw_content"] = text
+    entry["images"] = images
+    if settings["detail_content_is_html"]:
+        entry["body_html"] = sanitize_body_html(str(raw_body), str(entry["url"]))
 
 
 def _api_item_to_entry(
@@ -1905,7 +2156,7 @@ def _api_item_to_entry(
     title = clean_title(_dig(item, settings["title_field"]))
     raw_url = str(_dig(item, settings["url_field"]) or "").strip()
     if not raw_url and settings["url_template"]:
-        item_id = str(_dig(item, settings["id_field"]) or "").strip()
+        item_id = _api_string(_dig(item, settings["id_field"]))
         # id 为空时 url_template 会退化成 "https://host/detail/" 这种非空串，
         # 绕过下面的空链接检查，导致整页条目共用一个 URL、去重后只剩第一条。
         if not item_id and "{id}" in settings["url_template"]:
@@ -1960,7 +2211,7 @@ def _api_item_to_entry(
         "deadline_text": "",
         "deadline": None,
         "project_status": "",
-        "api_id": str(_dig(item, settings["id_field"]) or ""),
+        "api_id": _api_string(_dig(item, settings["id_field"])),
     }
     raw_body = _dig(item, settings["content_field"])
     if raw_body:
@@ -1981,6 +2232,219 @@ def _api_item_to_entry(
     if settings["author_field"]:
         entry["author"] = clean_text(_dig(item, settings["author_field"]))
     return entry
+
+
+def _datastore_records(html: str, settings: dict[str, Any]) -> list[str]:
+    """从首页或 dataproxy XML 中提取 CDATA 里的 record 片段。"""
+    try:
+        records = re.findall(settings["record_regex"], html, re.S)
+    except re.error as exc:
+        LOG.warning("datastore.record_regex 非法：%s", exc)
+        return []
+    return [str(item).strip() for item in records if str(item).strip()]
+
+
+def _datastore_items(
+    records: list[str],
+    source: dict,
+    settings: dict[str, Any],
+    page_url: str,
+) -> list[dict]:
+    if not records:
+        return []
+    fragment = "<html><body><ul>" + "\n".join(records) + "</ul></body></html>"
+    virtual_source = dict(source)
+    virtual_source["item_xpath"] = settings["item_xpath"]
+    return parse_list_items(
+        fragment,
+        virtual_source,
+        settings["base_url"] or str(source.get("list_url") or page_url),
+    )
+
+
+def _datastore_page_url(settings: dict[str, Any], start: int, end: int) -> str:
+    query = dict(settings["params"])
+    query[settings["start_record_param"]] = str(start)
+    query[settings["end_record_param"]] = str(end)
+    query[settings["per_page_param"]] = str(settings["page_size"])
+    base = settings["url"]
+    separator = "&" if "?" in base else "?"
+    return base + separator + urlencode(query)
+
+
+def _collect_datastore_entries(
+    source: dict,
+    settings: dict[str, Any],
+    *,
+    cutoff: dt.datetime | None = None,
+    known_urls: set[str] | None = None,
+) -> dict[str, Any]:
+    """按首页 CDATA + dataproxy POST 翻页采集，返回与 HTML 采集同构的结果。
+
+    首页由 list_url 提供，record 以 CDATA 嵌在 script 中；后续页 POST
+    到 datastore.url（大汉版通 dataproxy.jsp），每页返回 XML recordset。
+    停止条件与 HTML/API 分页一致：max_pages、空页、整页早于 cutoff、
+    连续若干页全是已入库链接，或达到 totalrecord。
+    """
+    from url_extract import fetch_text
+
+    page_size = int(settings["page_size"])
+    page_urls: list[str] = []
+    all_items: list[dict] = []
+    seen_urls: set[str] = set()
+    pages = 0
+    known_streak = 0
+    stop_reason = "done"
+    total = settings["total"] or None
+    delay = float(source.get("delay", 0) or 0)
+    is_project = source.get("listing_type") == "project_application"
+    list_url = str(source.get("list_url") or "").strip()
+    if not list_url:
+        return {
+            "items": [],
+            "pages": 0,
+            "page_urls": [],
+            "stop_reason": "fetch_failed",
+        }
+    render = bool(source.get("render"))
+    page_validator = _pagination_url_validator(source)
+
+    html = fetch_list_html(list_url, render, url_validator=page_validator)
+    if not html:
+        return {
+            "items": [],
+            "pages": 0,
+            "page_urls": [],
+            "stop_reason": "fetch_failed",
+        }
+    pages = 1
+    page_urls.append(list_url)
+    first_records = _datastore_records(html, settings)
+    if total is None:
+        try:
+            match = re.search(settings["total_regex"], html, re.S)
+            total = int(match.group(1)) if match else None
+        except (re.error, TypeError, ValueError):
+            total = None
+    first_items = _datastore_items(first_records, source, settings, list_url)
+    if not first_items:
+        return {
+            "items": [],
+            "pages": pages,
+            "page_urls": page_urls,
+            "stop_reason": "empty",
+        }
+    all_items.extend(first_items)
+    seen_urls.update(item["url"] for item in first_items)
+
+    max_pages = int(settings["max_pages"])
+    if max_pages <= 0:
+        max_pages = (
+            (total + page_size - 1) // page_size if total is not None else 50
+        )
+    max_pages = max(1, min(max_pages, 500))
+
+    def _has_older_page(items: list[dict]) -> bool:
+        parsed_dates = [item["parsed"] for item in items if item.get("parsed")]
+        return (
+            not is_project
+            and cutoff is not None
+            and settings["stop_when_older_than_cutoff"]
+            and len(parsed_dates) == len(items)
+            and max(parsed_dates) < cutoff
+        )
+
+    # 首页也要参与「连续 N 页全部已入库」判断：此前只在第 2 页起的循环里
+    # 累计 known_streak，stop_after_known_pages=1 时首页全已知仍然会继续翻页。
+    if known_urls is not None and settings["stop_after_known_pages"] > 0:
+        known_streak = (
+            1
+            if all(item["url"] in known_urls for item in first_items)
+            else 0
+        )
+    if (
+        settings["stop_after_known_pages"] > 0
+        and known_streak >= settings["stop_after_known_pages"]
+    ):
+        stop_reason = "known_pages"
+    elif _has_older_page(first_items):
+        stop_reason = "cutoff"
+    else:
+        for page in range(2, max_pages + 1):
+            if delay > 0:
+                time.sleep(delay)
+            start = (page - 1) * page_size + 1
+            end = page * page_size
+            page_url = _datastore_page_url(settings, start, end)
+            try:
+                xml = fetch_text(
+                    page_url,
+                    method=settings["method"],
+                    payload=settings["payload"] or None,
+                    form_payload=bool(settings["payload"]),
+                    headers=settings["headers"],
+                    url_validator=page_validator,
+                    legacy_renegotiation=settings["legacy_ssl"],
+                )
+            except Exception as exc:
+                LOG.warning("datastore 翻页失败（第 %d 页）：%s", page, exc)
+                stop_reason = "fetch_failed"
+                break
+            pages = page
+            page_urls.append(page_url)
+            if total is None:
+                try:
+                    match = re.search(settings["total_regex"], xml, re.S)
+                    total = int(match.group(1)) if match else None
+                except (re.error, TypeError, ValueError):
+                    total = None
+            records = _datastore_records(xml, settings)
+            page_items = _datastore_items(records, source, settings, page_url)
+            if not page_items:
+                stop_reason = "empty"
+                break
+            fresh_items = []
+            for item in page_items:
+                if item["url"] in seen_urls:
+                    continue
+                seen_urls.add(item["url"])
+                fresh_items.append(item)
+            if not fresh_items:
+                stop_reason = "empty"
+                break
+            all_items.extend(fresh_items)
+            if _has_older_page(page_items):
+                stop_reason = "cutoff"
+                break
+            if known_urls is not None and settings["stop_after_known_pages"] > 0:
+                page_known = all(item["url"] in known_urls for item in page_items)
+                known_streak = known_streak + 1 if page_known else 0
+                if known_streak >= settings["stop_after_known_pages"]:
+                    stop_reason = "known_pages"
+                    break
+            if total is not None and page * page_size >= total:
+                stop_reason = "done"
+                break
+            if len(records) < page_size:
+                stop_reason = "done"
+                break
+        else:
+            stop_reason = "max_pages"
+
+    LOG.info(
+        "[%s] datastore 采集 %d 页（停止原因：%s），解析 %d 条%s",
+        source.get("name"),
+        pages,
+        stop_reason,
+        len(all_items),
+        f"，记录总数 {total}" if total is not None else "",
+    )
+    return {
+        "items": all_items,
+        "pages": pages,
+        "page_urls": page_urls,
+        "stop_reason": stop_reason,
+    }
 
 
 def _collect_api_entries(
@@ -2032,19 +2496,36 @@ def _collect_api_entries(
                 # 为可信目标：重定向到未配置主机一律按公网策略校验，避免
                 # 可信接口被篡改后把爬虫导向内网。
                 url_validator=api_validator,
+                legacy_renegotiation=settings["legacy_ssl"],
+                form_payload=settings["payload_format"] == "form",
             )
         except Exception as exc:
             LOG.warning("接口翻页失败（第 %d 页）：%s", page, exc)
             stop_reason = "fetch_failed"
             break
-        raw_items = _dig(data, settings["items_path"])
-        if not isinstance(raw_items, list):
-            LOG.warning(
-                "接口返回里 items_path=%r 不是数组，停止翻页",
-                settings["items_path"],
-            )
-            stop_reason = "empty"
-            break
+        if settings["html_path"]:
+            html_fragment = _dig(data, settings["html_path"])
+            if not isinstance(html_fragment, str) or not html_fragment.strip():
+                LOG.warning(
+                    "接口返回里 html_path=%r 不是非空 HTML 字符串，停止翻页",
+                    settings["html_path"],
+                )
+                stop_reason = "empty"
+                break
+            raw_items = parse_list_items(html_fragment, source, settings["base_url"])
+        else:
+            raw_items = data if settings.get("root_array") else _dig(data, settings["items_path"])
+            if isinstance(raw_items, list) and settings["item_path"]:
+                # 有些接口把真实字段包在 results[].source 里：先按 item_path
+                # 逐条解包，再交给 _api_item_to_entry，避免把包装层当条目。
+                raw_items = [_dig(item, settings["item_path"]) for item in raw_items]
+            if not isinstance(raw_items, list):
+                LOG.warning(
+                    "接口返回里 items_path=%r 不是数组，停止翻页",
+                    settings["items_path"],
+                )
+                stop_reason = "empty"
+                break
         if total is None and settings["total_path"]:
             raw_total = _dig(data, settings["total_path"])
             try:
@@ -2064,9 +2545,13 @@ def _collect_api_entries(
         page_items: list[dict] = []
         fresh_items: list[dict] = []
         for item in raw_items:
-            entry = _api_item_to_entry(item, settings, source, tz_name)
+            entry = item if settings["html_path"] else _api_item_to_entry(
+                item, settings, source, tz_name
+            )
             if entry is None:
                 continue
+            if settings["detail_url"] and not entry.get("content"):
+                _api_fill_detail(entry, item, settings, api_validator)
             page_items.append(entry)
             if entry["url"] in seen_urls:
                 continue
@@ -2097,7 +2582,9 @@ def _collect_api_entries(
                 stop_reason = "known_pages"
                 break
 
-        if total is not None and page * settings["page_size"] >= total:
+        # pages 是本轮已抓页数；start_page=0 或 offset 模式下 page 是绝对页码，
+        # 用 page*page_size 会把 offset 之前的页也算进去，导致少抓一页。
+        if total is not None and pages * settings["page_size"] >= total:
             stop_reason = "done"
             break
         if len(raw_items) < settings["page_size"]:
@@ -2142,6 +2629,11 @@ def collect_list_entries_detailed(
     接口型源（source["api"] 已由 load_config 归一）完全不走 HTML 分页，
     条目与正文都来自后端 JSON 接口。
     """
+    datastore_settings = _datastore_settings(source)
+    if datastore_settings is not None:
+        return _collect_datastore_entries(
+            source, datastore_settings, cutoff=cutoff, known_urls=known_urls
+        )
     api_settings = _api_settings(source)
     if api_settings is not None:
         return _collect_api_entries(
@@ -2298,6 +2790,7 @@ def extract_article(
     title_xpath: str = "",
     publish_time_xpath: str = "",
     body_xpath: str = "",
+    body_mode: str = "",
 ) -> dict | None:
     """用已抓取的 HTML 抽取一篇文章（与 url_extract.extract_article 共用实现）。
 
@@ -2316,6 +2809,7 @@ def extract_article(
         title_xpath=title_xpath,
         publish_time_xpath=publish_time_xpath,
         body_xpath=body_xpath,
+        body_mode=body_mode,
     )
 
 
@@ -2934,6 +3428,7 @@ def _process_project_entry(
         title_xpath=source.get("article_title_xpath") or "",
         publish_time_xpath=source.get("article_publish_time_xpath") or "",
         body_xpath=source.get("article_body_xpath") or "",
+        body_mode=source.get("article_body_mode") or "",
     )
     if result is None:
         if content_required:
@@ -2993,10 +3488,14 @@ def process_entry(
             source_name,
             url,
             list_title=entry.get("title", ""),
+            # 列表阶段就判 old 的条目同样要写 title：展示与检索都读 title 列，
+            # 只写 list_title 会让这类行在前端显示为空标题（实测 125/125 全空）。
+            title=clean_title(entry.get("title", "")),
             publish_time=list_publish_text,
             publish_time_source="list",
             publish_time_raw="",
             list_publish_time=list_publish_text,
+            title_source="list_title" if entry.get("title") else "",
             timezone=tz_name,
             status="old",
         )
@@ -3017,6 +3516,11 @@ def process_entry(
         archive_content_type = "application/json; charset=utf-8"
         result = {
             "content": inline_body,
+            # 接口条目在采集阶段已经把 HTML 清洗进 entry["body_html"]（如
+            # content_is_html/detail_content_is_html），这里必须原样带进保存
+            # 结果；否则 process_entry 后面只写 content，新行的 body_html 永远
+            # 是空串，前端富文本链路直接丢失。
+            "body_html": str(entry.get("body_html") or ""),
             "publish_time": "",
             "publish_time_source": "",
             # 标题来自接口字段而不是 GNE/XPath：单独标记，便于下游区分
@@ -3055,6 +3559,7 @@ def process_entry(
             title_xpath=source.get("article_title_xpath") or "",
             publish_time_xpath=source.get("article_publish_time_xpath") or "",
             body_xpath=source.get("article_body_xpath") or "",
+            body_mode=source.get("article_body_mode") or "",
         )
         if result is None:
             save_article(
@@ -3238,10 +3743,19 @@ def run_source(
         known_urls: set[str] | None = None
         pagination = _pagination_settings(source)
         api_settings = source.get("api")
+        datastore_settings = _datastore_settings(source)
         wants_known_urls = (
-            api_settings.get("stop_after_known_pages", 0) > 0
-            if isinstance(api_settings, dict)
-            else pagination["mode"] != "none" and not source.get("list_urls")
+            (isinstance(api_settings, dict) and api_settings.get("stop_after_known_pages", 0) > 0)
+            or (
+                isinstance(datastore_settings, dict)
+                and datastore_settings.get("stop_after_known_pages", 0) > 0
+            )
+            or (
+                not isinstance(api_settings, dict)
+                and not isinstance(datastore_settings, dict)
+                and pagination["mode"] != "none"
+                and not source.get("list_urls")
+            )
         )
         if not force and wants_known_urls:
             known_urls = {

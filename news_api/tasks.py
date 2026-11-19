@@ -184,6 +184,7 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             source_config.get("article_publish_time_xpath") or ""
         ).strip()
         body_xpath = str(source_config.get("article_body_xpath") or "").strip()
+        body_mode = str(source_config.get("article_body_mode") or "").strip().lower()
         try:
             date_skew_days = max(
                 0, min(365, int(source_config.get("date_skew_days", 7)))
@@ -198,6 +199,7 @@ def execute_extract(payload: dict[str, Any], settings: Settings) -> dict[str, An
             title_xpath=title_xpath,
             publish_time_xpath=publish_time_xpath,
             body_xpath=body_xpath,
+            body_mode=body_mode,
         )
         if result is None:
             # 只标记错误：save_article 是部分更新，已有正文不会被清空。

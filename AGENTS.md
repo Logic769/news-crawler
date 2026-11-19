@@ -277,6 +277,7 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | `article_title_xpath` | 否 | 详情页标题 XPath（`<title>` 是站点名、真标题在正文 h1 时使用）；推荐直接写标题元素（如 `//h1`），会取其全部文本（含 `<em>` 等子元素）；`/text()` 只取第一个直接文本节点，标题含子标签时会截断；以 `string(` 开头的表达式会被忽略。不配时 GNE 兜底：`<title>` 判为站点名（≤24 字、以 `SITE_NAME_HINTS` 之一结尾、不含减号、竖线、下划线前后带空格的分隔符，也不含双连字符、方头括号）且页面唯一非空 `h1`（8–200 字、自身不像站点名；`display:none` 等不可见节点——含 `h1` 自身或任一祖先容器，style 空白（制表符/换行/全角空格）会被归一——与 `<template>`/`<noscript>` 内的模板 `h1` 不计入唯一性）时用该 `h1`；多 `h1` 保持原行为；`h1` 可能是机构名（如「XX省科学技术厅」），这层兜底只保证不会停在站点名，不保证一定是文章标题；按 class/外部样式表隐藏的 `h1` 无法识别，`<title>` 不以 `SITE_NAME_HINTS` 结尾的机构名也不会被识别，这类站点需显式配本字段（见 `regression/test_title_fallback.py`） |
 | `article_publish_time_xpath` | 否 | 详情页发布时间 XPath；推荐直接写日期元素（如 `//p[contains(@class,'article__subTitle')]/span[1]`）；以 `string(` 开头或非法表达式会被忽略 |
 | `article_body_xpath` | 否 | 详情页正文容器 XPath，透传 GNE 的 `body_xpath`；必须是元素节点表达式，属性/文本表达式（`//div/@id`、`//div/text()`）、未命中、命中空容器都会记 WARNING 并回退整页 `//body`（见 `ContentExtractor._resolve_body`）；命中多个节点只取第一个并记 WARNING；以 `string(` 开头或非法表达式在加载配置时被忽略；正文与配图仍在该容器内按密度算法取最佳子块（并列多个正文块时可能只取一段），收窄容器会漏掉容器外的配图；视频页分支优先于本字段 |
+| `article_body_mode` | 否 | 仅配合 `article_body_xpath` 使用；可选值 `container`，表示按该容器内的块级元素汇总全文，绕开 GNE「容器内再选单个最高分节点」的密度算法，保留段落换行；默认空串走 GNE 密度算法。非法值记 WARNING 后按空串；配置 container 但未配 article_body_xpath 时记 WARNING 并按空串 |
 | `date_skew_days` | 否 | 详情日期与列表日期允许相差的天数，默认 7，范围 0–365；超过时改用列表日期 |
 | `listing_type` | 否 | `news`（默认）或 `project_application`。项目申报模式把列表页当作数据源，见下方“项目申报列表” |
 | `deadline_xpath` | 否 | 项目申报：截止时间单元格 XPath（相对条目节点），写 `deadline`/`deadline_raw`，不写 `publish_time` |
@@ -284,7 +285,8 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 | `project_status_xpath` | 否 | 项目申报：申报状态单元格 XPath |
 | `content_required` | 否 | 项目申报：是否必须抓到详情正文；默认 `false`（登录墙/短正文仍记 `ok`，只存列表字段），`true` 退回新闻语义 |
 | `pagination` | 否 | 自动分页配置对象，见下方“自动分页”；只对单个 `list_url` 生效，配置 `list_urls` 时仍按固定地址列表抓取 |
-| `api` | 否 | 接口型源配置对象，见下方“接口型源”；配置后不抓列表页 HTML，改为请求 JSON 接口翻页，正文随条目入库；与 `list_url`/`list_urls`/`pagination` 互斥（同时配置时以 `api` 为准并记 debug） |
+| `api` | 否 | 接口型源配置对象，见下方“接口型源”；配置后不抓列表页 HTML，改为请求 JSON/HTML 片段接口翻页，正文随条目入库；与 `list_url`/`list_urls`/`pagination` 互斥（同时配置时以 `api` 为准并记 debug） |
+| `datastore` | 否 | datastore 列表源配置对象，见下方“datastore 列表源”；适用于大汉版通等把列表条目以 CDATA 嵌在 script、后续页走 dataproxy POST 的 CMS；与 `api` 互斥，同时配置时按 datastore 采集并记 WARNING |
 | `timezone` | 否 | 默认 `Asia/Shanghai`；未配置时继承顶层 `timezone`，空串/非法值在 `load_config` 中同样回退到顶层（默认 `Asia/Shanghai`），其中非法值会记 WARNING |
 | `render` | 否 | 列表页是否强制 Chrome 渲染 |
 | `delay` | 否 | 请求间隔秒数，默认 0.3；列表页与文章详情页请求前都会等待 |
@@ -343,14 +345,39 @@ result = extract_article("https://example.com/article.html", GeneralNewsExtracto
 }
 ```
 
-各字段的含义与默认值见 README「接口型源」一节的完整表格（`url`/`method`/`payload`/`headers`/`items_path`/`total_path`/`page_param`/`page_size_param`/`page_size`/`start_page`/`max_pages`/`url_field`/`url_template`/`id_field`/`title_field`/`date_field`/`date_format`/`content_field`/`content_is_html`/`author_field`/`stop_when_older_than_cutoff`/`stop_after_known_pages`）。要点：
+各字段的含义与默认值见 README「接口型源」一节的完整表格（`url`/`method`/`payload`/`payload_format`/`headers`/`items_path`/`root_array`/`item_path`/`html_path`/`total_path`/`page_param`/`page_param_mode`/`page_size_param`/`page_size`/`start_page`/`max_pages`/`url_field`/`url_template`/`id_field`/`title_field`/`date_field`/`date_format`/`content_field`/`content_is_html`/`detail_url`/`detail_method`/`detail_payload`/`detail_content_field`/`detail_content_is_html`/`legacy_ssl`/`author_field`/`stop_when_older_than_cutoff`/`stop_after_known_pages`）。要点：
 
 - **GET 模式不拼查询串、也不发 `payload`**：只有 POST 会把 `page_param`/`page_size_param` 合并进请求体（源配置的 `payload` 同理只在 POST 生效，GET 下写筛选条件会被静默丢弃）；GET 的页码只能靠 `url` 里的 `{page}`，否则每页都请求同一 URL，靠跨页 URL 去重后第一页就因「没有新条目」停止；GET 模式同样不发送 `page_size`，但采集器仍用它判断末页（本页条数少于 `page_size` 即视为最后一页），需把它设为接口每页实际返回的条数；
-- **`_api_settings` 幂等**：返回的 dict 带 `_API_NORMALIZED_FLAG`，`load_config` 与 `collect_list_entries_detailed` 各调一次不会重复告警。直接构造 `source` 的调用方也靠 collect 入口兜底归一，**不要用 `source.get("api")` 判断是否接口型**（裸配置缺 `start_page` 会 KeyError）；
+- **`_api_settings` 幂等**：返回的 dict 带 `_API_NORMALIZED_FLAG`，`load_config` 与 `collect_list_entries_detailed` 各调一次不会重复告警。直接构造 `source` 的调用方也靠 collect 入口兜底归一，**不要用 `source.get("api")` 判断是否接口型**（裸配置缺 `start_page` 会 KeyError）；`page_param_mode=offset` 时 `start_page` 必须设 0，否则首个请求会从 page_size 偏移开始、跳过首页；
 - **与列表页配置互斥**：同时配 `list_url`/`pagination` 时以 `api` 为准并记 debug；
 - **重定向校验以 `api.url` 为锚点**：接口型源没有 `list_url`，不能复用 `_pagination_url_validator`；`_api_url_validator(settings)` 把配置的 `api.url` 交给同一套 `_trusted_url_validator`（只有该 origin 允许内网地址，其余必须是公网 http 80 / https 443，连接层再按真实解析 IP 校验一次），`fetch_json` 收到 `url_validator` 时会装 `_ValidatingRedirectHandler` + `_PinnedHTTPSHandler`/`_PinnedHTTPHandler` 并禁用环境代理（与 API extract 路径同一取舍）。跨 origin 重定向会剥掉 `Cookie`/`Authorization`/`Proxy-Authorization`（urllib 默认会把这些头原样复制给新目标）。请求复用 `url_extract.fetch_json`（同一套总时限、解压体积上限、`NEWS_INSECURE_SSL` 降级），响应编码统一走 `url_extract._decode_bytes`（charset → UTF-8 → GB18030，`fetch_html` 与 `fetch_json` 共用），GBK 接口不会静默变乱码；
 - **不支持与 `listing_type=project_application` 组合**：`load_config` 对这种组合记 WARNING 但不阻止启动——`process_entry` 会先分派到 `_process_project_entry`，那条路径不读 `entry` 里的接口正文、也没有 `deadline` 字段映射，结果是正文被丢弃、`deadline` 为空。要支持需要另加 `deadline_field` 并在项目路径优先取 inline 正文；
 - 停止原因：`cutoff`/`known_pages`/`done`（total 用尽或不足一页）/`empty`（items_path 非数组或本页无新条目）/`fetch_failed`/`max_pages`（`for` 循环正常走完，即没有触发任何更明确的终止条件）。
+
+### datastore 列表源
+
+适用于大汉版通等 CMS：首页把列表条目以 record/CDATA 嵌在 script 中，后续页需要 POST 到 dataproxy.jsp 取 XML。配置 source["datastore"] 后，collect_list_entries_detailed 会优先走 _collect_datastore_entries，list_url 仍作为首页地址；与 api 互斥，同时配置时按 datastore 采集并记 WARNING。
+
+~~~json
+"datastore": {
+  "url": "http://kjt.shandong.gov.cn/module/web/jpage/dataproxy.jsp",
+  "params": {
+    "col": "1",
+    "webid": "73",
+    "path": "http://kjt.shandong.gov.cn/",
+    "columnid": "359318",
+    "sourceContentType": "3",
+    "unitid": "764209",
+    "webname": "山东省科学技术厅",
+    "permissiontype": "0"
+  },
+  "page_size": 25,
+  "total": 3505,
+  "max_pages": 141
+}
+~~~
+
+字段：url 必填；base_url 默认取 url 的 origin；method 默认 POST（只接受 GET/POST）；params 会与 startrecord/endrecord/perpage 一起拼到 URL；payload 为 POST 表单 body（如 jQuery jpage 的 ajaxParam），设为对象后按 application/x-www-form-urlencoded 发送；headers 为附加请求头（dataproxy 常需 Referer/Origin）；legacy_ssl 允许旧式 TLS 重协商；page_size 默认 25（范围 1–500）；total 默认 0（0 表示从 total_regex 读取）；max_pages 默认 0（0 表示按 total/page_size 计算，缺 total 时最多 50 页，硬上限 500）；start_record_param/end_record_param/per_page_param 默认分别为 startrecord/endrecord/perpage；record_regex 默认匹配 record/CDATA；total_regex 默认匹配 totalrecord 数字；item_xpath 默认 //li；stop_when_older_than_cutoff 默认 true；stop_after_known_pages 默认 0。停止原因与 HTML/API 分页一致。
 
 ### 项目申报列表
 
@@ -486,7 +513,7 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 - `save_article()` 是**部分更新**：空字符串表示“这次没拿到”，不会覆盖库中已有值，因此抓取失败或重新分类时只更新 `status`/`error`，已成功入库的正文不会被清空；`images` 例外地区分三态：`None` 保留旧值、`[]` 明确清空、非空列表覆盖；抓取流程用 `normalize_images_for_update` 把"抽取不到图"归一为 `None`（保留旧值），只有显式传 `[]` 才清空，避免成功重抓因抽取失败抹掉历史图片；
 - `timezone` 随文章落库，读取时优先使用该列，旧行（NULL）才回落到当前配置推断；`publish_time_utc` 存真实时刻（UTC），`published_from`/`published_to` 按它过滤以消除混时区偏差，`publish_time_utc` 为 NULL/空串的历史行回退旧的 `publish_time` 墙钟比较；列表排序仍按 `publish_time` 墙钟；
 - 详情页日期晚于当前时间超过 1 天时视为不可信（不再自动减一年），回退列表日期；列表日期也缺失时记 `unknown_date`；`date_skew_days` 范围为 0–365；GNE 文本扫描可能只抽到“09月30日”这类无年份日期：主抓取路径优先用列表日期的年份补齐，列表日期也缺失时记 `unknown_date`；API 单 URL extract 无列表日期可交叉校验时同样记 `unknown_date`，不按当前年猜测；
-- `old` 分支的 `publish_time_source` 取决于判定时机：列表阶段就确认超出窗口时记 `list`；详情抓取后才发现超出窗口时保留详情来源（`xpath`/`labeled_text`/`meta`/`text`）。`publish_time_raw` 与当前 `publish_time` 同步：回退到列表日期时清空，不再保留旧详情原文；`unknown_date` 本次没有可信发布时间，新插入行会保留本次抽取文本便于排查，已有行则保留旧值与旧时间配对；新行的 `publish_time_source` 为空字符串，已有行保留旧来源，避免旧时间挂新来源；
+- `old` 分支的 `publish_time_source` 取决于判定时机：列表阶段就确认超出窗口时记 `list`；详情抓取后才发现超出窗口时保留详情来源（`xpath`/`labeled_text`/`meta`/`text`）。列表阶段判 `old` 的条目同样写 `title`/`list_title`/`title_source=list_title`（未写 `title` 会让这类行在前端显示空标题；历史库可用 `UPDATE articles SET title=list_title, title_source='list_title' WHERE status='old' AND (title IS NULL OR title='')` 回填）。`publish_time_raw` 与当前 `publish_time` 同步：回退到列表日期时清空，不再保留旧详情原文；`unknown_date` 本次没有可信发布时间，新插入行会保留本次抽取文本便于排查，已有行则保留旧值与旧时间配对；新行的 `publish_time_source` 为空字符串，已有行保留旧来源，避免旧时间挂新来源；
 - 项目申报行（`listing_type=project_application`）的 `title`/`list_title` 都写列表标题（经 `clean_title()` 清掉属性值里的字面量 HTML 标记：`br`/`p`/`div`/`span`/`strong`/`em`/`sub`/`sup` 带不带属性都删；单字母 `b`/`i`/`u`/`a` 只删成对写法与带属性/自闭合/孤立结束标签，孤立的 `<b>` 按普通文本保留以免误伤 `A <B> C`；其余标签原样保留）、`title_source=list_title`；`deadline` 列存截止时间，与发布时间完全解耦：列表页自身的发布日期在配置了 `date_xpath` 时照常写 `publish_time`/`publish_time_utc`/`list_publish_time`（`publish_time_source=list`），未配置时 `publish_time` 为空，两种情况都不会拿截止时间顶替。`publish_time` 为空的项目行按 `published_desc` 排序会排在末尾、且会被 `published_from`/`published_to` 排除；查询项目公告请用 `order=deadline_desc|deadline_asc` 与 `deadline_from`/`deadline_to`。`content_required=false` 时详情抓不到正文也记 `ok`，不会反复重试；同一 URL 从新闻模式切到项目模式时，未配 `date_xpath` 的站点清空 `publish_time*`、配了 `date_xpath` 的站点改写成列表日期并把 `publish_time_source` 归一为 `list`（本次解析失败沿用旧值、来源保持原值并记 WARNING），`content`/`raw_content`/`author`/`images` 保留（可能残留旧新闻正文，检索侧请以 `title_source=list_title` 或站点配置识别项目行，不要只按 `deadline`；`deadline_from`/`deadline_to` 只对有可解析截止时间的项目行生效）；反向切换（项目→新闻）会保留旧 `deadline`/`deadline_raw`/`project_status`，这类新闻行仍可能命中截止时间过滤，查询侧请按站点/字段区分行类型；
 - `article_id` 由 `sha256(source + \x1f + url)` 派生，不随数据库重建变化，可安全作为下游引用；
 - 原文归档（v10）是旁路能力：`save_article()` 在 `conn.commit()` 之后才调 `article_archive.archive_article()`，归档异常只记 `LOG.exception`，不会把已入库的文章改写成抓取失败；快照写成 gzip 文件（`{库目录}/archive/{article_id前两位}/{article_id}/{时间}_{kind}.gz`）加同目录 `.meta.json` sidecar，`article_archives` 表只存索引。同一 `(article_id, kind)` 按解压后明文的 sha256 去重，重复抓取不重复占盘；kind 取 `raw_html`（详情页原始 HTML）、`api_response`（接口型源条目 JSON）或 `body_html`（历史行回填的清洗正文）。保留期 365 天（`article_archive.DEFAULT_RETENTION_DAYS`），过期快照由 `prune_expired_archives()` 移到 `archive_trash/{日期}/` 而不是硬删除；`cmd_run` 每轮末尾顺手清理一次，清理失败同样不影响抓取结果。**prune 只扫 `article_archives` 里有索引的行，看不见没有索引的孤儿文件**，需要「索引与文件同一事务原子」时应当先提交再归档，别指望 prune 兜底；
@@ -671,7 +698,7 @@ curl http://localhost:8000/v1/health
 | `regression/test_gne_regression.py` | 3 个用例：全部样本与基线一致、基线可复现、样本集合与基线匹配 |
 | `regression/test_list_page.py` | 7 个用例：列表页解析的条目定位、feature 缺失、少于 4 条时不回退、`count()`/`number()`/`boolean()` 等标量 XPath 在 `xpath_text`/`xpath_href` 中返回空而不崩溃 |
 | `regression/test_video_detection.py` | 7 个用例：路径规则、`og:type`、JSON-LD `VideoObject`、文章内嵌视频不误判 |
-| `regression/test_backfill.py` | 15 个用例：候选 skip/limit（含真实 SQLite）、LIMIT 下推与游标提前停止、游标异常关闭、失败清单列清洗、BOM 跳过清单、`--skip-file` 条目在下次失败清单中保留、`--failed-list` 指向数据库/目录/硬链接/符号链接/未创建的 WAL·SHM 侧车路径时抓取前返回 2、正常清单文件不误杀 |
+| `regression/test_backfill.py` | 16 个用例：候选 skip/limit（含真实 SQLite）、LIMIT 下推与游标提前停止、游标异常关闭、失败清单列清洗、BOM 跳过清单、`--skip-file` 条目在下次失败清单中保留、`--failed-list` 指向数据库/目录/硬链接/符号链接/未创建的 WAL·SHM 侧车路径时抓取前返回 2、正常清单文件不误杀 |
 | `regression/test_backfill_body_html.py` | 7 个用例：只选空 body_html 与可回填状态、source/limit、`--overwrite` 覆盖已有 HTML、写入不改 content/raw_content、默认守卫保留已有 HTML、空 HTML 记失败 |
 | `regression/test_body_html.py` | 1 个用例：GNE `with_body_html=True` 保留正文里的实体文本，不把 `&lt;div&gt;`/`&lt;script&gt;`/`&lt;b` 还原成真标签 |
 | `regression/test_html_sanitize.py` | 8 个用例：白名单结构、脚本/样式子树、事件属性与内联样式、可执行 URL、相对链接补全、裸文本转义、空值 |
@@ -686,7 +713,9 @@ curl http://localhost:8000/v1/health
 | `regression/test_scheduler.py` | 16 个用例：时间点解析（排序/去重/非法值）、下一触发点（首班前/两班间/末班后/整点边界）、抓取命令拼装、文件锁互斥与释放后重用、`--once` 在锁占用时跳过、抓取成功才触发分析、抓取失败不触发分析、非法 INSIGHT_URL 只记日志、停止信号终止抓取子进程（含 terminate 超时后 kill）、`execute_once` 把 stop 事件传给等待函数；另有 `test_run_exit_code.py` 覆盖“全部失败/没有新文章/正文全部不可用”的退出码与 `fetch_failed` 计数 |
 | `regression/test_pagination.py` | 40 个用例：模板分页按截止日期停止、模板生成后续页、max_pages 含首页语义、last_url_xpath 多候选取最大页码、跟随 onclick/忽略 # 锚点、渲染后 DOM 找下一页、未知日期不触发 cutoff、已入库页连续早停、旧 list_urls 行为、非法 mode 回退、固定列表忽略 max_pages/分页配置/cutoff、固定页抓取失败不误报、固定列表全空报 empty、置顶旧文不提前停、next XPath 无 href 文本忽略、next XPath 属性 onclick 解析（含 JavaScript: 前缀）、模板缺 {page} 回退、collect_list_entries 包装、分页 URL SSRF 校验（可信内网主机/可信主机 DNS 解析出的内网 IP/公网 IP/未信任私网拒绝）、连接层 IP 字面量保留 scheme+port（`_PinnedHTTPConnection`/`_PinnedHTTPSConnection` 的 `connect` 真实路径）、可信端点 DNS 失败冷却后重试、列表抓取确实收到 validator |
 | `regression/test_title_fallback.py` | 24 个用例：`_looks_like_site_name` 的站点名词表命中、带空格分隔符（减号/竖线/下划线）以及双连字符、方头括号的真标题不判为站点名、超长文本不判为站点名、含 hint 词但词不在结尾的真标题（如“关于XX平台建设的通知”）不判为站点名；`extract_by_sole_heading` 兜底在唯一 h1 时替换站点名 `<title>`（`title_source` 仍为 `gne_default`）、无 h1/多 h1/h1 本身像站点名/h1 短于 8 字时保持站点名、`<title>` 是真标题时不覆盖、`og:title` 与配置的 `article_title_xpath` 优先级高于该兜底、`display:none` 的隐藏 h1（含祖先容器隐藏、style 空白为制表符/换行）与 `<template>`/`<noscript>` 里的模板 h1 不计入唯一性；祖先 visibility:hidden + h1 visibility:visible 时该 h1 仍算可见候选（与另一个栏目标题并存时宁可不猜）、display:none 祖先优先于 h1 的 visibility:visible、站名判断用未切分的原始 <title>（「关于启用申报平台 - 某某官网」不会被切成「关于启用申报平台」后误判成站点名）；端到端经 `GeneralNewsExtractor()` 验证同样行为 |
-| `regression/test_api_source.py` | 42 个用例：接口型源采集（条目带正文与日期、total 用尽/不足一页/cutoff/known_pages/max_pages 五种停止原因、抓取失败 stop_reason、items_path 非数组、url_template 兜底、无 url 跳过、畸形条目链接（`https://[broken/p`，`urlsplit` 抛 `ValueError`）只告警跳过而不中断整页采集、跨页去重、相对链接按 `api.url` 的 origin 补全（显式 `base_url` 可覆盖）、早停判断用去重前的本页条目（`page_items`）而非 `fresh_items`、GET 不发请求体、delay 只在两次请求之间等待且末页不等、`fetch_json` 收到以 `api.url` 为锚点的 `url_validator`）、`_api_settings` 归一（默认值与覆盖、无 api 返回 None、非法 method 回退 POST、`_dig` 列表下标、`_html_to_text` 段落与图片/剔 script·style/表格单元格换行、`_decode_bytes` 的 GBK 回退·meta 嗅探·声明 charset 解不开时记 INFO 日志）、传输层（跨 origin 重定向剥掉 Cookie/Authorization 但保留 `X-Trace`、同源重定向保留凭据、校验器拒绝时在跟随之前抛错、传 `url_validator` 时装 `ProxyHandler`+`_ValidatingRedirectHandler`+`_PinnedHTTPSHandler`+`_PinnedHTTPHandler`、不传时只装 `HTTPSHandler`）、`process_entry` 自带正文跳过详情抓取（`title_source=api_field`）与无正文仍抓详情、`load_config` 归一接口型源（timezone 空串→Asia/Shanghai、method 小写→POST）与 api+项目申报模式告警、纯新闻源不告警 |
+| `regression/test_datastore_and_container.py` | 14 个用例：datastore 配置归一（默认值、非法 method 回退 POST、分页参数 URL）、首页 CDATA 解析与 dataproxy 翻页（3 条/2 页/done）、POST 表单 payload 透传、首页 cutoff 早停、空记录 empty、container 模式多段正文/图片/跳过脚本、GNE 无正文时容器兜底、extract_article/process_entry/tasks 透传 body_mode、load_config 校验 container 与缺 body_xpath |
+| `regression/test_eo_bot.py` | 4 个用例：EO_Bot 挑战页解出 `__tst_status=<三数之和>#; EO_Bot_Ssid=<sid>`、正常页面返回 None、缺少 session 常量返回 None、`fetch_html` 首次挑战后携带 Cookie 重试并拿到真实页面 |
+| `regression/test_api_source.py` | 55 个用例：接口型源采集（含 `api.html_path` 的 HTML 片段解析、空片段停止与配置归一、`api.item_path` 的嵌套 source 解包、`api.root_array` 顶层数组、`api.detail_url` 详情补正文、`id=0` 作为有效 ID 的 url_template/detail_url）（条目带正文与日期、total 用尽/不足一页/cutoff/known_pages/max_pages 五种停止原因、抓取失败 stop_reason、items_path 非数组、url_template 兜底、无 url 跳过、畸形条目链接（`https://[broken/p`，`urlsplit` 抛 `ValueError`）只告警跳过而不中断整页采集、跨页去重、相对链接按 `api.url` 的 origin 补全（显式 `base_url` 可覆盖）、早停判断用去重前的本页条目（`page_items`）而非 `fresh_items`、GET 不发请求体、delay 只在两次请求之间等待且末页不等、`fetch_json` 收到以 `api.url` 为锚点的 `url_validator`）、`_api_settings` 归一（默认值与覆盖、无 api 返回 None、非法 method 回退 POST、`_dig` 列表下标、`_html_to_text` 段落与图片/剔 script·style/表格单元格换行、`_decode_bytes` 的 GBK 回退·meta 嗅探·声明 charset 解不开时记 INFO 日志）、传输层（跨 origin 重定向剥掉 Cookie/Authorization 但保留 `X-Trace`、同源重定向保留凭据、校验器拒绝时在跟随之前抛错、传 `url_validator` 时装 `ProxyHandler`+`_ValidatingRedirectHandler`+`_PinnedHTTPSHandler`+`_PinnedHTTPHandler`、不传时只装 `HTTPSHandler`）、`process_entry` 自带正文跳过详情抓取（`title_source=api_field`）与无正文仍抓详情、`load_config` 归一接口型源（timezone 空串→Asia/Shanghai、method 小写→POST）与 api+项目申报模式告警、纯新闻源不告警 |
 
 运行方式：`python -X utf8 -m unittest discover -s regression -t . -p "test_*.py" -v`（约 15 秒，无需网络）。
 

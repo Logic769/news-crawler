@@ -430,6 +430,7 @@ cp sources.json sources.local.json
 | `article_title_xpath` | 可选 | 详情页标题 XPath。用于 `<title>` 写的是站点名、真标题在正文 `h1` 的站点（如科技部计划通知）。推荐直接写标题元素（如 `//h1[@class='article-title']`），会取其全部文本（含 `<em>` 等子元素）；写成 `//h1/text()` 只能取第一个直接文本节点，标题含子标签时会截断。以 `string(` 开头的表达式会被忽略。不配这个字段时，GNE 还有一层兜底：`<title>` 被判定为站点名（不超过 24 字、以“网站/门户/官网/平台/系统/首页/新闻网”之一结尾、且不含 ` - ` 之类分隔符）、页面又恰好只有一个非空 `h1`（8–200 字、自身也不像站点名）时，会用该 `h1` 作为标题（`display:none` 等不可见节点——含 `h1` 自身或任一祖先容器，style 里的制表符/换行/全角空格会被归一——与 `<template>`/`<noscript>` 里的模板 `h1` 不计入唯一性）；多 `h1` 页面保持原行为，宁可留站点名也不猜。注意唯一 `h1` 也可能是机构名（如“XX省科学技术厅”），这层兜底只保证不会停在站点名，不保证一定取到文章标题；按 class 或外部样式表隐藏的 `h1`（如 `sr-only`）无法识别；`<title>` 不以这些词结尾的机构名（如“XX省人民政府”）也不会被识别，这类站点请显式配 `article_title_xpath` |
 | `article_publish_time_xpath` | 可选 | 详情页发布时间 XPath。用于正文里更早出现无关时间、页头日期才是真发布时间的站点；推荐写包含日期的元素（如 `//p[contains(@class,'article__subTitle')]/span[1]`）。以 `string(` 开头或非法表达式会被忽略 |
 | `article_body_xpath` | 可选 | 详情页正文容器 XPath，透传给 GNE 的 `body_xpath`。用于默认密度算法被页面其他长文本块带偏、或正文抽不出来的站点（例：`//div[@id='ivs_content']`）。**必须是元素节点表达式**：写成 `//div/@id`、`//div/text()` 这类属性/文本表达式，或表达式未命中、命中的容器没有文本时，都会记一条 WARNING 并回退整页 `//body`，不会中断抓取；命中多个节点时只用第一个并记 WARNING（建议写成唯一元素表达式）；以 `string(` 开头或非法表达式在加载配置时就被忽略。正文与配图仍会在该容器内按密度算法取最佳子块（容器内并列多个正文块时可能只取一段），收窄容器也会漏掉容器外的配图。视频页（`/shipin/`、`/video/` 等）走 meta 抽取，优先于本字段 |
+| `article_body_mode` | 可选 | 只配合 `article_body_xpath` 使用；目前只支持 `container`，表示按该容器内的块级元素汇总全文，绕开 GNE 在容器内再选单个最高分节点的密度算法，并保留段落换行；默认空串走 GNE 密度算法。非法值记 WARNING 后按空串；配置 container 但未配 article_body_xpath 时记 WARNING 并按空串 |
 | `date_skew_days` | 可选 | 详情日期与列表日期允许相差的天数，默认 7，范围 0–365；超过时改用列表日期，避免正文里的未来时间或站内推荐日期污染发布时间 |
 | `listing_type` | 可选 | 列表类型：`news`（默认）或 `project_application`。项目申报模式把列表本身当作数据源，见下方“项目申报列表” |
 | `deadline_xpath` | 可选 | 项目申报：截止时间所在单元格 XPath（相对条目节点） |
@@ -438,6 +439,7 @@ cp sources.json sources.local.json
 | `content_required` | 可选 | 项目申报：是否必须抓到详情正文。默认 `false`（登录墙/无正文仍记 `ok` 并存列表字段）；设为 `true` 退回新闻语义（无正文记 `no_content`/`error`） |
 | `pagination` | 可选 | 自动分页配置对象，见下方“自动分页（可选）”；只对单个 `list_url` 生效，配置 `list_urls` 时仍按固定地址列表抓取（不受 `max_pages`/`stop_when_older_than_cutoff` 影响） |
 | `api` | 可选 | 接口型源配置对象，见下方“接口型源（可选）”。配置后不再抓列表页 HTML，改为直接请求 JSON 接口翻页；与 `list_url`/`list_urls`/`pagination` 互斥（同时配置时以 `api` 为准并记一条 debug 日志） |
+| `datastore` | 可选 | datastore 列表源配置对象，见下方“datastore 列表源（可选）”。适用于大汉版通等把列表条目以 CDATA 嵌在 script、后续页走 dataproxy POST 的 CMS；与 `api` 互斥，同时配置时按 datastore 采集并记 WARNING |
 | `render` | 可选 | 设为 `true` 表示列表页需要用 Chrome 渲染后再解析 |
 | `delay` | 可选 | 每个请求之间的等待秒数，默认 0.3（接口型源同样是"两次请求之间"，最后一页抓完不再等待） |
 
@@ -513,14 +515,19 @@ cp sources.json sources.local.json
 | `url` | 必填 | 接口地址；含 `{page}` 时按页替换 |
 | `method` | `POST` | `GET` 或 `POST`；其他值记 WARNING 并回退 `POST`。请求方法只看这个字段，与 `payload` 无关 |
 | `payload` | 空 | 请求体基础字段，**只在 `POST` 模式生效**（`GET` 模式不会传递 `payload`，写进去的筛选条件会被静默丢弃）；页码与每页条数会合并进去。带 body 的 `GET` 只属于直接调用 `fetch_json` 的底层契约，源配置里做不到 |
+| `payload_format` | `json` | POST 请求体编码，`json` 或 `form`；`form` 用于 jQuery `$.post`/表单接口 |
 | `base_url` | 接口地址的 `scheme://host/` | 补全接口返回的相对链接（`"/p/1.html"`）时用的基准；接口与详情页不同域时显式写，例如 `https://www.example.com/` |
 | `headers` | 空 | 额外请求头，如 `Referer`（不少接口校验来源） |
-| `items_path` | 必填 | 条目数组的点号路径，支持数组下标（如 `data.list.0.items`）；为空记 ERROR，该站点不会有数据 |
+| `items_path` | 必填（`html_path` 为空且 `root_array` 为 false 时） | 条目数组的点号路径，支持数组下标（如 `data.list.0.items`）；配置 `html_path` 时忽略 |
+| `root_array` | `false` | 接口返回本身就是条目数组（顶层 list）时设为 `true`，此时 `items_path` 可为空 |
+| `item_path` | 空 | 条目数组里每条记录的实际字段路径（如 `source`）；用于接口返回 `{"source": {...}}` 包装层的场景，逐条解包后再按 `title_field`/`url_field` 等读取 |
+| `html_path` | 空 | 接口返回 HTML 片段时的点号路径（如 `data.html`）；设置后由 `item_xpath`/`title_xpath`/`url_xpath`/`date_xpath` 解析片段，适合 CMS 的 HTML 单元接口 |
 | `total_path` | 空 | 总数点号路径，用于提前判断是否还有下一页 |
 | `page_param` | `pageNum` | 页码参数名（仅 POST 生效，见下方“GET 模式的页码”） |
+| `page_param_mode` | `page` | 页码语义：`page` 是页码；`offset` 表示 `page_param` 是偏移量（0、page_size、2×page_size…），用于 `start_index` 一类接口。offset 模式应把 `start_page` 设为 0，否则首个请求会跳过前 `page_size` 条 |
 | `page_size_param` | `pageSize` | 每页条数参数名（仅 POST 生效） |
 | `page_size` | `20` | 每页条数，范围 1–500；超出接口实际上限时以接口返回条数为准（偏大会导致“不足一页即末页”的判断提前触发） |
-| `start_page` | `1` | 起始页码，范围 1–10000 |
+| `start_page` | `1` | 起始页码，范围 0–10000；0 用于 pageNumber 从 0 开始的接口，也是 offset 模式的推荐值 |
 | `max_pages` | `20` | 最多请求页数，范围 1–500 |
 | `url_field` | `originalURL` | 详情链接字段名；取不到时用 `url_template` 的 `{id}` 兜底，两者都没有则跳过该条并记 WARNING |
 | `url_template` | 空 | 详情链接模板，如 `https://example.com/detail/{id}`，`{id}` 由 `id_field` 填充 |
@@ -530,9 +537,17 @@ cp sources.json sources.local.json
 | `date_format` | 空 | 日期格式，默认交给 `parse_datetime` 自动识别 |
 | `content_field` | `content` | 正文字段名；有值时随条目入库，跳过详情页抓取 |
 | `content_is_html` | `true` | 正文字段是 HTML 时先转纯文本（保留段落换行，顺带取出 `<img>` 配图） |
+| `detail_url` | 空 | 列表接口不返回正文时，用于补正文的详情接口地址；支持 `{id}` 占位符，由 `id_field` 从列表条目填充。与 `html_path` 同时配置时会被禁用（HTML 片段条目没有接口 id，无法逐条展开）。详情请求失败只记 WARNING，保留列表字段与链接 |
+| `detail_method` | `POST` | `detail_url` 的请求方法，`GET` 或 `POST` |
+| `detail_payload` | 空 | `detail_url` 的请求体基础字段（仅 POST 生效） |
+| `detail_content_field` | `content` | 详情接口返回 JSON 里的正文字段名 |
+| `detail_content_is_html` | `true` | 详情正文字段是 HTML 时先转纯文本并提取配图 |
+| `legacy_ssl` | `false` | 允许旧式 TLS 重协商（部分政务站点报 `UNSAFE_LEGACY_RENEGOTIATION_DISABLED` 时开启；只影响该接口请求） |
 | `author_field` | 空 | 作者字段名 |
 | `stop_when_older_than_cutoff` | `true` | 整页日期都早于抓取窗口时停止翻页（与 HTML 分页同口径；项目申报模式不据此早停） |
 | `stop_after_known_pages` | `0` | 连续 N 页条目都已入库时停止；范围 0–100，默认关闭 |
+
+**HTML 片段接口**：有些 CMS 的列表接口返回的是 HTML 片段而不是 JSON 条目数组（例如浙江政务 CMS 的 `/api-gateway/jpaas-publish-server/front/page/build/unit`）。在 `api` 里配置 `html_path`（如 `data.html`）后，分页仍按 `url` 的 `{page}` 或 `payload` 驱动，片段内的条目用站点自身的 `item_xpath`/`title_xpath`/`url_xpath`/`date_xpath` 解析；未配置 `html_path` 时才使用 `items_path`。
 
 **不支持与项目申报模式组合**：`listing_type: project_application` 与 `api` 同时配置时，`load_config` 会记一条 WARNING。项目申报走的是列表字段路径，不读接口给的正文、也没有截止时间字段映射，结果是正文被丢弃、`deadline` 为空；需要这种数据源时请改用新闻模式，或等后续补上 `deadline_field` 映射。
 
@@ -547,6 +562,52 @@ cp sources.json sources.local.json
 ```bash
 docker compose run --rm crawler test --config sources.local.json --name shpolicy_ssme
 ```
+
+#### datastore 列表源（可选）
+
+有些政务 CMS（如大汉版通）的列表条目不是 DOM 里的 li，而是以 record/CDATA 嵌在首页 script 中；后续页需要 POST 到 dataproxy.jsp 才能拿到 XML。配置 datastore 后，爬虫会优先走 datastore 采集，list_url 仍作为首页地址；datastore 与 api 互斥，同时配置时按 datastore 采集并记 WARNING。
+
+~~~json
+"datastore": {
+  "url": "http://kjt.shandong.gov.cn/module/web/jpage/dataproxy.jsp",
+  "params": {
+    "col": "1",
+    "webid": "73",
+    "path": "http://kjt.shandong.gov.cn/",
+    "columnid": "359318",
+    "sourceContentType": "3",
+    "unitid": "764209",
+    "webname": "山东省科学技术厅",
+    "permissiontype": "0"
+  },
+  "page_size": 25,
+  "total": 3505,
+  "max_pages": 141
+}
+~~~
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `url` | 必填 | dataproxy 地址；每页请求会追加 startrecord/endrecord/perpage 参数 |
+| `base_url` | `url` 的 origin | 补全 record 内相对链接的基准 |
+| `method` | `POST` | 只接受 GET/POST；其他值记 WARNING 并回退 POST |
+| `params` | 空 | 附加查询参数（col/webid/path/columnid 等），与分页参数一起拼到 URL |
+| `payload` | 空 | POST 表单 body 字段（col/webid/columnid 等）；jQuery jpage 的 ajaxParam 实际放在 body 而不是 URL 时使用，设为对象后以 application/x-www-form-urlencoded 发送 |
+| `headers` | 空 | 附加请求头（如 Referer、Origin；dataproxy 常校验） |
+| `legacy_ssl` | `false` | 允许旧式 TLS 重协商（dataproxy 报 `UNSAFE_LEGACY_RENEGOTIATION_DISABLED` 时开启） |
+| `page_size` | `25` | 每页条数，范围 1–500 |
+| `total` | `0` | 总记录数；0 表示从首页或后续页的 total_regex 读取 |
+| `max_pages` | `0` | 最大页数；0 表示按 total/page_size 计算，缺 total 时最多 50 页；硬上限 500 |
+| `start_record_param` | `startrecord` | 起始记录参数名 |
+| `end_record_param` | `endrecord` | 结束记录参数名 |
+| `per_page_param` | `perpage` | 每页条数参数名 |
+| `record_regex` | record/CDATA 正则 | 从首页或翻页 XML 中提取每条 record |
+| `total_regex` | totalrecord 正则 | 提取总记录数 |
+| `item_xpath` | `//li` | 在每条 record 包成的 HTML 中定位条目的 XPath |
+| `stop_when_older_than_cutoff` | `true` | 整页日期都早于抓取窗口时停止翻页 |
+| `stop_after_known_pages` | `0` | 连续 N 页条目都已入库时停止；0 关闭 |
+
+停止原因与 HTML/API 分页一致：cutoff、known_pages、done、empty、fetch_failed、max_pages。
 
 #### 项目申报列表（`listing_type: project_application`）
 

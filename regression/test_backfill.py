@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import sqlite3
 import tempfile
@@ -11,6 +12,7 @@ import unittest
 from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
+from unittest import mock
 
 import backfill_raw_content as bf
 from news_crawler import init_db
@@ -234,6 +236,53 @@ class BackfillUnitTest(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(bf.main(["--db", str(self.db), "--failed-list", str(sidecar)]), 2)
             self.assertFalse(sidecar.exists())
+
+    def test_load_source_body_modes_and_backfill_forwards_it(self) -> None:
+        config = self.root / "sources.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "sources": [
+                        {
+                            "name": "site",
+                            "list_url": "https://example.com/list",
+                            "item_xpath": "//li",
+                            "article_body_xpath": "//div",
+                            "article_body_mode": "container",
+                        },
+                        {
+                            "name": "plain",
+                            "list_url": "https://example.com/list",
+                            "item_xpath": "//li",
+                            "article_body_mode": "",
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(bf.load_source_body_modes(str(config)), {"site": "container"})
+
+        url = "https://example.com/container.html"
+        self.insert(url)
+        conn = sqlite3.connect(self.db)
+        try:
+            with mock.patch.object(
+                bf, "extract_article", return_value={"content": "容器正文"}
+            ) as extract:
+                result = bf.backfill(
+                    conn,
+                    [("site", url)],
+                    delay=0,
+                    allow_browser=False,
+                    dry_run=False,
+                    source_body_modes={"site": "container"},
+                )
+        finally:
+            conn.close()
+        self.assertEqual(result[:3], (1, 0, 0))
+        self.assertEqual(extract.call_args.kwargs["body_mode"], "container")
+        self.assertEqual(self.raw_of(url), "容器正文")
 
     def test_main_accepts_existing_failed_list_file(self) -> None:
         failed = self.root / "failed.txt"

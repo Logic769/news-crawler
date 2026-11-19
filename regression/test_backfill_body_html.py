@@ -53,6 +53,23 @@ class FindCandidatesTest(unittest.TestCase):
 
 
 class BackfillTest(unittest.TestCase):
+    def test_forwards_article_body_mode(self) -> None:
+        conn = _conn()
+        conn.execute(
+            "INSERT INTO articles (source, url, body_html, status) "
+            "VALUES ('site', 'https://e.com/a', NULL, 'ok')"
+        )
+        with mock.patch.object(bf, "extract_article", return_value={"body_html": "<p>新</p>"}) as extract:
+            bf.backfill(
+                conn,
+                [("site", "https://e.com/a")],
+                delay=0,
+                allow_browser=False,
+                dry_run=False,
+                source_body_modes={"site": "container"},
+            )
+        self.assertEqual(extract.call_args.kwargs["body_mode"], "container")
+
     def test_writes_html_without_touching_existing_content(self) -> None:
         conn = _conn()
         conn.execute(

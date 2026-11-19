@@ -4,6 +4,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
@@ -50,13 +51,14 @@ def _page(*items: dict) -> dict:
 class ApiCollectTest(unittest.TestCase):
     """接口翻页：条目、正文、终止条件。"""
 
-    def _collect(self, source: dict, pages: list[dict], **kwargs):
+    def _collect(self, source: dict, pages: Sequence[dict | list[dict]], **kwargs):
         calls: list[tuple[str, dict | None]] = []
         self.validators: list = []
 
         def fake_fetch(
-            url, *, method="GET", payload=None, headers=None, url_validator=None
-        ):
+            url, *, method="GET", payload=None, headers=None, url_validator=None,
+            legacy_renegotiation=False, form_payload=False,
+        ) -> dict | list[dict]:
             calls.append((url, payload))
             self.validators.append(url_validator)
             if len(calls) > len(pages):
@@ -90,6 +92,53 @@ class ApiCollectTest(unittest.TestCase):
         self.assertEqual(
             entry["parsed"], datetime(2026, 11, 10, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
         )
+
+    def test_root_array_reads_top_level_list(self) -> None:
+        source = _api_source(
+            url="https://example.com/api/list.json",
+            method="GET",
+            items_path="",
+            total_path="",
+            root_array=True,
+            page_size=5,
+            max_pages=1,
+        )
+        result, calls = self._collect(source, [[_item(1), _item(2)]], cutoff=CUTOFF)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(result["items"]), 2)
+        self.assertEqual(result["items"][0]["title"], "政策 1")
+
+    def test_offset_page_param_uses_page_times_page_size(self) -> None:
+        source = _api_source(
+            page_param="start_index",
+            page_param_mode="offset",
+            page_size=2,
+            start_page=0,
+            max_pages=3,
+        )
+        pages = [_page(_item(1), _item(2)), _page(_item(3), _item(4)), _page(_item(5), _item(6))]
+        result, calls = self._collect(source, pages)
+
+        self.assertEqual([call[1]["start_index"] for call in calls], [0, 2, 4])
+        self.assertEqual(result["pages"], 3)
+        self.assertEqual(len(result["items"]), 6)
+
+    def test_offset_start_page_zero_checks_pages_not_absolute_page(self) -> None:
+        source = _api_source(
+            page_param="start_index",
+            page_param_mode="offset",
+            page_size=2,
+            start_page=0,
+            max_pages=3,
+        )
+        first = _page(_item(1), _item(2))
+        first["data"]["respData"]["total"] = 2
+        result, calls = self._collect(source, [first])
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result["stop_reason"], "done")
+        self.assertEqual(result["pages"], 1)
 
     def test_stops_when_total_reached(self) -> None:
         source = _api_source(page_size=1, max_pages=5)
@@ -157,6 +206,17 @@ class ApiCollectTest(unittest.TestCase):
         result, _ = self._collect(source, [_page(item)])
 
         self.assertEqual(result["items"][0]["url"], "https://example.com/detail/ZZ7")
+
+    def test_url_template_treats_zero_item_id_as_present(self) -> None:
+        source = _api_source(url_field="", url_template="https://example.com/detail/{id}")
+        item = _item(0)
+        item["id"] = 0
+        item.pop("originalURL")
+        result, _ = self._collect(source, [_page(item)])
+
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(result["items"][0]["url"], "https://example.com/detail/0")
+        self.assertEqual(result["items"][0]["api_id"], "0")
 
     def test_item_without_url_is_skipped(self) -> None:
         source = _api_source(url_field="")
@@ -361,6 +421,88 @@ class ApiCollectTest(unittest.TestCase):
         self.assertEqual([item["url"] for item in result["items"]], [good["originalURL"]])
         self.assertTrue(any("链接无法解析" in line for line in logs.output))
 
+    def test_item_path_unwraps_nested_source_items(self) -> None:
+        source = _api_source(page_size=5, item_path="source")
+        page = {
+            "data": {
+                "respData": {
+                    "total": 1,
+                    "dataList": [{"source": _item(1)}],
+                }
+            }
+        }
+        result, _ = self._collect(source, [page])
+
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(result["items"][0]["title"], "政策 1")
+        self.assertEqual(result["items"][0]["url"], "https://example.com/p/1.html")
+
+    def test_detail_url_treats_zero_item_id_as_present(self) -> None:
+        source = _api_source(
+            page_size=5,
+            detail_url="https://example.com/api/detail?id={id}",
+            detail_method="GET",
+            detail_content_field="infocontent",
+            detail_content_is_html=True,
+        )
+        item = _item(1, body="")
+        item["id"] = 0
+        calls: list[str] = []
+
+        def fake_fetch(
+            url,
+            *,
+            method="GET",
+            payload=None,
+            headers=None,
+            url_validator=None,
+            legacy_renegotiation=False,
+            form_payload=False,
+        ):
+            calls.append(url)
+            if "/detail" in url:
+                return {"infocontent": "<p>详情段落</p>"}
+            return _page(item)
+
+        with mock.patch("url_extract.fetch_json", side_effect=fake_fetch):
+            result = news_crawler.collect_list_entries_detailed(source, cutoff=CUTOFF)
+
+        self.assertIn("https://example.com/api/detail?id=0", calls)
+        self.assertEqual(result["items"][0]["content"], "详情段落")
+
+    def test_detail_url_fills_body_when_list_item_has_no_content(self) -> None:
+        source = _api_source(
+            page_size=5,
+            detail_url="https://example.com/api/detail?id={id}",
+            detail_method="POST",
+            detail_content_field="infocontent",
+            detail_content_is_html=True,
+        )
+        calls: list[str] = []
+
+        def fake_fetch(
+            url,
+            *,
+            method="GET",
+            payload=None,
+            headers=None,
+            url_validator=None,
+            legacy_renegotiation=False,
+            form_payload=False,
+        ):
+            calls.append(url)
+            if "/detail" in url:
+                return {"infocontent": "<p>详情段落</p>"}
+            return _page(_item(1, body=""))
+
+        with mock.patch("url_extract.fetch_json", side_effect=fake_fetch):
+            result = news_crawler.collect_list_entries_detailed(source, cutoff=CUTOFF)
+
+        self.assertEqual(len(calls), 2)
+        entry = result["items"][0]
+        self.assertEqual(entry["content"], "详情段落")
+        self.assertIn("<p>详情段落</p>", entry["body_html"])
+
 
 class ApiSettingsTest(unittest.TestCase):
     def test_defaults_and_overrides(self) -> None:
@@ -377,6 +519,50 @@ class ApiSettingsTest(unittest.TestCase):
         self.assertEqual(settings["content_field"], "content")
         self.assertTrue(settings["content_is_html"])
         self.assertEqual(settings["start_page"], 1)
+
+    def test_html_path_disables_detail_url_with_id(self) -> None:
+        with self.assertLogs("news_crawler", level="WARNING") as captured:
+            settings = news_crawler._api_settings(
+                {
+                    "name": "s",
+                    "api": {
+                        "items_path": "",
+                        "html_path": "data.html",
+                        "detail_url": "https://example.com/detail/{id}",
+                    },
+                }
+            )
+        assert settings is not None
+        self.assertEqual(settings["detail_url"], "")
+        self.assertTrue(any("html_path" in line and "detail_url" in line for line in captured.output))
+
+    def test_invalid_payload_format_and_detail_method_fall_back(self) -> None:
+        with self.assertLogs("news_crawler", level="WARNING") as captured:
+            settings = news_crawler._api_settings(
+                {
+                    "name": "s",
+                    "api": {
+                        "items_path": "a.b",
+                        "payload_format": "xml",
+                        "detail_method": "PUT",
+                        "detail_payload": ["bad"],
+                    },
+                }
+            )
+        assert settings is not None
+        self.assertEqual(settings["payload_format"], "json")
+        self.assertEqual(settings["detail_method"], "POST")
+        self.assertEqual(settings["detail_payload"], {})
+        self.assertTrue(any("payload_format" in line for line in captured.output))
+        self.assertTrue(any("detail_method" in line for line in captured.output))
+
+    def test_start_page_allows_zero_for_zero_based_apis(self) -> None:
+        settings = news_crawler._api_settings(
+            {"name": "s", "api": {"items_path": "a.b", "start_page": 0}}
+        )
+
+        assert settings is not None
+        self.assertEqual(settings["start_page"], 0)
 
     def test_absent_api_returns_none(self) -> None:
         self.assertIsNone(news_crawler._api_settings({"name": "s"}))
@@ -583,6 +769,7 @@ class ApiProcessEntryTest(unittest.TestCase):
                     "project_status": "",
                     "content": "正文段落",
                     "raw_content": "正文段落",
+                    "body_html": "<p>正文段落</p>",
                     "images": [],
                 }
                 with mock.patch.object(
@@ -596,7 +783,7 @@ class ApiProcessEntryTest(unittest.TestCase):
 
                 self.assertEqual(status, "ok")
                 row = conn.execute(
-                    "SELECT title, title_source, content, raw_content, status,"
+                    "SELECT title, title_source, content, raw_content, body_html, status,"
                     " publish_time, publish_time_source, timezone FROM articles"
                 ).fetchone()
                 self.assertEqual(row["status"], "ok")
@@ -604,6 +791,7 @@ class ApiProcessEntryTest(unittest.TestCase):
                 self.assertEqual(row["title_source"], "api_field")
                 self.assertEqual(row["content"], "正文段落")
                 self.assertEqual(row["raw_content"], "正文段落")
+                self.assertEqual(row["body_html"], "<p>正文段落</p>")
                 self.assertEqual(row["publish_time"], "2026-11-10 12:00:00")
                 self.assertEqual(row["publish_time_source"], "list")
                 self.assertEqual(row["timezone"], "Asia/Shanghai")
@@ -788,6 +976,111 @@ class ApiLoadConfigTest(unittest.TestCase):
                 config = news_crawler.load_config(str(path))
 
         self.assertEqual(config["sources"][0]["listing_type"], "news")
+
+
+class ApiHtmlFragmentTest(unittest.TestCase):
+    """接口型源的 HTML 片段模式（api.html_path）。"""
+
+    def _source(self, **api) -> dict:
+        base = {
+            "url": "https://example.com/api/list?page={page}",
+            "method": "GET",
+            "html_path": "data.html",
+            "base_url": "https://example.com",
+            "page_size": 2,
+            "max_pages": 3,
+            "start_page": 1,
+        }
+        base.update(api)
+        return {
+            "name": "html_fragment_demo",
+            "timezone": "Asia/Shanghai",
+            "delay": 0,
+            "item_xpath": "//li",
+            "title_xpath": "./a/@title",
+            "url_xpath": "./a/@href",
+            "date_xpath": "./span",
+            "date_format": "%Y-%m-%d",
+            "api": base,
+        }
+
+    def _collect(self, source: dict, pages: list[dict], **kwargs):
+        calls: list[str] = []
+
+        def fake_fetch(
+            url,
+            *,
+            method="GET",
+            payload=None,
+            headers=None,
+            url_validator=None,
+            legacy_renegotiation=False,
+            form_payload=False,
+        ):
+            calls.append(url)
+            return pages[len(calls) - 1]
+
+        with mock.patch("url_extract.fetch_json", side_effect=fake_fetch):
+            result = news_crawler.collect_list_entries_detailed(source, **kwargs)
+        return result, calls
+
+    def test_html_path_parses_fragment_and_dates(self) -> None:
+        fragment = (
+            "<div><li><a href='/p/1.html' title='政策一'>政策一</a><span>2026-11-10</span></li>"
+            "<li><a href='/p/2.html' title='政策二'>政策二</a><span>2026-11-11</span></li></div>"
+        )
+        second = "<div><li><a href='/p/3.html' title='政策三'>政策三</a><span>2026-11-12</span></li></div>"
+        result, calls = self._collect(
+            self._source(),
+            [{"data": {"html": fragment}}, {"data": {"html": second}}],
+            cutoff=CUTOFF,
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], "https://example.com/api/list?page=1")
+        self.assertEqual([item["title"] for item in result["items"]], ["政策一", "政策二", "政策三"])
+        self.assertEqual(result["items"][0]["url"], "https://example.com/p/1.html")
+        self.assertEqual(
+            result["items"][0]["parsed"],
+            datetime(2026, 11, 10, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+        self.assertEqual(result["stop_reason"], "done")
+
+    def test_empty_html_fragment_stops(self) -> None:
+        result, calls = self._collect(self._source(), [{"data": {"html": ""}}])
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["stop_reason"], "empty")
+
+    def test_load_config_accepts_html_path_without_items_path(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sources.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "timezone": "Asia/Shanghai",
+                        "sources": [
+                            {
+                                "name": "html_api",
+                                "item_xpath": "//li",
+                                "api": {
+                                    "url": "https://example.com/api",
+                                    "html_path": "data.html",
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = news_crawler.load_config(str(path))
+
+        api = config["sources"][0]["api"]
+        self.assertEqual(api["html_path"], "data.html")
+        self.assertEqual(api["items_path"], "")
 
 
 if __name__ == "__main__":

@@ -370,5 +370,48 @@ class ProcessEntryDatesTest(unittest.TestCase):
                 conn.close()
 
 
+
+    def test_list_stage_old_row_keeps_title(self) -> None:
+        """列表阶段就判 old 的行也要写 title，否则前端显示空标题。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "news.db")
+            init_conn = news_crawler.init_db(db_path)
+            init_conn.close()
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                cutoff = news_crawler.parse_datetime(
+                    "2026-01-01 00:00:00", None, "Asia/Shanghai"
+                )
+                assert cutoff is not None
+                list_date = news_crawler.parse_datetime(
+                    "2025-06-01 00:00:00", None, "Asia/Shanghai"
+                )
+                status = news_crawler.process_entry(
+                    conn,
+                    {"name": "source", "timezone": "Asia/Shanghai"},
+                    {
+                        "url": "https://example.com/old",
+                        "title": "列表标题",
+                        "parsed": list_date,
+                    },
+                    cutoff,
+                    force=False,
+                )
+                self.assertEqual(status, "old")
+                row = conn.execute(
+                    "SELECT title, list_title, title_source, status FROM articles "
+                    "WHERE source = ? AND url = ?",
+                    ("source", "https://example.com/old"),
+                ).fetchone()
+                assert row is not None
+                self.assertEqual(row["status"], "old")
+                self.assertEqual(row["title"], "列表标题")
+                self.assertEqual(row["list_title"], "列表标题")
+                self.assertEqual(row["title_source"], "list_title")
+            finally:
+                conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

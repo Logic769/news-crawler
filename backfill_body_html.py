@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-from backfill_raw_content import load_source_xpaths
+from backfill_raw_content import load_source_body_modes, load_source_xpaths
 from gne import GeneralNewsExtractor
 from html_sanitize import sanitize_body_html
 from news_crawler import DEFAULT_DB_FILE, DEFAULT_SOURCES_FILE, init_db
@@ -163,6 +163,7 @@ def backfill(
     allow_browser: bool,
     dry_run: bool,
     source_xpaths: dict[str, str] | None = None,
+    source_body_modes: dict[str, str] | None = None,
     overwrite: bool = False,
 ) -> tuple[int, int, int, int]:
     """逐条重抓并写回 body_html。
@@ -174,6 +175,7 @@ def backfill(
         return 0, 0, 0, 0
 
     source_xpaths = source_xpaths or {}
+    source_body_modes = source_body_modes or {}
     extractor = GeneralNewsExtractor()
     updated = failed = skipped = write_failed = 0
     try:
@@ -186,6 +188,7 @@ def backfill(
                     extractor,
                     allow_browser=allow_browser,
                     body_xpath=source_xpaths.get(source, ""),
+                    body_mode=source_body_modes.get(source, ""),
                 )
                 body_html = str((result or {}).get("body_html") or "").strip()
             except Exception as exc:  # 单条失败不能中止整批
@@ -273,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         scope = "全部" if args.overwrite else "body_html 为空"
         print(f"候选 {len(candidates)} 条（status in {'/'.join(BACKFILL_STATUSES)} 且 {scope}）")
         source_xpaths = {} if args.dry_run else load_source_xpaths(args.config)
+        source_body_modes = {} if args.dry_run else load_source_body_modes(args.config)
         updated, failed, skipped, write_failed = backfill(
             conn,
             candidates,
@@ -280,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_browser=args.allow_browser,
             dry_run=args.dry_run,
             source_xpaths=source_xpaths,
+            source_body_modes=source_body_modes,
             overwrite=args.overwrite,
         )
     finally:

@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 from collections.abc import Callable
@@ -49,6 +50,7 @@ BROWSER_FALLBACK_HTTP_CODES = frozenset({401, 403, 406, 429})
 
 # SSLContext 创建一次约 20ms，模块级复用避免每个请求都重新加载 CA 证书。
 _SSL_CONTEXT = ssl.create_default_context()
+_LEGACY_SSL_CONTEXT: ssl.SSLContext | None = None
 _UNVERIFIED_SSL_CONTEXT: ssl.SSLContext | None = None
 _SSL_CONTEXT_LOCK = threading.Lock()
 
@@ -58,12 +60,27 @@ def _insecure_ssl_allowed() -> bool:
     return os.environ.get(INSECURE_SSL_ENV, "").strip().lower() in _TRUE_ENV_VALUES
 
 
+def _legacy_ssl_context() -> ssl.SSLContext:
+    """创建允许旧式 TLS 重协商的严格校验上下文（部分政务站点需要）。"""
+    global _LEGACY_SSL_CONTEXT
+    with _SSL_CONTEXT_LOCK:
+        if _LEGACY_SSL_CONTEXT is None:
+            context = ssl.create_default_context()
+            if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
+                context.options |= ssl.OP_LEGACY_SERVER_CONNECT
+            _LEGACY_SSL_CONTEXT = context
+        return _LEGACY_SSL_CONTEXT
+
+
 def _unverified_ssl_context() -> ssl.SSLContext:
     """惰性创建“不校验证书”的上下文，仅在 NEWS_INSECURE_SSL 显式开启时使用。"""
     global _UNVERIFIED_SSL_CONTEXT
     with _SSL_CONTEXT_LOCK:
         if _UNVERIFIED_SSL_CONTEXT is None:
-            _UNVERIFIED_SSL_CONTEXT = ssl._create_unverified_context()
+            context = ssl._create_unverified_context()
+            if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
+                context.options |= ssl.OP_LEGACY_SERVER_CONNECT
+            _UNVERIFIED_SSL_CONTEXT = context
         return _UNVERIFIED_SSL_CONTEXT
 
 
@@ -813,6 +830,9 @@ def fetch_json(
     payload: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
     url_validator: Callable[[str], None] | None = None,
+    parse_json: bool = True,
+    legacy_renegotiation: bool = False,
+    form_payload: bool = False,
 ) -> Any:
     """按 JSON 协议请求一个接口，返回解析后的对象。
 
@@ -830,14 +850,19 @@ def fetch_json(
     连接时再按真实解析出的 IP 校验。不传时只装默认处理器（跟随任意
     重定向），调用方若配置来自不可信来源必须传。
     """
-    body_bytes = (
-        json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        if payload is not None
-        else None
-    )
+    if payload is not None and form_payload:
+        body_bytes = urllib.parse.urlencode(payload, doseq=True).encode("utf-8")
+    elif payload is not None:
+        body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    else:
+        body_bytes = None
     request_headers = dict(HEADERS)
     if body_bytes is not None:
-        request_headers["Content-Type"] = "application/json;charset=UTF-8"
+        request_headers["Content-Type"] = (
+            "application/x-www-form-urlencoded;charset=UTF-8"
+            if form_payload
+            else "application/json;charset=UTF-8"
+        )
     if headers:
         request_headers.update(headers)
 
@@ -899,7 +924,9 @@ def fetch_json(
             return decompressed, resp.headers.get_content_charset()
 
     try:
-        raw, charset = _fetch(_SSL_CONTEXT)
+        raw, charset = _fetch(
+            _legacy_ssl_context() if legacy_renegotiation else _SSL_CONTEXT
+        )
     except urllib.error.URLError as exc:
         if not isinstance(exc.reason, ssl.SSLCertVerificationError):
             raise
@@ -918,11 +945,61 @@ def fetch_json(
         )
         raw, charset = _fetch(_unverified_ssl_context())
 
-    text = _decode_bytes(raw, charset)
+    text = _decode_bytes(raw, charset, sniff_html=not parse_json)
+    if not parse_json:
+        return text
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValueError(f"接口返回的不是合法 JSON（{url}）：{exc}") from exc
+
+
+def fetch_text(
+    url: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    url_validator: Callable[[str], None] | None = None,
+    form_payload: bool = False,
+    legacy_renegotiation: bool = False,
+) -> str:
+    """POST/GET 一个文本响应（XML/HTML），复用 fetch_json 的超时、解压与代理策略。"""
+    return str(
+        fetch_json(
+            url,
+            method=method,
+            payload=payload,
+            headers=headers,
+            url_validator=url_validator,
+            parse_json=False,
+            form_payload=form_payload,
+            legacy_renegotiation=legacy_renegotiation,
+        )
+    )
+
+
+_EO_BOT_CHALLENGE_RE = re.compile(
+    r"WTKkN:\s*(\d+)\s*,\s*bOYDu:\s*(\d+)\s*,\s*dtzqS:\s*function\(a,n\)\{return a\+n\}\s*,\s*wyeCN:\s*(\d+)"
+)
+_EO_BOT_SESSION_RE = re.compile(r't=a\[_0x649a\("0x7"\)\]\(t,(\d+)\)')
+
+
+def _solve_eo_bot_cookie(text: str) -> str | None:
+    """识别 EO_Bot 反爬挑战脚本并计算它要求写入的两个 cookie。
+
+    这类站点首次请求只返回一段混淆脚本，必须带上脚本算出的 __tst_status 与
+    EO_Bot_Ssid 才会返回真实页面。这里只处理结构稳定的 EO_Bot 挑战；识别
+    不到时返回 None，由调用方按原样返回页面，不掩盖其他反爬。
+    """
+    m = _EO_BOT_CHALLENGE_RE.search(text)
+    if not m:
+        return None
+    status = sum(int(value) for value in m.groups())
+    session = _EO_BOT_SESSION_RE.search(text)
+    if not session:
+        return None
+    return f"__tst_status={status}#; EO_Bot_Ssid={session.group(1)}"
 
 
 def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) -> str:
@@ -932,7 +1009,9 @@ def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) 
     caller-side allow-list cannot be bypassed by a 3xx response.
     """
 
-    def _fetch(context: ssl.SSLContext) -> tuple[bytes, str | None]:
+    def _fetch(
+        context: ssl.SSLContext, extra_headers: dict[str, str] | None = None
+    ) -> tuple[bytes, str | None]:
         handlers: list[urllib.request.BaseHandler] = []
         if url_validator is not None:
             # 重定向目标先按 URL 策略校验（域名层），连接时再按真实解析出的
@@ -948,7 +1027,7 @@ def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) 
         else:
             handlers.append(urllib.request.HTTPSHandler(context=context))
         opener = urllib.request.build_opener(*handlers)
-        req = urllib.request.Request(url, headers=HEADERS)
+        req = urllib.request.Request(url, headers={**HEADERS, **(extra_headers or {})})
         # 总预算从建立连接前开始计时，连接、等待响应头、读取正文共用同一截止时间。
         deadline = time.monotonic() + MAX_FETCH_TOTAL_SECONDS
         open_timeout = min(PER_OP_TIMEOUT, deadline - time.monotonic())
@@ -1010,8 +1089,9 @@ def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) 
             raw = _decompress(compressed, ",".join(ce_headers) if ce_headers else None)
             return raw, resp.headers.get_content_charset()
 
+    context = _SSL_CONTEXT
     try:
-        raw, charset = _fetch(_SSL_CONTEXT)
+        raw, charset = _fetch(context)
     except urllib.error.URLError as exc:
         if not isinstance(exc.reason, ssl.SSLCertVerificationError):
             raise
@@ -1033,9 +1113,136 @@ def fetch_html(url: str, *, url_validator: Callable[[str], None] | None = None) 
             url,
             exc.reason,
         )
-        raw, charset = _fetch(_unverified_ssl_context())
+        context = _unverified_ssl_context()
+        raw, charset = _fetch(context)
 
-    return _decode_bytes(raw, charset, sniff_html=True)
+    text = _decode_bytes(raw, charset, sniff_html=True)
+    cookie = _solve_eo_bot_cookie(text)
+    if cookie:
+        LOG.info("检测到 EO_Bot 反爬挑战，携带 cookie 重试一次：%s", url)
+        raw, charset = _fetch(context, {"Cookie": cookie})
+        text = _decode_bytes(raw, charset, sniff_html=True)
+    return text
+
+
+_BODY_MODE_CONTAINER = "container"
+_CONTAINER_SKIP_TAGS = frozenset(
+    {"script", "style", "noscript", "template", "iframe", "svg", "canvas"}
+)
+_CONTAINER_BLOCK_TAGS = frozenset(
+    {
+        "p",
+        "li",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "blockquote",
+        "pre",
+        "td",
+        "th",
+        "div",
+        "section",
+        "article",
+        "header",
+        "footer",
+    }
+)
+
+
+def _clean_block_text(value: str) -> str:
+    return " ".join((value or "").split())
+
+
+def _extract_container_content(html: str, url: str, body_xpath: str) -> dict | None:
+    """按正文容器取全文，供 article_body_mode=container 的站点使用。
+
+    GNE 的密度算法会在容器内再挑一个最高分节点，湖南科技厅这类把正文
+    拆成多个并列 <p> 的页面因此只拿到第一段。这里直接以配置的容器为
+    边界，按块级元素收集文本，保留段落换行，图片仍从容器内补全。
+    """
+    try:
+        from lxml import etree
+        from lxml import html as lxml_html
+
+        doc = lxml_html.document_fromstring(html)
+        nodes = doc.xpath(body_xpath)
+    except Exception as exc:  # noqa: BLE001 - 配置/页面问题按未抽到处理
+        LOG.warning("article_body_mode=container 解析失败：%s", exc)
+        return None
+    if not nodes:
+        LOG.warning("article_body_mode=container 未命中容器：%s", body_xpath)
+        return None
+    if len(nodes) > 1:
+        LOG.warning(
+            "article_body_mode=container 命中 %d 个节点，只使用第一个：%s",
+            len(nodes),
+            body_xpath,
+        )
+    node = nodes[0]
+    if not hasattr(node, "tag"):
+        return None
+    parts: list[str] = []
+    buffer: list[str] = []
+
+    def flush() -> None:
+        text = _clean_block_text("".join(buffer))
+        buffer.clear()
+        if text:
+            parts.append(text)
+
+    def append_text(value: str | None) -> None:
+        if value:
+            buffer.append(value)
+
+    def walk(current) -> None:
+        tag = getattr(current, "tag", "")
+        if not isinstance(tag, str):
+            return
+        tag = tag.lower()
+        if tag in _CONTAINER_SKIP_TAGS:
+            # 跳过脚本/样式等子树；它的 tail 由父级继续追加，不能一起丢。
+            return
+        if tag == "br":
+            buffer.append("\n")
+            return
+        if tag in _CONTAINER_BLOCK_TAGS:
+            # 块级边界先结束上一段：<p>第一段</p>尾部文字<span>行内后缀</span><p>第二段</p>
+            # 中的“尾部文字/行内后缀”必须落在自己的段落里，不能被块子节点吞掉。
+            flush()
+            append_text(current.text)
+            for child in current:
+                if not isinstance(getattr(child, "tag", ""), str):
+                    continue
+                walk(child)
+                append_text(child.tail)
+            flush()
+        else:
+            append_text(current.text)
+            for child in current:
+                if not isinstance(getattr(child, "tag", ""), str):
+                    continue
+                walk(child)
+                append_text(child.tail)
+
+    walk(node)
+    raw_content = "\n".join(part for part in parts if part).strip()
+    if not raw_content:
+        LOG.warning("article_body_mode=container 容器内没有可读文本：%s", body_xpath)
+        return None
+    try:
+        body_html = etree.tostring(node, encoding="unicode", method="html")
+    except Exception:
+        body_html = ""
+    images = node.xpath(".//img/@src")
+    return {
+        "content": raw_content,
+        "raw_content": raw_content,
+        "body_html": body_html,
+        "images": images,
+    }
 
 
 def extract_from_html(
@@ -1049,6 +1256,7 @@ def extract_from_html(
     title_xpath: str = "",
     publish_time_xpath: str = "",
     body_xpath: str = "",
+    body_mode: str = "",
 ) -> dict | None:
     """Extract one article already-fetched HTML (shared by CLI and crawler).
 
@@ -1072,6 +1280,22 @@ def extract_from_html(
         )
     except NoContentException:
         result = None
+
+    def _apply_container(data: dict | None, html_text: str) -> dict | None:
+        if body_mode != _BODY_MODE_CONTAINER or not body_xpath:
+            return data
+        container = _extract_container_content(html_text, url, body_xpath)
+        if container is None:
+            return data
+        merged = container if data is None else {**data, **container}
+        LOG.info(
+            "article_body_mode=container 按容器取全文：%d 字（%s）",
+            len(container["content"]),
+            body_xpath,
+        )
+        return merged
+
+    result = _apply_container(result, html)
 
     if result is None or content_needs_render(result.get("content")):
         if already_rendered:
@@ -1105,6 +1329,10 @@ def extract_from_html(
                 )
             except NoContentException:
                 result = None
+            # 浏览器渲染后的 DOM 与首屏 HTML 不同：container 模式必须在
+            # 渲染后的页面上再应用一次，否则 JS 站点仍会退回 GNE 密度算法，
+            # article_body_mode=container 看似配置成功却静默失效。
+            result = _apply_container(result, html)
             if result is None:
                 LOG.info("浏览器渲染后仍无法提取正文。可能是列表页，或不是新闻文章页。")
                 return None
@@ -1131,6 +1359,7 @@ def extract_article(
     title_xpath: str = "",
     publish_time_xpath: str = "",
     body_xpath: str = "",
+    body_mode: str = "",
 ) -> dict | None:
     """抓取单个 URL 并抽取正文；必要时回退浏览器，失败或正文为空时返回 None。"""
     LOG.info("正在抓取: %s", url)
@@ -1171,6 +1400,7 @@ def extract_article(
         title_xpath=title_xpath,
         publish_time_xpath=publish_time_xpath,
         body_xpath=body_xpath,
+        body_mode=body_mode,
     )
 
 
