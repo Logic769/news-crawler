@@ -159,6 +159,27 @@ docker compose run --rm crawler smoke     # 可选：验证
 
 数据与配置都在宿主机挂载目录中，更新镜像不影响已有数据。
 
+### 定时采集（可选）
+
+`docker-compose.yml` 提供 `scheduler` 服务：默认每天 **09:00 / 15:00**（Asia/Shanghai）执行一次抓取，抓取成功后自动调用 news-insight 的 `POST /v1/jobs` 提交分析作业。
+
+```bash
+docker compose up -d scheduler          # 启动定时采集（restart unless-stopped）
+docker compose logs -f scheduler        # 查看下次触发时间与抓取日志
+docker compose run --rm scheduler scheduler --once  # 立即执行一次，便于验证
+```
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `SCHEDULE_TIMES` | `09:00,15:00` | 每日触发时间，逗号分隔 |
+| `SCHEDULE_TIMEZONE` | `Asia/Shanghai` | 调度时区 |
+| `CRAWL_DAYS` | `3` | 每次抓取的最近天数 |
+| `INSIGHT_URL` | `http://host.docker.internal:8020` | 采集成功后触发的分析服务；设为空则只采集不分析 |
+| `INSIGHT_API_KEY` | 空 | 调用 insight `/v1/jobs` 时携带的 `X-API-Key` |
+| `ANALYZE_LIMIT` | `1000` | 单次分析作业上限 |
+
+调度器使用 `data/.crawl.lock` 文件锁防止上一轮未结束时重复启动；单轮抓取失败只记日志，下一轮照常执行。整轮只产生错误、没有任何有效产出时 `news_crawler.py run` 返回非零退出码，调度器不会提交分析作业。若只想手动抓取，保持 `scheduler` 服务不启动即可。
+
 ---
 
 ## 新闻 API（/v1）

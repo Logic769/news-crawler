@@ -29,6 +29,38 @@ services:
     command: ["run", "--config", "sources.local.json", "--days", "3"]
     restart: "no"
 
+  scheduler:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        INSTALL_BROWSER: ${INSTALL_BROWSER:-1}
+        PLAYWRIGHT_DOWNLOAD_HOST: ${PLAYWRIGHT_DOWNLOAD_HOST:-}
+    image: news-crawler:local
+    container_name: news-crawler-scheduler
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      SCHEDULE_TIMES: ${SCHEDULE_TIMES:-09:00,15:00}
+      SCHEDULE_TIMEZONE: ${SCHEDULE_TIMEZONE:-Asia/Shanghai}
+      CRAWL_DAYS: ${CRAWL_DAYS:-3}
+      CRAWL_CONFIG: /app/sources.local.json
+      CRAWL_DB: /app/data/news.db
+      CRAWL_LOCK_FILE: /app/data/.crawl.lock
+      INSIGHT_URL: ${INSIGHT_URL-http://host.docker.internal:8020}
+      INSIGHT_API_KEY: ${INSIGHT_API_KEY:-}
+      ANALYZE_LIMIT: ${ANALYZE_LIMIT:-1000}
+      NEWS_INSECURE_SSL: ${NEWS_INSECURE_SSL:-}
+    volumes:
+      - ./sources.local.json:/app/sources.local.json:ro
+      - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["scheduler"]
+    restart: unless-stopped
+    # SIGTERM 后 scheduler 会 terminate 抓取子进程并等待最多 10 秒；
+    # 30 秒宽限期足够完成回收，不会让 Docker 的默认 10 秒提前杀掉容器。
+    stop_grace_period: 30s
+
   api:
     build:
       context: .

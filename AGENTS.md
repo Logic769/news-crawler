@@ -78,6 +78,7 @@ news-crawler/
 ├── backfill_archives.py            # 回填历史文章的原文快照（默认用库内 body_html/raw_content，--fetch-html 才重抓）
 ├── html_sanitize.py                # 正文 HTML 白名单清洗（脚本/事件属性/可执行 URL 过滤）
 ├── api.py                          # FastAPI 入口（uvicorn api:app）
+├── scheduler.py                    # 定时采集调度器（默认 09:00/15:00，可触发 insight 分析）
 ├── news_api/                       # API 应用：设置、模型、查询、作业队列、站点配置存储
 │   └── config_store.py             # sources.local.json 的受控读写（写前备份、保留未知键、过滤敏感头）
 ├── api_smoke.py                    # API 冒烟测试（本地 HTTP + 临时数据库）
@@ -87,7 +88,7 @@ news-crawler/
 ├── sources.local.json              # 本地私有站点配置（.gitignore 忽略）
 ├── Dockerfile                      # 容器镜像定义（含 Playwright Chromium）
 ├── docker-compose.yml              # Docker Compose 编排（挂载配置/数据）
-├── docker/entrypoint.sh            # 容器统一入口（run/init/test/smoke/live-news/api/shell）
+├── docker/entrypoint.sh            # 容器统一入口（run/init/test/smoke/live-news/api/scheduler/shell）
 ├── docker-deploy.sh / docker-deploy.bat  # Docker 一键部署（Linux·macOS / Windows）
 ├── pyproject.toml                  # 项目元数据与依赖
 ├── uv.lock                         # uv 依赖锁
@@ -604,7 +605,8 @@ curl http://localhost:8000/v1/health
 - 基础镜像：`python:3.12-slim`；**默认镜像自带 Playwright Chromium**（`playwright install --with-deps chromium`，构建期会实际启动一次 Chromium 自检），可用构建参数 `INSTALL_BROWSER=0` 关闭以减小镜像但失去浏览器能力
 - 浏览器运行：容器以 root 运行时 Chromium 必须带 `--no-sandbox --disable-dev-shm-usage`（`url_extract.py` 已内置）
 - 视频页适配：`/shipin/`、`/video/` 等视频页由 `url_extract.is_video_page()` 识别，改用 meta/JSON-LD/URL 提取标题、简介、发布时间（`extract_video_meta()`），避免正文过短与日期误判
-- 入口：`docker/entrypoint.sh` 统一处理 `run`/`init`/`test`/`smoke`/`live-news`/`api`/`shell`，数据库默认写入 `/app/data/news.db`
+- 入口：`docker/entrypoint.sh` 统一处理 `run`/`init`/`test`/`smoke`/`live-news`/`api`/`scheduler`/`shell`，数据库默认写入 `/app/data/news.db`
+- 定时采集：`docker compose up -d scheduler` 启动 `news-crawler-scheduler`，默认每天 09:00 / 15:00（`SCHEDULE_TIMES`/`SCHEDULE_TIMEZONE`）执行抓取；成功后按 `INSIGHT_URL` 调 insight `POST /v1/jobs` 提交分析（`INSIGHT_API_KEY` 可选）；`--once` 立即执行一次；`data/.crawl.lock` 防重入
 - API 服务：`docker compose up -d api` 启动 `news-crawler-api`，端口由 `NEWS_API_PORT` 控制（默认 8000）
 - 挂载：`sources.local.json` 只读挂载（私有配置不进镜像）；`./data` 持久化数据库
 - 容器以 root 运行，避免跨平台 bind mount 的 UID 权限问题；安全要求高时可改非 root + 命名卷
@@ -681,6 +683,7 @@ curl http://localhost:8000/v1/health
 | `regression/test_process_entry_dates.py` | 17 个用例：未来/超 skew 详情日期回退列表、跨 UTC 日期边界、无年份按列表年补齐、跨年无年份日期取上一年并保留时刻、跨年正方向（列表年末+详情次年）保留时刻、未来无年份日期按列表年补齐、无列表日期记 unknown_date、title_source 归一、skew 钳制、unknown_date 不覆盖旧来源 |
 | `regression/test_extract_job_dates.py` | 7 个用例：API extract 作业超 skew 回退库内列表日期、无年份兜底、跨年无年份取上一年、跨年正方向保留时刻、详情不可解析兜底、无列表日期记 unknown_date |
 | `regression/test_project_application.py` | 65 个用例：`listing_type` 默认值/非法值回退、`deadline_xpath`/`project_status_xpath` 解析且不把截止时间当发布时间、详情缺失或登录墙短正文仍存列表字段（标题取列表标题、`title_source=list_title`）、`content_required=true` 走 `no_content`、截止时间早于窗口记 `old`、v7→v8 迁移补三列、deadline 不回退发布时间、不可解析截止时间保留原文、项目 `old` 行二次运行 skip、`--force` 仍抓详情、长正文成功入库、`content_required` 字符串值归一、deadline 过滤与排序、已入库 `ok`/`old` 行刷新列表字段（`title`/`list_title`/延期/截止/不可解析清空）且不抓详情、`old` 恢复 `ok` 且 `content_required=true` 时继续抓正文、新闻切项目清空 `publish_time*`、无年份未来截止保留当年、无年份 `deadline_format` 按基准年补齐、闰日隔两年取最近合法年、deadline 边界按站点墙钟、无分隔符 `deadline_format`（`%m%d`）按基准年补齐、已截止状态把无年份截止约束到过去、`content_required` 由 false 改 true 后 `ok` 行按正文缺失重抓、已截止状态下闰日回看四年、旧新闻行刷新时补写 `title_source=list_title`、已截止状态文本含内部空白（半角/全角空格、NBSP）时仍按过去方向解析、已截止时截止时间须落在列表发布日期与抓取时刻之间（区间无候选保留原文）、公告发布当天截止仍能解析、候选年份覆盖抓取时刻上界（发布日期距抓取超过三年）、配置 `date_xpath` 的项目行把列表发布日期写入 `publish_time`/`publish_time_utc`/`list_publish_time` 且不影响 `deadline`、未配置 `date_xpath` 时 `publish_time` 保持空、增量刷新改写列表发布日期且不抓详情、列表日期本次不可解析时保留旧发布日期、正文重试期间（首轮 `no_content` + 次轮列表日期降级）不抹掉已保留的列表发布日期、日期值不变但来源为历史详情来源时刷新归一为 `list`、列表日期降级沿用非 `list` 旧值时会记 WARNING（未变化的行不重复告警）、没有任何可沿用的本地墙钟时连同来源/原文/`list_publish_time` 一并清空、`publish_time` 为空而 `publish_time_utc` 有值的脏行不会被当成本地墙钟写回、行内 `timezone` 为空时已有 `publish_time_utc` 直接沿用且不写回时区（幂等 skip）、行内既无时区也无 UTC 时按站点配置换算并记 WARNING 且不写回时区（猜出的 UTC 下一轮被沿用、幂等 skip）、站点配置缺 `timezone`（空串）时改用行内时区换算并记 WARNING 且不清空行内已知时区（未变化的行不重复告警、端到端经 `process_entry` 接线仍按行内时区换算）、`load_config` 把站点空串/非法 `timezone` 归一为顶层时区（缺失/非法值同样回退并告警）、端到端用 `parse_list_items` + `process_entry` 验证墙钟格式化与 UTC 换算使用同一时区、行内 `timezone` 为历史非法值（如 `Asia/Shangha`）时刷新按归一值换算并把合法名写回（只修一次、幂等 skip；接受本次列表日期与沿用旧墙钟两条分支都覆盖）、`should_skip_stored` 对 `old` 行的非法行内时区按归一值判窗口（不回落运行环境时区）、行内时区首尾带空白时同样写回一次合法名、纯空白归一成 NULL（不污染时区分组）、列表日期与旧值完全相同时脏时区仍能靠时区判定单独触发一次写回、正文重试保留旧发布时间时不覆盖行内时区（`publish_time`/`publish_time_utc`/`timezone` 三字段一致、下一轮按行内时区换算） |
+| `regression/test_scheduler.py` | 16 个用例：时间点解析（排序/去重/非法值）、下一触发点（首班前/两班间/末班后/整点边界）、抓取命令拼装、文件锁互斥与释放后重用、`--once` 在锁占用时跳过、抓取成功才触发分析、抓取失败不触发分析、非法 INSIGHT_URL 只记日志、停止信号终止抓取子进程（含 terminate 超时后 kill）、`execute_once` 把 stop 事件传给等待函数；另有 `test_run_exit_code.py` 覆盖“全部失败/没有新文章/正文全部不可用”的退出码与 `fetch_failed` 计数 |
 | `regression/test_pagination.py` | 40 个用例：模板分页按截止日期停止、模板生成后续页、max_pages 含首页语义、last_url_xpath 多候选取最大页码、跟随 onclick/忽略 # 锚点、渲染后 DOM 找下一页、未知日期不触发 cutoff、已入库页连续早停、旧 list_urls 行为、非法 mode 回退、固定列表忽略 max_pages/分页配置/cutoff、固定页抓取失败不误报、固定列表全空报 empty、置顶旧文不提前停、next XPath 无 href 文本忽略、next XPath 属性 onclick 解析（含 JavaScript: 前缀）、模板缺 {page} 回退、collect_list_entries 包装、分页 URL SSRF 校验（可信内网主机/可信主机 DNS 解析出的内网 IP/公网 IP/未信任私网拒绝）、连接层 IP 字面量保留 scheme+port（`_PinnedHTTPConnection`/`_PinnedHTTPSConnection` 的 `connect` 真实路径）、可信端点 DNS 失败冷却后重试、列表抓取确实收到 validator |
 | `regression/test_title_fallback.py` | 24 个用例：`_looks_like_site_name` 的站点名词表命中、带空格分隔符（减号/竖线/下划线）以及双连字符、方头括号的真标题不判为站点名、超长文本不判为站点名、含 hint 词但词不在结尾的真标题（如“关于XX平台建设的通知”）不判为站点名；`extract_by_sole_heading` 兜底在唯一 h1 时替换站点名 `<title>`（`title_source` 仍为 `gne_default`）、无 h1/多 h1/h1 本身像站点名/h1 短于 8 字时保持站点名、`<title>` 是真标题时不覆盖、`og:title` 与配置的 `article_title_xpath` 优先级高于该兜底、`display:none` 的隐藏 h1（含祖先容器隐藏、style 空白为制表符/换行）与 `<template>`/`<noscript>` 里的模板 h1 不计入唯一性；祖先 visibility:hidden + h1 visibility:visible 时该 h1 仍算可见候选（与另一个栏目标题并存时宁可不猜）、display:none 祖先优先于 h1 的 visibility:visible、站名判断用未切分的原始 <title>（「关于启用申报平台 - 某某官网」不会被切成「关于启用申报平台」后误判成站点名）；端到端经 `GeneralNewsExtractor()` 验证同样行为 |
 | `regression/test_api_source.py` | 42 个用例：接口型源采集（条目带正文与日期、total 用尽/不足一页/cutoff/known_pages/max_pages 五种停止原因、抓取失败 stop_reason、items_path 非数组、url_template 兜底、无 url 跳过、畸形条目链接（`https://[broken/p`，`urlsplit` 抛 `ValueError`）只告警跳过而不中断整页采集、跨页去重、相对链接按 `api.url` 的 origin 补全（显式 `base_url` 可覆盖）、早停判断用去重前的本页条目（`page_items`）而非 `fresh_items`、GET 不发请求体、delay 只在两次请求之间等待且末页不等、`fetch_json` 收到以 `api.url` 为锚点的 `url_validator`）、`_api_settings` 归一（默认值与覆盖、无 api 返回 None、非法 method 回退 POST、`_dig` 列表下标、`_html_to_text` 段落与图片/剔 script·style/表格单元格换行、`_decode_bytes` 的 GBK 回退·meta 嗅探·声明 charset 解不开时记 INFO 日志）、传输层（跨 origin 重定向剥掉 Cookie/Authorization 但保留 `X-Trace`、同源重定向保留凭据、校验器拒绝时在跟随之前抛错、传 `url_validator` 时装 `ProxyHandler`+`_ValidatingRedirectHandler`+`_PinnedHTTPSHandler`+`_PinnedHTTPHandler`、不传时只装 `HTTPSHandler`）、`process_entry` 自带正文跳过详情抓取（`title_source=api_field`）与无正文仍抓详情、`load_config` 归一接口型源（timezone 空串→Asia/Shanghai、method 小写→POST）与 api+项目申报模式告警、纯新闻源不告警 |
@@ -694,7 +697,7 @@ curl http://localhost:8000/v1/health
 ### 提交前必须执行
 
 ```bash
-docker compose run --rm --entrypoint python crawler -m compileall -q news_crawler.py url_extract.py smoke_fixture.py backfill_raw_content.py backfill_body_html.py backfill_archives.py article_archive.py html_sanitize.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api gne regression
+docker compose run --rm --entrypoint python crawler -m compileall -q news_crawler.py url_extract.py scheduler.py smoke_fixture.py backfill_raw_content.py backfill_body_html.py backfill_archives.py article_archive.py html_sanitize.py smoke_test.py verify_live_news.py api.py api_smoke.py news_api gne regression
 docker compose run --rm crawler smoke
 docker compose run --rm --entrypoint python crawler -X utf8 api_smoke.py
 ```
